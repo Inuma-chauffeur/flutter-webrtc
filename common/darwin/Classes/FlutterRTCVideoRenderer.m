@@ -2,24 +2,111 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CGImage.h>
+#import <TargetConditionals.h>
+#import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCYUVHelper.h>
 #import <WebRTC/RTCYUVPlanarBuffer.h>
 #import <WebRTC/WebRTC.h>
 
 #import <objc/runtime.h>
+#include <stdlib.h>
+#include <time.h>
 
 #import "FlutterWebRTCPlugin.h"
 #import <os/lock.h>
+
+#if TARGET_OS_OSX
+enum { kInumaTextureTraceCapacity = 8192 };
+
+typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
+  InumaMacOSPixelModeStockBGRA = 0,
+  InumaMacOSPixelModeNativeNV12 = 1,
+};
+
+typedef struct {
+  bool enabled;
+  uint64_t render_frames;
+  uint64_t accepted_frames;
+  uint64_t coalesced_frames;
+  uint64_t copy_calls;
+  uint64_t copy_hits;
+  uint64_t copy_misses;
+  uint64_t source_cv_pixel_buffer_frames;
+  uint64_t source_i420_frames;
+  uint64_t source_nv12_frames;
+  uint64_t source_bgra_frames;
+  uint64_t source_other_pixel_format_frames;
+  uint64_t native_nv12_frames;
+  uint64_t native_nv12_fallback_frames;
+  uint64_t conversion_samples[kInumaTextureTraceCapacity];
+  uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
+  uint64_t copy_lock_wait_samples[kInumaTextureTraceCapacity];
+  uint64_t copy_ready_age_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
+  NSUInteger conversion_count;
+  NSUInteger render_lock_wait_count;
+  NSUInteger copy_lock_wait_count;
+  NSUInteger copy_ready_age_count;
+  NSUInteger texture_notify_count;
+} InumaTextureTrace;
+
+static uint64_t InumaMonotonicNanoseconds(void) {
+  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+}
+
+static void InumaAppendTraceSample(uint64_t *samples, NSUInteger *count,
+                                   uint64_t value) {
+  if (*count >= kInumaTextureTraceCapacity) {
+    return;
+  }
+  samples[*count] = value;
+  *count += 1;
+}
+
+static NSArray<NSNumber *> *InumaTraceSampleArray(const uint64_t *samples,
+                                                  NSUInteger count) {
+  NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+static InumaMacOSPixelMode
+InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
+  NSString *value = [env[@"INUMA_FLUTTER_WEBRTC_MACOS_PIXEL_MODE"]
+      stringByTrimmingCharactersInSet:[NSCharacterSet
+                                          whitespaceAndNewlineCharacterSet]];
+  if ([value isEqualToString:@"native_nv12"]) {
+    return InumaMacOSPixelModeNativeNV12;
+  }
+  return InumaMacOSPixelModeStockBGRA;
+}
+
+@interface FlutterRTCVideoRenderer ()
+- (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer;
+- (bool)inumaAdoptNativeNV12BufferFromFrame:(RTCVideoFrame *)frame;
+- (void)inumaWriteTextureTrace;
+@end
+#endif
 
 @implementation FlutterRTCVideoRenderer {
   CGSize _frameSize;
   CGSize _renderSize;
   CVPixelBufferRef _pixelBufferRef;
   RTCVideoRotation _rotation;
-  FlutterEventChannel* _eventChannel;
+  FlutterEventChannel *_eventChannel;
   bool _isFirstFrameRendered;
   bool _frameAvailable;
   os_unfair_lock _lock;
+#if TARGET_OS_OSX
+  NSString *_inumaTracePath;
+  InumaMacOSPixelMode _inumaPixelMode;
+  InumaTextureTrace _inumaTrace;
+  uint64_t _inumaFrameReadyMonotonicNs;
+  dispatch_queue_t _inumaTraceQueue;
+  dispatch_source_t _inumaTraceTimer;
+#endif
 }
 
 @synthesize textureId = _textureId;
@@ -28,7 +115,8 @@
 @synthesize videoTrack = _videoTrack;
 
 - (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry
-                              messenger:(NSObject<FlutterBinaryMessenger>*)messenger {
+                              messenger:(NSObject<FlutterBinaryMessenger> *)
+                                            messenger {
   self = [super init];
   if (self) {
     _lock = OS_UNFAIR_LOCK_INIT;
@@ -42,9 +130,34 @@
     _eventSink = nil;
     _rotation = -1;
     _textureId = [registry registerTexture:self];
+#if TARGET_OS_OSX
+    NSDictionary<NSString *, NSString *> *environment =
+        NSProcessInfo.processInfo.environment;
+    _inumaTracePath =
+        [environment[@"INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH"] copy];
+    _inumaTrace.enabled = _inumaTracePath.length > 0;
+    _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
+    _inumaFrameReadyMonotonicNs = 0;
+    if (_inumaTrace.enabled) {
+      _inumaTraceQueue = dispatch_queue_create(
+          "dev.inuma.flutter-webrtc.texture-trace", DISPATCH_QUEUE_SERIAL);
+      _inumaTraceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0,
+                                                0, _inumaTraceQueue);
+      dispatch_source_set_timer(
+          _inumaTraceTimer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+          5 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
+      __weak FlutterRTCVideoRenderer *weakSelf = self;
+      dispatch_source_set_event_handler(_inumaTraceTimer, ^{
+        [weakSelf inumaWriteTextureTrace];
+      });
+      dispatch_resume(_inumaTraceTimer);
+    }
+#endif
     /*Create Event Channel.*/
     _eventChannel = [FlutterEventChannel
-        eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/Texture%lld", _textureId]
+        eventChannelWithName:[NSString
+                                 stringWithFormat:@"FlutterWebRTC/Texture%lld",
+                                                  _textureId]
              binaryMessenger:messenger];
     [_eventChannel setStreamHandler:self];
   }
@@ -53,16 +166,49 @@
 
 - (CVPixelBufferRef)copyPixelBuffer {
   CVPixelBufferRef buffer = nil;
+#if TARGET_OS_OSX
+  const uint64_t started =
+      _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+#endif
   os_unfair_lock_lock(&_lock);
+#if TARGET_OS_OSX
+  const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+  if (_inumaTrace.enabled) {
+    _inumaTrace.copy_calls += 1;
+    InumaAppendTraceSample(_inumaTrace.copy_lock_wait_samples,
+                           &_inumaTrace.copy_lock_wait_count, locked - started);
+  }
+#endif
   if (_pixelBufferRef != nil && _frameAvailable) {
     buffer = CVBufferRetain(_pixelBufferRef);
     _frameAvailable = false;
+#if TARGET_OS_OSX
+    if (_inumaTrace.enabled) {
+      _inumaTrace.copy_hits += 1;
+      if (_inumaFrameReadyMonotonicNs > 0 &&
+          locked >= _inumaFrameReadyMonotonicNs) {
+        InumaAppendTraceSample(_inumaTrace.copy_ready_age_samples,
+                               &_inumaTrace.copy_ready_age_count,
+                               locked - _inumaFrameReadyMonotonicNs);
+      }
+    }
+#endif
+#if TARGET_OS_OSX
+  } else if (_inumaTrace.enabled) {
+    _inumaTrace.copy_misses += 1;
+#endif
   }
   os_unfair_lock_unlock(&_lock);
   return buffer;
 }
 
 - (void)dispose {
+#if TARGET_OS_OSX
+  if (_inumaTraceTimer != nil) {
+    dispatch_source_cancel(_inumaTraceTimer);
+    _inumaTraceTimer = nil;
+  }
+#endif
   os_unfair_lock_lock(&_lock);
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
@@ -72,10 +218,13 @@
   }
   _frameAvailable = false;
   os_unfair_lock_unlock(&_lock);
+#if TARGET_OS_OSX
+  [self inumaWriteTextureTrace];
+#endif
 }
 
-- (void)setVideoTrack:(RTCVideoTrack*)videoTrack {
-  RTCVideoTrack* oldValue = self.videoTrack;
+- (void)setVideoTrack:(RTCVideoTrack *)videoTrack {
+  RTCVideoTrack *oldValue = self.videoTrack;
   if (oldValue != videoTrack) {
     os_unfair_lock_lock(&_lock);
     _videoTrack = videoTrack;
@@ -104,8 +253,8 @@
     rotated_height = temp;
   }
 
-  id<RTCI420Buffer> buffer = [[RTCI420Buffer alloc] initWithWidth:rotated_width
-                                                           height:rotated_height];
+  id<RTCI420Buffer> buffer =
+      [[RTCI420Buffer alloc] initWithWidth:rotated_width height:rotated_height];
 
   [RTCYUVHelper I420Rotate:src.dataY
                 srcStrideY:src.strideY
@@ -113,11 +262,11 @@
                 srcStrideU:src.strideU
                       srcV:src.dataV
                 srcStrideV:src.strideV
-                      dstY:(uint8_t*)buffer.dataY
+                      dstY:(uint8_t *)buffer.dataY
                 dstStrideY:buffer.strideY
-                      dstU:(uint8_t*)buffer.dataU
+                      dstU:(uint8_t *)buffer.dataU
                 dstStrideU:buffer.strideU
-                      dstV:(uint8_t*)buffer.dataV
+                      dstV:(uint8_t *)buffer.dataV
                 dstStrideV:buffer.strideV
                      width:src.width
                     height:src.height
@@ -127,7 +276,7 @@
 }
 
 - (void)copyI420ToCVPixelBuffer:(CVPixelBufferRef)outputPixelBuffer
-                      withFrame:(RTCVideoFrame*)frame {
+                      withFrame:(RTCVideoFrame *)frame {
   id<RTCI420Buffer> i420Buffer = [self correctRotation:[frame.buffer toI420]
                                           withRotation:frame.rotation];
   CVPixelBufferLockBaseAddress(outputPixelBuffer, 0);
@@ -136,10 +285,12 @@
   if (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
       pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
     // NV12
-    uint8_t* dstY = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 0);
-    const size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 0);
-    uint8_t* dstUV = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 1);
-    const size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 1);
+    uint8_t *dstY = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 0);
+    const size_t dstYStride =
+        CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 0);
+    uint8_t *dstUV = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 1);
+    const size_t dstUVStride =
+        CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 1);
 
     [RTCYUVHelper I420ToNV12:i420Buffer.dataY
                   srcStrideY:i420Buffer.strideY
@@ -155,7 +306,7 @@
                       height:i420Buffer.height];
 
   } else {
-    uint8_t* dst = CVPixelBufferGetBaseAddress(outputPixelBuffer);
+    uint8_t *dst = CVPixelBufferGetBaseAddress(outputPixelBuffer);
     const size_t bytesPerRow = CVPixelBufferGetBytesPerRow(outputPixelBuffer);
 
     if (pixelFormat == kCVPixelFormatType_32BGRA) {
@@ -191,26 +342,82 @@
 }
 
 #pragma mark - RTCVideoRenderer methods
-- (void)renderFrame:(RTCVideoFrame*)frame {
+- (void)renderFrame:(RTCVideoFrame *)frame {
 
+#if TARGET_OS_OSX
+  const uint64_t started =
+      _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+#endif
   os_unfair_lock_lock(&_lock);
-  if(_videoTrack == nil) {
+#if TARGET_OS_OSX
+  const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+  if (_inumaTrace.enabled) {
+    _inumaTrace.render_frames += 1;
+    InumaAppendTraceSample(_inumaTrace.render_lock_wait_samples,
+                           &_inumaTrace.render_lock_wait_count,
+                           locked - started);
+    [self inumaRecordSourceBuffer:frame.buffer];
+  }
+#endif
+  if (_videoTrack == nil) {
     os_unfair_lock_unlock(&_lock);
     return;
   }
-  if(!_frameAvailable && _pixelBufferRef) {
+  if (!_frameAvailable && _pixelBufferRef) {
+#if TARGET_OS_OSX
+    bool usedNativeNV12 = false;
+    if (_inumaPixelMode == InumaMacOSPixelModeNativeNV12) {
+      usedNativeNV12 = [self inumaAdoptNativeNV12BufferFromFrame:frame];
+      if (_inumaTrace.enabled && !usedNativeNV12) {
+        _inumaTrace.native_nv12_fallback_frames += 1;
+      }
+    }
+    if (!usedNativeNV12) {
+      const uint64_t conversionStarted =
+          _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+      [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
+      if (_inumaTrace.enabled) {
+        InumaAppendTraceSample(_inumaTrace.conversion_samples,
+                               &_inumaTrace.conversion_count,
+                               InumaMonotonicNanoseconds() - conversionStarted);
+      }
+    }
+#else
     [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
-    if(_textureId != -1) {
+#endif
+    if (_textureId != -1) {
+#if TARGET_OS_OSX
+      const uint64_t notifyStarted =
+          _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
       [_registry textureFrameAvailable:_textureId];
+      if (_inumaTrace.enabled) {
+        InumaAppendTraceSample(_inumaTrace.texture_notify_samples,
+                               &_inumaTrace.texture_notify_count,
+                               InumaMonotonicNanoseconds() - notifyStarted);
+      }
+#else
+      [_registry textureFrameAvailable:_textureId];
+#endif
     }
     _frameAvailable = true;
+#if TARGET_OS_OSX
+    _inumaFrameReadyMonotonicNs =
+        _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.accepted_frames += 1;
+    }
+#endif
+#if TARGET_OS_OSX
+  } else if (_inumaTrace.enabled) {
+    _inumaTrace.coalesced_frames += 1;
+#endif
   }
   os_unfair_lock_unlock(&_lock);
 
-  __weak FlutterRTCVideoRenderer* weakSelf = self;
+  __weak FlutterRTCVideoRenderer *weakSelf = self;
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
     dispatch_async(dispatch_get_main_queue(), ^{
-      FlutterRTCVideoRenderer* strongSelf = weakSelf;
+      FlutterRTCVideoRenderer *strongSelf = weakSelf;
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{
           @"event" : @"didTextureChangeVideoSize",
@@ -225,7 +432,7 @@
 
   if (frame.rotation != _rotation) {
     dispatch_async(dispatch_get_main_queue(), ^{
-      FlutterRTCVideoRenderer* strongSelf = weakSelf;
+      FlutterRTCVideoRenderer *strongSelf = weakSelf;
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{
           @"event" : @"didTextureChangeRotation",
@@ -240,7 +447,7 @@
 
   // Notify the Flutter new pixelBufferRef to be ready.
   dispatch_async(dispatch_get_main_queue(), ^{
-    FlutterRTCVideoRenderer* strongSelf = weakSelf;
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
     if (!strongSelf->_isFirstFrameRendered) {
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{@"event" : @"didFirstFrameRendered"});
@@ -249,6 +456,111 @@
     }
   });
 }
+
+#if TARGET_OS_OSX
+- (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer {
+  if ([buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
+    _inumaTrace.source_cv_pixel_buffer_frames += 1;
+    const OSType format = CVPixelBufferGetPixelFormatType(
+        ((RTCCVPixelBuffer *)buffer).pixelBuffer);
+    if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+      _inumaTrace.source_nv12_frames += 1;
+    } else if (format == kCVPixelFormatType_32BGRA) {
+      _inumaTrace.source_bgra_frames += 1;
+    } else {
+      _inumaTrace.source_other_pixel_format_frames += 1;
+    }
+  } else {
+    _inumaTrace.source_i420_frames += 1;
+  }
+}
+
+- (bool)inumaAdoptNativeNV12BufferFromFrame:(RTCVideoFrame *)frame {
+  if (frame.rotation != RTCVideoRotation_0 ||
+      ![frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
+    return false;
+  }
+  RTCCVPixelBuffer *source = (RTCCVPixelBuffer *)frame.buffer;
+  CVPixelBufferRef pixelBuffer = source.pixelBuffer;
+  const OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  if ((format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+       format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ||
+      [source requiresCropping] ||
+      [source requiresScalingToWidth:frame.width height:frame.height] ||
+      CVPixelBufferGetIOSurface(pixelBuffer) == nil) {
+    return false;
+  }
+  CVBufferRetain(pixelBuffer);
+  CVPixelBufferRef oldBuffer = _pixelBufferRef;
+  _pixelBufferRef = pixelBuffer;
+  if (oldBuffer != nil) {
+    CVBufferRelease(oldBuffer);
+  }
+  if (_inumaTrace.enabled) {
+    _inumaTrace.native_nv12_frames += 1;
+  }
+  return true;
+}
+
+- (void)inumaWriteTextureTrace {
+  if (!_inumaTrace.enabled || _inumaTracePath.length == 0) {
+    return;
+  }
+  InumaTextureTrace *snapshot = malloc(sizeof(InumaTextureTrace));
+  if (snapshot == NULL) {
+    return;
+  }
+  os_unfair_lock_lock(&_lock);
+  *snapshot = _inumaTrace;
+  os_unfair_lock_unlock(&_lock);
+  NSString *mode = _inumaPixelMode == InumaMacOSPixelModeNativeNV12
+                       ? @"native_nv12"
+                       : @"stock_bgra";
+  NSDictionary *report = @{
+    @"schema" : @"inuma.flutter_webrtc.macos_texture_trace.v1",
+    @"status" : @"pass",
+    @"pixel_mode" : mode,
+    @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
+    @"sample_capacity" : @(kInumaTextureTraceCapacity),
+    @"render_frames" : @(snapshot->render_frames),
+    @"accepted_frames" : @(snapshot->accepted_frames),
+    @"coalesced_frames" : @(snapshot->coalesced_frames),
+    @"copy_calls" : @(snapshot->copy_calls),
+    @"copy_hits" : @(snapshot->copy_hits),
+    @"copy_misses" : @(snapshot->copy_misses),
+    @"source_cv_pixel_buffer_frames" :
+        @(snapshot->source_cv_pixel_buffer_frames),
+    @"source_i420_frames" : @(snapshot->source_i420_frames),
+    @"source_nv12_frames" : @(snapshot->source_nv12_frames),
+    @"source_bgra_frames" : @(snapshot->source_bgra_frames),
+    @"source_other_pixel_format_frames" :
+        @(snapshot->source_other_pixel_format_frames),
+    @"native_nv12_frames" : @(snapshot->native_nv12_frames),
+    @"native_nv12_fallback_frames" : @(snapshot->native_nv12_fallback_frames),
+    @"conversion_ns" : InumaTraceSampleArray(snapshot->conversion_samples,
+                                             snapshot->conversion_count),
+    @"render_lock_wait_ns" : InumaTraceSampleArray(
+        snapshot->render_lock_wait_samples, snapshot->render_lock_wait_count),
+    @"copy_lock_wait_ns" : InumaTraceSampleArray(
+        snapshot->copy_lock_wait_samples, snapshot->copy_lock_wait_count),
+    @"copy_ready_age_ns" : InumaTraceSampleArray(
+        snapshot->copy_ready_age_samples, snapshot->copy_ready_age_count),
+    @"texture_notify_ns" : InumaTraceSampleArray(
+        snapshot->texture_notify_samples, snapshot->texture_notify_count),
+  };
+  NSError *error = nil;
+  NSData *data = [NSJSONSerialization dataWithJSONObject:report
+                                                 options:0
+                                                   error:&error];
+  if (data == nil || error != nil) {
+    free(snapshot);
+    return;
+  }
+  [data writeToFile:_inumaTracePath options:NSDataWritingAtomic error:&error];
+  free(snapshot);
+}
+#endif
 
 /**
  * Sets the size of the video frame to render.
@@ -261,9 +573,11 @@
     if (_pixelBufferRef) {
       CVBufferRelease(_pixelBufferRef);
     }
-    NSDictionary* pixelAttributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
-    CVPixelBufferCreate(kCFAllocatorDefault, size.width, size.height, kCVPixelFormatType_32BGRA,
-                        (__bridge CFDictionaryRef)(pixelAttributes), &_pixelBufferRef);
+    NSDictionary *pixelAttributes =
+        @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+    CVPixelBufferCreate(
+        kCFAllocatorDefault, size.width, size.height, kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)(pixelAttributes), &_pixelBufferRef);
     _frameAvailable = false;
     _frameSize = size;
   }
@@ -272,13 +586,14 @@
 
 #pragma mark - FlutterStreamHandler methods
 
-- (FlutterError* _Nullable)onCancelWithArguments:(id _Nullable)arguments {
+- (FlutterError *_Nullable)onCancelWithArguments:(id _Nullable)arguments {
   _eventSink = nil;
   return nil;
 }
 
-- (FlutterError* _Nullable)onListenWithArguments:(id _Nullable)arguments
-                                       eventSink:(nonnull FlutterEventSink)sink {
+- (FlutterError *_Nullable)onListenWithArguments:(id _Nullable)arguments
+                                       eventSink:
+                                           (nonnull FlutterEventSink)sink {
   _eventSink = sink;
   return nil;
 }
@@ -286,12 +601,15 @@
 
 @implementation FlutterWebRTCPlugin (FlutterVideoRendererManager)
 
-- (FlutterRTCVideoRenderer*)createWithTextureRegistry:(id<FlutterTextureRegistry>)registry
-                                            messenger:(NSObject<FlutterBinaryMessenger>*)messenger {
-  return [[FlutterRTCVideoRenderer alloc] initWithTextureRegistry:registry messenger:messenger];
+- (FlutterRTCVideoRenderer *)
+    createWithTextureRegistry:(id<FlutterTextureRegistry>)registry
+                    messenger:(NSObject<FlutterBinaryMessenger> *)messenger {
+  return [[FlutterRTCVideoRenderer alloc] initWithTextureRegistry:registry
+                                                        messenger:messenger];
 }
 
-- (void)rendererSetSrcObject:(FlutterRTCVideoRenderer*)renderer stream:(RTCVideoTrack*)videoTrack {
+- (void)rendererSetSrcObject:(FlutterRTCVideoRenderer *)renderer
+                      stream:(RTCVideoTrack *)videoTrack {
   renderer.videoTrack = videoTrack;
 }
 @end
