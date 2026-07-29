@@ -3,6 +3,8 @@
 
 [Unreleased]
 
+* [Darwin/Android] fix: serialize data channel `eventSink`/`eventQueue` access between the WebRTC signaling thread and the platform thread. On iOS the unsynchronized access could crash with `EXC_BAD_ACCESS` in `objc_retain` inside `-[RTCDataChannel(Flutter) onListenWithArguments:eventSink:]`.
+
 [1.5.2] - 2026-06-20
 
 * [Android] expose the internally managed audio device module to embedders (#2099).
