@@ -43,11 +43,16 @@ typedef struct {
   uint64_t copy_lock_wait_samples[kInumaTextureTraceCapacity];
   uint64_t copy_ready_age_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
+  uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
+  uint8_t render_outcome_samples[kInumaTextureTraceCapacity];
+  uint64_t coalesced_pending_age_samples[kInumaTextureTraceCapacity];
   NSUInteger conversion_count;
   NSUInteger render_lock_wait_count;
   NSUInteger copy_lock_wait_count;
   NSUInteger copy_ready_age_count;
   NSUInteger texture_notify_count;
+  NSUInteger render_event_count;
+  NSUInteger coalesced_pending_age_count;
 } InumaTextureTrace;
 
 static uint64_t InumaMonotonicNanoseconds(void) {
@@ -65,6 +70,15 @@ static void InumaAppendTraceSample(uint64_t *samples, NSUInteger *count,
 
 static NSArray<NSNumber *> *InumaTraceSampleArray(const uint64_t *samples,
                                                   NSUInteger count) {
+  NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+static NSArray<NSNumber *> *InumaTraceByteSampleArray(const uint8_t *samples,
+                                                      NSUInteger count) {
   NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:count];
   for (NSUInteger index = 0; index < count; index++) {
     [values addObject:@(samples[index])];
@@ -103,6 +117,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   NSString *_inumaTracePath;
   InumaMacOSPixelMode _inumaPixelMode;
   InumaTextureTrace _inumaTrace;
+  uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
   dispatch_queue_t _inumaTraceQueue;
   dispatch_source_t _inumaTraceTimer;
@@ -137,6 +152,8 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         [environment[@"INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH"] copy];
     _inumaTrace.enabled = _inumaTracePath.length > 0;
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
+    _inumaTraceStartedMonotonicNs =
+        _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameReadyMonotonicNs = 0;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
@@ -347,12 +364,22 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
 #if TARGET_OS_OSX
   const uint64_t started =
       _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+  NSUInteger inumaRenderEventIndex = NSNotFound;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
   const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   if (_inumaTrace.enabled) {
     _inumaTrace.render_frames += 1;
+    if (_inumaTraceStartedMonotonicNs > 0 &&
+        locked >= _inumaTraceStartedMonotonicNs &&
+        _inumaTrace.render_event_count < kInumaTextureTraceCapacity) {
+      inumaRenderEventIndex = _inumaTrace.render_event_count;
+      _inumaTrace.render_event_offset_samples[inumaRenderEventIndex] =
+          locked - _inumaTraceStartedMonotonicNs;
+      _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 0;
+      _inumaTrace.render_event_count += 1;
+    }
     InumaAppendTraceSample(_inumaTrace.render_lock_wait_samples,
                            &_inumaTrace.render_lock_wait_count,
                            locked - started);
@@ -405,11 +432,23 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     if (_inumaTrace.enabled) {
       _inumaTrace.accepted_frames += 1;
+      if (inumaRenderEventIndex != NSNotFound) {
+        _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 1;
+      }
     }
 #endif
 #if TARGET_OS_OSX
   } else if (_inumaTrace.enabled) {
     _inumaTrace.coalesced_frames += 1;
+    if (inumaRenderEventIndex != NSNotFound) {
+      _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 2;
+    }
+    if (_inumaFrameReadyMonotonicNs > 0 &&
+        locked >= _inumaFrameReadyMonotonicNs) {
+      InumaAppendTraceSample(_inumaTrace.coalesced_pending_age_samples,
+                             &_inumaTrace.coalesced_pending_age_count,
+                             locked - _inumaFrameReadyMonotonicNs);
+    }
 #endif
   }
   os_unfair_lock_unlock(&_lock);
@@ -523,6 +562,9 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
+    @"tail_diagnostics_version" : @2,
+    @"trace_clock_domain" :
+        @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"render_frames" : @(snapshot->render_frames),
     @"accepted_frames" : @(snapshot->accepted_frames),
     @"coalesced_frames" : @(snapshot->coalesced_frames),
@@ -548,6 +590,19 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         snapshot->copy_ready_age_samples, snapshot->copy_ready_age_count),
     @"texture_notify_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_samples, snapshot->texture_notify_count),
+    @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
+    @"render_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->render_event_offset_samples, snapshot->render_event_count),
+    @"render_outcome" : InumaTraceByteSampleArray(
+        snapshot->render_outcome_samples, snapshot->render_event_count),
+    @"render_outcome_codes" : @{
+      @"0" : @"ignored",
+      @"1" : @"accepted",
+      @"2" : @"coalesced",
+    },
+    @"coalesced_pending_age_ns" : InumaTraceSampleArray(
+        snapshot->coalesced_pending_age_samples,
+        snapshot->coalesced_pending_age_count),
   };
   NSError *error = nil;
   NSData *data = [NSJSONSerialization dataWithJSONObject:report
