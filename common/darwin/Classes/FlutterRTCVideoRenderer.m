@@ -16,7 +16,10 @@
 #import <os/lock.h>
 
 #if TARGET_OS_OSX
-enum { kInumaTextureTraceCapacity = 8192 };
+enum {
+  kInumaTextureTraceCapacity = 8192,
+  kInumaStockBGRAPoolMinimumBufferCount = 4,
+};
 
 typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
   InumaMacOSPixelModeStockBGRA = 0,
@@ -38,6 +41,9 @@ typedef struct {
   uint64_t source_other_pixel_format_frames;
   uint64_t native_nv12_frames;
   uint64_t native_nv12_fallback_frames;
+  uint64_t stock_bgra_pool_create_failures;
+  uint64_t stock_bgra_pool_buffer_requests;
+  uint64_t stock_bgra_pool_buffer_failures;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
   uint64_t copy_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -113,6 +119,8 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
 @interface FlutterRTCVideoRenderer ()
 - (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer;
 - (bool)inumaAdoptNativeNV12BufferFromFrame:(RTCVideoFrame *)frame;
+- (bool)inumaPrepareFreshStockBGRABuffer;
+- (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size;
 - (void)inumaWriteTextureTrace;
 @end
 #endif
@@ -133,6 +141,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
   int64_t _inumaFrameTimestampNs;
+  CVPixelBufferPoolRef _inumaStockBGRAPixelBufferPool;
   dispatch_queue_t _inumaTraceQueue;
   dispatch_source_t _inumaTraceTimer;
 #endif
@@ -170,6 +179,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameReadyMonotonicNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
           "dev.inuma.flutter-webrtc.texture-trace", DISPATCH_QUEUE_SERIAL);
@@ -258,6 +268,12 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     CVBufferRelease(_pixelBufferRef);
     _pixelBufferRef = nil;
   }
+#if TARGET_OS_OSX
+  if (_inumaStockBGRAPixelBufferPool) {
+    CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
+    _inumaStockBGRAPixelBufferPool = nil;
+  }
+#endif
   _frameAvailable = false;
   os_unfair_lock_unlock(&_lock);
 #if TARGET_OS_OSX
@@ -417,30 +433,37 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     os_unfair_lock_unlock(&_lock);
     return;
   }
-  if (!_frameAvailable && _pixelBufferRef) {
+#if TARGET_OS_OSX
+  const bool canAcceptFrame =
+      !_frameAvailable &&
+      (_inumaPixelMode == InumaMacOSPixelModeNativeNV12 ||
+       _inumaStockBGRAPixelBufferPool != nil);
+#else
+  const bool canAcceptFrame = !_frameAvailable && _pixelBufferRef != nil;
+#endif
+  if (canAcceptFrame) {
 #if TARGET_OS_OSX
     bool usedNativeNV12 = false;
+    bool framePrepared = false;
     if (_inumaPixelMode == InumaMacOSPixelModeNativeNV12) {
       usedNativeNV12 = [self inumaAdoptNativeNV12BufferFromFrame:frame];
       if (_inumaTrace.enabled && !usedNativeNV12) {
         _inumaTrace.native_nv12_fallback_frames += 1;
       }
     }
-    if (!usedNativeNV12) {
+    framePrepared = usedNativeNV12;
+    if (!framePrepared && [self inumaPrepareFreshStockBGRABuffer]) {
       const uint64_t conversionStarted =
           _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
       [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
+      framePrepared = true;
       if (_inumaTrace.enabled) {
         InumaAppendTraceSample(_inumaTrace.conversion_samples,
                                &_inumaTrace.conversion_count,
                                InumaMonotonicNanoseconds() - conversionStarted);
       }
     }
-#else
-    [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
-#endif
-    if (_textureId != -1) {
-#if TARGET_OS_OSX
+    if (framePrepared && _textureId != -1) {
       const uint64_t notifyStarted =
           _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
       [_registry textureFrameAvailable:_textureId];
@@ -449,21 +472,23 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
                                &_inumaTrace.texture_notify_count,
                                InumaMonotonicNanoseconds() - notifyStarted);
       }
-#else
-      [_registry textureFrameAvailable:_textureId];
-#endif
     }
-    _frameAvailable = true;
-#if TARGET_OS_OSX
+    _frameAvailable = framePrepared;
     _inumaFrameReadyMonotonicNs =
-        _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
-    _inumaFrameTimestampNs = frame.timeStampNs;
-    if (_inumaTrace.enabled) {
+        _inumaTrace.enabled && framePrepared ? InumaMonotonicNanoseconds() : 0;
+    _inumaFrameTimestampNs = framePrepared ? frame.timeStampNs : 0;
+    if (_inumaTrace.enabled && framePrepared) {
       _inumaTrace.accepted_frames += 1;
       if (inumaRenderEventIndex != NSNotFound) {
         _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 1;
       }
     }
+#else
+    [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
+    if (_textureId != -1) {
+      [_registry textureFrameAvailable:_textureId];
+    }
+    _frameAvailable = true;
 #endif
 #if TARGET_OS_OSX
   } else if (_inumaTrace.enabled) {
@@ -570,6 +595,56 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   return true;
 }
 
+- (bool)inumaPrepareFreshStockBGRABuffer {
+  // Flutter retains the returned CVPixelBuffer while Metal presents it
+  // asynchronously. Never overwrite that same backing for the next frame;
+  // the pool recycles it only after downstream owners release it.
+  _inumaTrace.stock_bgra_pool_buffer_requests += 1;
+  CVPixelBufferRef freshBuffer = nil;
+  CVReturn result = kCVReturnInvalidArgument;
+  if (_inumaStockBGRAPixelBufferPool != nil) {
+    result = CVPixelBufferPoolCreatePixelBuffer(
+        kCFAllocatorDefault, _inumaStockBGRAPixelBufferPool, &freshBuffer);
+  }
+  if (result != kCVReturnSuccess || freshBuffer == nil) {
+    _inumaTrace.stock_bgra_pool_buffer_failures += 1;
+    return false;
+  }
+  CVPixelBufferRef oldBuffer = _pixelBufferRef;
+  _pixelBufferRef = freshBuffer;
+  if (oldBuffer != nil) {
+    CVBufferRelease(oldBuffer);
+  }
+  return true;
+}
+
+- (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size {
+  if (_inumaStockBGRAPixelBufferPool != nil) {
+    CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
+    _inumaStockBGRAPixelBufferPool = nil;
+  }
+  NSDictionary *pixelAttributes = @{
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    (id)kCVPixelBufferWidthKey : @(size.width),
+    (id)kCVPixelBufferHeightKey : @(size.height),
+    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+  };
+  NSDictionary *poolAttributes = @{
+    (id)kCVPixelBufferPoolMinimumBufferCountKey :
+        @(kInumaStockBGRAPoolMinimumBufferCount),
+  };
+  CVReturn result = CVPixelBufferPoolCreate(
+      kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttributes,
+      (__bridge CFDictionaryRef)pixelAttributes,
+      &_inumaStockBGRAPixelBufferPool);
+  if (result != kCVReturnSuccess ||
+      _inumaStockBGRAPixelBufferPool == nil) {
+    _inumaTrace.stock_bgra_pool_create_failures += 1;
+    _inumaStockBGRAPixelBufferPool = nil;
+  }
+}
+
 - (void)inumaWriteTextureTrace {
   if (!_inumaTrace.enabled || _inumaTracePath.length == 0) {
     return;
@@ -590,7 +665,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @3,
+    @"tail_diagnostics_version" : @4,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"render_frames" : @(snapshot->render_frames),
@@ -608,6 +683,15 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         @(snapshot->source_other_pixel_format_frames),
     @"native_nv12_frames" : @(snapshot->native_nv12_frames),
     @"native_nv12_fallback_frames" : @(snapshot->native_nv12_fallback_frames),
+    @"stock_bgra_pool_minimum_buffer_count" :
+        @(kInumaStockBGRAPoolMinimumBufferCount),
+    @"stock_bgra_pool_create_failures" :
+        @(snapshot->stock_bgra_pool_create_failures),
+    @"stock_bgra_pool_buffer_requests" :
+        @(snapshot->stock_bgra_pool_buffer_requests),
+    @"stock_bgra_pool_buffer_failures" :
+        @(snapshot->stock_bgra_pool_buffer_failures),
+    @"mutable_single_bgra_buffer_reuse_enabled" : @NO,
     @"conversion_ns" : InumaTraceSampleArray(snapshot->conversion_samples,
                                              snapshot->conversion_count),
     @"render_lock_wait_ns" : InumaTraceSampleArray(
@@ -663,12 +747,17 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   if (size.width != _frameSize.width || size.height != _frameSize.height) {
     if (_pixelBufferRef) {
       CVBufferRelease(_pixelBufferRef);
+      _pixelBufferRef = nil;
     }
+#if TARGET_OS_OSX
+    [self inumaResetStockBGRAPixelBufferPoolForSize:size];
+#else
     NSDictionary *pixelAttributes =
         @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
     CVPixelBufferCreate(
         kCFAllocatorDefault, size.width, size.height, kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef)(pixelAttributes), &_pixelBufferRef);
+#endif
     _frameAvailable = false;
     _frameSize = size;
   }
