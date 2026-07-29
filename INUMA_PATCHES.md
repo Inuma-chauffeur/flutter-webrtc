@@ -13,6 +13,10 @@
   `INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH=/private/scalar/path.json`.
   The renderer retains only bounded scalar counts and nanosecond timing
   samples. It never retains pixel or tensor payloads.
+- Tail diagnostics v3 retain the WebRTC frame timestamp beside each native
+  render callback and successful Flutter raster-thread texture copy, plus the
+  copy event's Mac monotonic offset. This distinguishes decoder/plugin
+  acceptance from raster consumption without retaining media bytes.
 - A/B opt-in:
   `INUMA_FLUTTER_WEBRTC_MACOS_PIXEL_MODE=native_nv12`.
   This path is used only when the decoded frame is an uncropped, unscaled,
