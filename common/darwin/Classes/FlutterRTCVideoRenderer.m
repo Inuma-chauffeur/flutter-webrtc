@@ -48,6 +48,7 @@ typedef struct {
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
   uint64_t copy_lock_wait_samples[kInumaTextureTraceCapacity];
   uint64_t copy_ready_age_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_dispatch_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
   uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t render_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
@@ -59,6 +60,7 @@ typedef struct {
   NSUInteger render_lock_wait_count;
   NSUInteger copy_lock_wait_count;
   NSUInteger copy_ready_age_count;
+  NSUInteger texture_notify_dispatch_count;
   NSUInteger texture_notify_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
@@ -406,6 +408,9 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   const uint64_t started =
       _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   NSUInteger inumaRenderEventIndex = NSNotFound;
+  bool inumaShouldNotifyTexture = false;
+  int64_t inumaTextureIdToNotify = -1;
+  uint64_t inumaNotifyEnqueuedMonotonicNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -468,14 +473,10 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         _inumaTrace.enabled && framePrepared ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameTimestampNs = framePrepared ? frame.timeStampNs : 0;
     if (framePrepared && _textureId != -1) {
-      const uint64_t notifyStarted =
+      inumaShouldNotifyTexture = true;
+      inumaTextureIdToNotify = _textureId;
+      inumaNotifyEnqueuedMonotonicNs =
           _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
-      [_registry textureFrameAvailable:_textureId];
-      if (_inumaTrace.enabled) {
-        InumaAppendTraceSample(_inumaTrace.texture_notify_samples,
-                               &_inumaTrace.texture_notify_count,
-                               InumaMonotonicNanoseconds() - notifyStarted);
-      }
     }
     if (_inumaTrace.enabled && framePrepared) {
       _inumaTrace.accepted_frames += 1;
@@ -507,6 +508,49 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   os_unfair_lock_unlock(&_lock);
 
   __weak FlutterRTCVideoRenderer *weakSelf = self;
+#if TARGET_OS_OSX
+  if (inumaShouldNotifyTexture) {
+    void (^notifyTextureFrameAvailable)(void) = ^{
+      FlutterRTCVideoRenderer *strongSelf = weakSelf;
+      if (strongSelf == nil) {
+        return;
+      }
+      const uint64_t notifyStarted = InumaMonotonicNanoseconds();
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool notificationIsCurrent =
+          strongSelf->_textureId == inumaTextureIdToNotify &&
+          strongSelf->_frameAvailable;
+      const bool traceEnabled = strongSelf->_inumaTrace.enabled;
+      id<FlutterTextureRegistry> registry = strongSelf->_registry;
+      os_unfair_lock_unlock(&strongSelf->_lock);
+      if (!notificationIsCurrent || registry == nil) {
+        return;
+      }
+      [registry textureFrameAvailable:inumaTextureIdToNotify];
+      if (traceEnabled) {
+        const uint64_t notifyEnded = InumaMonotonicNanoseconds();
+        os_unfair_lock_lock(&strongSelf->_lock);
+        if (inumaNotifyEnqueuedMonotonicNs > 0 &&
+            notifyStarted >= inumaNotifyEnqueuedMonotonicNs) {
+          InumaAppendTraceSample(
+              strongSelf->_inumaTrace.texture_notify_dispatch_samples,
+              &strongSelf->_inumaTrace.texture_notify_dispatch_count,
+              notifyStarted - inumaNotifyEnqueuedMonotonicNs);
+        }
+        InumaAppendTraceSample(
+            strongSelf->_inumaTrace.texture_notify_samples,
+            &strongSelf->_inumaTrace.texture_notify_count,
+            notifyEnded - notifyStarted);
+        os_unfair_lock_unlock(&strongSelf->_lock);
+      }
+    };
+    if ([NSThread isMainThread]) {
+      notifyTextureFrameAvailable();
+    } else {
+      dispatch_async(dispatch_get_main_queue(), notifyTextureFrameAvailable);
+    }
+  }
+#endif
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
     dispatch_async(dispatch_get_main_queue(), ^{
       FlutterRTCVideoRenderer *strongSelf = weakSelf;
@@ -665,11 +709,14 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @6,
+    @"tail_diagnostics_version" : @7,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
-        @"frame_state_before_same_thread_notification",
+        @"frame_state_before_platform_thread_notification",
+    @"trace_snapshot_monotonic_ns" : @(InumaMonotonicNanoseconds()),
+    @"trace_snapshot_wall_time_ns" :
+        @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0)),
     @"render_frames" : @(snapshot->render_frames),
     @"accepted_frames" : @(snapshot->accepted_frames),
     @"coalesced_frames" : @(snapshot->coalesced_frames),
@@ -702,6 +749,9 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         snapshot->copy_lock_wait_samples, snapshot->copy_lock_wait_count),
     @"copy_ready_age_ns" : InumaTraceSampleArray(
         snapshot->copy_ready_age_samples, snapshot->copy_ready_age_count),
+    @"texture_notify_dispatch_ns" : InumaTraceSampleArray(
+        snapshot->texture_notify_dispatch_samples,
+        snapshot->texture_notify_dispatch_count),
     @"texture_notify_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_samples, snapshot->texture_notify_count),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
