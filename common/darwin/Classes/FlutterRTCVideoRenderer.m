@@ -42,6 +42,11 @@ typedef NS_ENUM(NSUInteger, InumaRenderQoSPolicy) {
   InumaRenderQoSPolicyUserInteractive = 1,
 };
 
+typedef NS_ENUM(NSUInteger, InumaRescueNotificationPhase) {
+  InumaRescueNotificationPhaseDisplayLink = 0,
+  InumaRescueNotificationPhasePlatformTurn = 1,
+};
+
 typedef struct {
   qos_class_t before;
   qos_class_t after;
@@ -423,6 +428,26 @@ static NSString *InumaRenderQoSPolicyName(InumaRenderQoSPolicy policy) {
              : @"inherit";
 }
 
+static InumaRescueNotificationPhase
+InumaRescueNotificationPhaseFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_RESCUE_NOTIFICATION_PHASE"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if ([value isEqualToString:@"platform_turn"]) {
+    return InumaRescueNotificationPhasePlatformTurn;
+  }
+  return InumaRescueNotificationPhaseDisplayLink;
+}
+
+static NSString *
+InumaRescueNotificationPhaseName(InumaRescueNotificationPhase phase) {
+  return phase == InumaRescueNotificationPhasePlatformTurn
+             ? @"platform_turn"
+             : @"display_link";
+}
+
 static InumaRenderQoSObservation
 InumaObserveRenderQoS(InumaRenderQoSPolicy policy) {
   static _Thread_local bool initialized = false;
@@ -542,6 +567,7 @@ static void InumaRecordRenderQoSObservationLocked(
   NSString *_inumaTracePath;
   InumaMacOSPixelMode _inumaPixelMode;
   InumaRenderQoSPolicy _inumaRenderQoSPolicy;
+  InumaRescueNotificationPhase _inumaRescueNotificationPhase;
   InumaTextureTrace _inumaTrace;
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
@@ -606,6 +632,8 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
     _inumaRenderQoSPolicy =
         InumaRenderQoSPolicyFromEnvironment(environment);
+    _inumaRescueNotificationPhase =
+        InumaRescueNotificationPhaseFromEnvironment(environment);
     _inumaMinimumTextureHoldNs =
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
     _inumaRasterRepeatGuardEnabled =
@@ -684,7 +712,7 @@ static void InumaRecordRenderQoSObservationLocked(
   // A rescue notification can reach Flutter's raster thread before Core
   // Animation has had one full minimum-tenure opportunity for the predecessor.
   // Return the retained predecessor once and leave the promoted frame pending;
-  // the existing display-linked rescue schedules its one permitted retry.
+  // the serialized platform-turn owner schedules its one permitted retry.
   const bool repeatGuardEligible =
       _inumaRasterRepeatGuardEnabled && _frameAvailable &&
       _inumaCurrentFrameWasRescuePromoted &&
@@ -801,14 +829,17 @@ static void InumaRecordRenderQoSObservationLocked(
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
-        _inumaTrace.rescue_hold_preservations += 1;
-        const NSUInteger preservationIndex = InumaReserveTraceSample(
-            &_inumaTrace.rescue_hold_preservation_count,
-            &_inumaTrace.sample_capacity_exhaustions);
-        if (preservationIndex != NSNotFound) {
-          _inumaTrace
-              .rescue_hold_preservation_frame_timestamp_ns_samples
-                  [preservationIndex] = promoted.frame_timestamp_ns;
+        if (_inumaRescueNotificationPhase ==
+            InumaRescueNotificationPhaseDisplayLink) {
+          _inumaTrace.rescue_hold_preservations += 1;
+          const NSUInteger preservationIndex = InumaReserveTraceSample(
+              &_inumaTrace.rescue_hold_preservation_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (preservationIndex != NSNotFound) {
+            _inumaTrace
+                .rescue_hold_preservation_frame_timestamp_ns_samples
+                    [preservationIndex] = promoted.frame_timestamp_ns;
+          }
         }
         if (copiedAt >= promoted.ready_monotonic_ns) {
           InumaAppendTraceSample(
@@ -853,11 +884,26 @@ static void InumaRecordRenderQoSObservationLocked(
                                   recordRasterRepeatRetry:true];
   }
   if (notifyPromotedFrame) {
-    [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
-                                      frameTimestampNs:
-                                          promotedFrameTimestampNs
-                              predecessorCopyUptimeNs:
-                                  promotedPredecessorCopyUptimeNs];
+    if (_inumaRescueNotificationPhase ==
+        InumaRescueNotificationPhasePlatformTurn) {
+      // copyPixelBuffer has already committed the predecessor and promoted the
+      // queued frame under the renderer lock. Notify that still-current frame
+      // on one serialized platform turn instead of waiting for a display-link
+      // timestamp that describes the previous display refresh. The existing
+      // repeat guard remains the only early-copy protection.
+      [self inumaScheduleTextureNotificationForTextureId:promotedTextureId
+                                        frameTimestampNs:
+                                            promotedFrameTimestampNs
+                                       bypassMinimumHold:true
+                                      recordRescueBypass:true
+                                recordRasterRepeatRetry:false];
+    } else {
+      [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
+                                        frameTimestampNs:
+                                            promotedFrameTimestampNs
+                                predecessorCopyUptimeNs:
+                                    promotedPredecessorCopyUptimeNs];
+    }
   }
 #endif
   return buffer;
@@ -1944,7 +1990,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @27,
+    @"tail_diagnostics_version" : @28,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1975,6 +2021,10 @@ static void InumaRecordRenderQoSObservationLocked(
     @"raster_repeat_guard_enabled" : @(_inumaRasterRepeatGuardEnabled),
     @"raster_repeat_guard_contract" :
         @"repeat_recent_rescue_predecessor_once_then_platform_turn_retry",
+    @"rescue_notification_phase" :
+        InumaRescueNotificationPhaseName(_inumaRescueNotificationPhase),
+    @"rescue_notification_contract" :
+        @"queued_promotion_only_default_display_link_opt_in_platform_turn",
     @"raster_repeat_guard_eligible_copy_calls" :
         @(snapshot->raster_repeat_guard_eligible_copy_calls),
     @"raster_repeat_guard_repeats" :
