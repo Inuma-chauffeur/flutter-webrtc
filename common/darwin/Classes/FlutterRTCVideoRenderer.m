@@ -10,7 +10,9 @@
 
 #import <objc/runtime.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #import "FlutterWebRTCPlugin.h"
@@ -181,6 +183,79 @@ static NSUInteger InumaReserveTraceSample(NSUInteger *count,
   return index;
 }
 
+static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
+                                        const InumaTextureTrace *source) {
+  // Copy scalar state once, then only each populated sample prefix. Copying the
+  // full capacity-safe structure under the renderer lock would make the
+  // observer itself a source of strict-hold timer lateness.
+  memcpy(destination, source, offsetof(InumaTextureTrace, conversion_samples));
+
+#define INUMA_COPY_TRACE_ARRAY(field, count_field)                         \
+  do {                                                                    \
+    destination->count_field = source->count_field;                       \
+    memcpy(destination->field, source->field,                             \
+           source->count_field * sizeof(source->field[0]));               \
+  } while (0)
+
+  INUMA_COPY_TRACE_ARRAY(conversion_samples, conversion_count);
+  INUMA_COPY_TRACE_ARRAY(render_lock_wait_samples, render_lock_wait_count);
+  INUMA_COPY_TRACE_ARRAY(copy_lock_wait_samples, copy_lock_wait_count);
+  INUMA_COPY_TRACE_ARRAY(copy_ready_age_samples, copy_ready_age_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_dispatch_samples,
+                         texture_notify_dispatch_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_samples, texture_notify_count);
+  INUMA_COPY_TRACE_ARRAY(texture_hold_delay_samples, texture_hold_delay_count);
+  INUMA_COPY_TRACE_ARRAY(texture_hold_frame_timestamp_ns_samples,
+                         texture_hold_delay_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_event_offset_samples,
+                         texture_notify_event_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_frame_timestamp_ns_samples,
+                         texture_notify_event_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_scheduled_delay_samples,
+                         texture_notify_event_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_deadline_lateness_samples,
+                         texture_notify_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_wait_samples, queue_wait_count);
+  INUMA_COPY_TRACE_ARRAY(queue_enqueue_event_offset_samples,
+                         queue_enqueue_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_enqueue_frame_timestamp_ns_samples,
+                         queue_enqueue_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_promote_event_offset_samples,
+                         queue_promote_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_promote_frame_timestamp_ns_samples,
+                         queue_promote_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_hold_bypass_frame_timestamp_ns_samples,
+                         rescue_hold_bypass_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_hold_preservation_frame_timestamp_ns_samples,
+                         rescue_hold_preservation_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_schedule_offset_samples,
+                         rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_fire_offset_samples,
+                         rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_presentation_ack_samples,
+                         rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_callback_count_samples,
+                         rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_frame_timestamp_ns_samples,
+                         rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(strict_hold_timer_deadline_offset_samples,
+                         strict_hold_timer_event_count);
+  INUMA_COPY_TRACE_ARRAY(strict_hold_timer_fire_offset_samples,
+                         strict_hold_timer_event_count);
+  INUMA_COPY_TRACE_ARRAY(strict_hold_timer_frame_timestamp_ns_samples,
+                         strict_hold_timer_event_count);
+  INUMA_COPY_TRACE_ARRAY(render_event_offset_samples, render_event_count);
+  INUMA_COPY_TRACE_ARRAY(render_frame_timestamp_ns_samples,
+                         render_event_count);
+  INUMA_COPY_TRACE_ARRAY(render_outcome_samples, render_event_count);
+  INUMA_COPY_TRACE_ARRAY(coalesced_pending_age_samples,
+                         coalesced_pending_age_count);
+  INUMA_COPY_TRACE_ARRAY(copy_event_offset_samples, copy_event_count);
+  INUMA_COPY_TRACE_ARRAY(copy_frame_timestamp_ns_samples, copy_event_count);
+
+#undef INUMA_COPY_TRACE_ARRAY
+}
+
 static NSArray<NSNumber *> *InumaTraceSampleArray(const uint64_t *samples,
                                                   NSUInteger count) {
   NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:count];
@@ -298,6 +373,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   dispatch_source_t _inumaTraceTimer;
   dispatch_source_t _inumaTextureHoldTimer;
   CADisplayLink *_inumaRescueDisplayLink;
+  uint64_t _inumaTraceSnapshotCount;
+  uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
   uint64_t _inumaRescuePredecessorCopyUptimeNs;
   NSUInteger _inumaRescueDisplayLinkEventIndex;
@@ -345,6 +422,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaFrameTimestampNs = 0;
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
+    _inumaTraceSnapshotCount = 0;
+    _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
     _inumaRescuePredecessorCopyUptimeNs = 0;
     _inumaRescueDisplayLinkEventIndex = NSNotFound;
@@ -1422,11 +1501,17 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
   os_unfair_lock_lock(&_lock);
-  *snapshot = _inumaTrace;
+  const uint64_t traceSnapshotMonotonicNs = InumaMonotonicNanoseconds();
+  InumaCopyTextureTraceLocked(snapshot, &_inumaTrace);
   pendingTextureFrameCount = _inumaPendingTextureFrameCount;
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
   os_unfair_lock_unlock(&_lock);
+  const uint64_t traceSnapshotLockHoldNs =
+      InumaMonotonicNanoseconds() - traceSnapshotMonotonicNs;
+  _inumaTraceSnapshotCount += 1;
+  _inumaTraceSnapshotLockHoldMaxNs =
+      MAX(_inumaTraceSnapshotLockHoldMaxNs, traceSnapshotLockHoldNs);
   NSString *mode = _inumaPixelMode == InumaMacOSPixelModeNativeNV12
                        ? @"native_nv12"
                        : @"stock_bgra";
@@ -1438,12 +1523,16 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @17,
+    @"tail_diagnostics_version" : @18,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
         @"frame_state_before_platform_thread_notification",
-    @"trace_snapshot_monotonic_ns" : @(InumaMonotonicNanoseconds()),
+    @"trace_snapshot_monotonic_ns" : @(traceSnapshotMonotonicNs),
+    @"trace_snapshot_count" : @(_inumaTraceSnapshotCount),
+    @"trace_snapshot_lock_hold_ns" : @(traceSnapshotLockHoldNs),
+    @"trace_snapshot_lock_hold_max_ns" :
+        @(_inumaTraceSnapshotLockHoldMaxNs),
     @"trace_snapshot_wall_time_ns" :
         @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0)),
     @"render_frames" : @(snapshot->render_frames),
