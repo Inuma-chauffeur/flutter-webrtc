@@ -68,6 +68,8 @@ typedef struct {
   uint64_t rescue_display_link_stale_fires;
   uint64_t rescue_display_link_callbacks;
   uint64_t rescue_display_link_deferrals;
+  uint64_t texture_notification_platform_turn_schedules;
+  uint64_t texture_notification_platform_turn_fires;
   uint64_t strict_hold_timer_created;
   uint64_t strict_hold_timer_fired;
   uint64_t strict_hold_timer_cancelled;
@@ -1019,10 +1021,32 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       os_unfair_lock_unlock(&strongSelf->_lock);
     }
   };
-  if ([NSThread isMainThread] && scheduledDelayNs == 0) {
-    notifyTextureFrameAvailable();
-  } else if (scheduledDelayNs == 0) {
-    dispatch_async(dispatch_get_main_queue(), notifyTextureFrameAvailable);
+  void (^notifyOnNextPlatformTurn)(void) = ^{
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    os_unfair_lock_lock(&strongSelf->_lock);
+    if (strongSelf->_inumaTrace.enabled) {
+      strongSelf->_inumaTrace.texture_notification_platform_turn_schedules +=
+          1;
+    }
+    os_unfair_lock_unlock(&strongSelf->_lock);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      FlutterRTCVideoRenderer *innerSelf = weakSelf;
+      if (innerSelf == nil) {
+        return;
+      }
+      os_unfair_lock_lock(&innerSelf->_lock);
+      if (innerSelf->_inumaTrace.enabled) {
+        innerSelf->_inumaTrace.texture_notification_platform_turn_fires += 1;
+      }
+      os_unfair_lock_unlock(&innerSelf->_lock);
+      notifyTextureFrameAvailable();
+    });
+  };
+  if (scheduledDelayNs == 0) {
+    notifyOnNextPlatformTurn();
   } else {
     dispatch_source_t timer = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
@@ -1035,7 +1059,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       os_unfair_lock_unlock(&_lock);
       dispatch_after(
           dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
-          dispatch_get_main_queue(), notifyTextureFrameAvailable);
+          dispatch_get_main_queue(), notifyOnNextPlatformTurn);
       return;
     }
 
@@ -1104,7 +1128,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       os_unfair_lock_unlock(&strongSelf->_lock);
       dispatch_source_cancel(strongTimer);
       if (ownsTimer) {
-        notifyTextureFrameAvailable();
+        notifyOnNextPlatformTurn();
       }
     });
     dispatch_source_set_timer(
@@ -1379,7 +1403,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @15,
+    @"tail_diagnostics_version" : @16,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1430,6 +1454,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         @(snapshot->rescue_display_link_callbacks),
     @"rescue_display_link_deferrals" :
         @(snapshot->rescue_display_link_deferrals),
+    @"texture_notification_platform_turn_schedules" :
+        @(snapshot->texture_notification_platform_turn_schedules),
+    @"texture_notification_platform_turn_fires" :
+        @(snapshot->texture_notification_platform_turn_fires),
     @"rescue_display_link_active_at_snapshot" :
         @(rescueDisplayLinkActive),
     @"strict_hold_timer_created" :
