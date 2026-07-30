@@ -27,6 +27,7 @@ enum {
   kInumaTextureTraceCapacity = 65536,
   kInumaStockBGRAPoolMinimumBufferCount = 4,
   kInumaPendingTextureFrameCapacity = 1,
+  kInumaCopiedBufferHoldCapacity = 2,
 };
 
 typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
@@ -80,6 +81,9 @@ typedef struct {
   uint64_t stock_bgra_pool_create_failures;
   uint64_t stock_bgra_pool_buffer_requests;
   uint64_t stock_bgra_pool_buffer_failures;
+  uint64_t copied_buffer_holds;
+  uint64_t copied_buffer_second_next_copy_releases;
+  uint64_t copied_buffer_lifecycle_releases;
   uint64_t sample_capacity_exhaustions;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -122,6 +126,8 @@ typedef struct {
   uint64_t coalesced_pending_age_samples[kInumaTextureTraceCapacity];
   uint64_t copy_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t copy_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t copied_buffer_second_next_copy_hold_samples
+      [kInumaTextureTraceCapacity];
   NSUInteger conversion_count;
   NSUInteger render_lock_wait_count;
   NSUInteger copy_lock_wait_count;
@@ -140,6 +146,7 @@ typedef struct {
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
+  NSUInteger copied_buffer_second_next_copy_hold_count;
 } InumaTextureTrace;
 
 static uint64_t InumaMonotonicNanoseconds(void) {
@@ -252,6 +259,8 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          coalesced_pending_age_count);
   INUMA_COPY_TRACE_ARRAY(copy_event_offset_samples, copy_event_count);
   INUMA_COPY_TRACE_ARRAY(copy_frame_timestamp_ns_samples, copy_event_count);
+  INUMA_COPY_TRACE_ARRAY(copied_buffer_second_next_copy_hold_samples,
+                         copied_buffer_second_next_copy_hold_count);
 
 #undef INUMA_COPY_TRACE_ARRAY
 }
@@ -339,6 +348,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     API_AVAILABLE(macos(14.0));
 - (void)inumaCancelTextureHoldTimerLocked;
 - (void)inumaCancelRescueDisplayLinkLocked;
+- (void)inumaRetainCopiedBufferHoldLocked:(CVPixelBufferRef)pixelBuffer
+                                 copiedAt:(uint64_t)copiedAt;
+- (void)inumaReleaseOldestCopiedBufferHoldLockedAt:(uint64_t)releasedAt
+                                          lifecycle:(bool)lifecycle;
+- (void)inumaReleaseAllCopiedBufferHoldsLockedAt:(uint64_t)releasedAt;
 - (void)inumaClearPendingTextureFramesLocked;
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size;
 - (void)inumaWriteTextureTrace;
@@ -368,6 +382,13 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   InumaPendingTextureFrame
       _inumaPendingTextureFrames[kInumaPendingTextureFrameCapacity];
   int64_t _inumaFrameTimestampNs;
+  CVPixelBufferRef
+      _inumaCopiedBufferHoldRefs[kInumaCopiedBufferHoldCapacity];
+  uint64_t
+      _inumaCopiedBufferHoldStartedMonotonicNs
+          [kInumaCopiedBufferHoldCapacity];
+  NSUInteger _inumaCopiedBufferHoldHead;
+  NSUInteger _inumaCopiedBufferHoldCount;
   CVPixelBufferPoolRef _inumaStockBGRAPixelBufferPool;
   dispatch_queue_t _inumaTraceQueue;
   dispatch_source_t _inumaTraceTimer;
@@ -420,6 +441,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaCopiedBufferHoldHead = 0;
+    _inumaCopiedBufferHoldCount = 0;
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
     _inumaTraceSnapshotCount = 0;
@@ -481,6 +504,13 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
 #if TARGET_OS_OSX
     const uint64_t copiedAt = InumaMonotonicNanoseconds();
     const uint64_t copiedAtUptimeNs = InumaUptimeNanoseconds();
+    // A display-acknowledged rescue may request the next raster copy after
+    // only one refresh. Flutter can release that CVPixelBuffer before Core
+    // Animation is finished with its IOSurface, so retain two copy
+    // generations. This preserves the accepted v18 low-backlog scheduler
+    // without allowing the recyclable pool to overwrite either predecessor.
+    [self inumaRetainCopiedBufferHoldLocked:_pixelBufferRef
+                                  copiedAt:copiedAt];
     _inumaLastCopyMonotonicNs = copiedAt;
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
@@ -598,6 +628,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   }
 #if TARGET_OS_OSX
   [self inumaClearPendingTextureFramesLocked];
+  [self inumaReleaseAllCopiedBufferHoldsLockedAt:
+            InumaMonotonicNanoseconds()];
   if (_inumaStockBGRAPixelBufferPool) {
     CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
     _inumaStockBGRAPixelBufferPool = nil;
@@ -619,6 +651,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaClearPendingTextureFramesLocked];
+    [self inumaReleaseAllCopiedBufferHoldsLockedAt:
+              InumaMonotonicNanoseconds()];
     _inumaFrameReadyMonotonicNs = 0;
     _inumaFrameTimestampNs = 0;
 #endif
@@ -1442,6 +1476,65 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   }
 }
 
+- (void)inumaRetainCopiedBufferHoldLocked:(CVPixelBufferRef)pixelBuffer
+                                 copiedAt:(uint64_t)copiedAt {
+  if (_inumaCopiedBufferHoldCount == kInumaCopiedBufferHoldCapacity) {
+    [self inumaReleaseOldestCopiedBufferHoldLockedAt:copiedAt
+                                           lifecycle:false];
+  }
+  const NSUInteger index =
+      (_inumaCopiedBufferHoldHead + _inumaCopiedBufferHoldCount) %
+      kInumaCopiedBufferHoldCapacity;
+  _inumaCopiedBufferHoldRefs[index] = CVBufferRetain(pixelBuffer);
+  _inumaCopiedBufferHoldStartedMonotonicNs[index] = copiedAt;
+  _inumaCopiedBufferHoldCount += 1;
+  if (_inumaTrace.enabled) {
+    _inumaTrace.copied_buffer_holds += 1;
+  }
+}
+
+- (void)inumaReleaseOldestCopiedBufferHoldLockedAt:(uint64_t)releasedAt
+                                          lifecycle:(bool)lifecycle {
+  if (_inumaCopiedBufferHoldCount == 0) {
+    return;
+  }
+  const NSUInteger index = _inumaCopiedBufferHoldHead;
+  CVPixelBufferRef heldBuffer = _inumaCopiedBufferHoldRefs[index];
+  const uint64_t heldAt =
+      _inumaCopiedBufferHoldStartedMonotonicNs[index];
+  _inumaCopiedBufferHoldRefs[index] = nil;
+  _inumaCopiedBufferHoldStartedMonotonicNs[index] = 0;
+  _inumaCopiedBufferHoldHead =
+      (_inumaCopiedBufferHoldHead + 1) %
+      kInumaCopiedBufferHoldCapacity;
+  _inumaCopiedBufferHoldCount -= 1;
+  if (_inumaTrace.enabled) {
+    if (lifecycle) {
+      _inumaTrace.copied_buffer_lifecycle_releases += 1;
+    } else {
+      _inumaTrace.copied_buffer_second_next_copy_releases += 1;
+      if (heldAt > 0 && releasedAt >= heldAt) {
+        InumaAppendTraceSample(
+            _inumaTrace.copied_buffer_second_next_copy_hold_samples,
+            &_inumaTrace.copied_buffer_second_next_copy_hold_count,
+            releasedAt - heldAt,
+            &_inumaTrace.sample_capacity_exhaustions);
+      }
+    }
+  }
+  if (heldBuffer != nil) {
+    CVBufferRelease(heldBuffer);
+  }
+}
+
+- (void)inumaReleaseAllCopiedBufferHoldsLockedAt:(uint64_t)releasedAt {
+  while (_inumaCopiedBufferHoldCount > 0) {
+    [self inumaReleaseOldestCopiedBufferHoldLockedAt:releasedAt
+                                           lifecycle:true];
+  }
+  _inumaCopiedBufferHoldHead = 0;
+}
+
 - (void)inumaClearPendingTextureFramesLocked {
   while (_inumaPendingTextureFrameCount > 0) {
     InumaPendingTextureFrame pending =
@@ -1498,12 +1591,14 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     return;
   }
   NSUInteger pendingTextureFrameCount = 0;
+  NSUInteger copiedBufferHoldCount = 0;
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
   os_unfair_lock_lock(&_lock);
   const uint64_t traceSnapshotMonotonicNs = InumaMonotonicNanoseconds();
   InumaCopyTextureTraceLocked(snapshot, &_inumaTrace);
   pendingTextureFrameCount = _inumaPendingTextureFrameCount;
+  copiedBufferHoldCount = _inumaCopiedBufferHoldCount;
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
   os_unfair_lock_unlock(&_lock);
@@ -1523,7 +1618,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @18,
+    @"tail_diagnostics_version" : @22,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1601,6 +1696,13 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         @(snapshot->stock_bgra_pool_buffer_requests),
     @"stock_bgra_pool_buffer_failures" :
         @(snapshot->stock_bgra_pool_buffer_failures),
+    @"copied_buffer_holds" : @(snapshot->copied_buffer_holds),
+    @"copied_buffer_second_next_copy_releases" :
+        @(snapshot->copied_buffer_second_next_copy_releases),
+    @"copied_buffer_lifecycle_releases" :
+        @(snapshot->copied_buffer_lifecycle_releases),
+    @"copied_buffer_hold_count_at_snapshot" :
+        @(copiedBufferHoldCount),
     @"mutable_single_bgra_buffer_reuse_enabled" : @NO,
     @"conversion_ns" : InumaTraceSampleArray(snapshot->conversion_samples,
                                              snapshot->conversion_count),
@@ -1699,6 +1801,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"copy_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->copy_frame_timestamp_ns_samples,
         snapshot->copy_event_count),
+    @"copied_buffer_second_next_copy_hold_ns" : InumaTraceSampleArray(
+        snapshot->copied_buffer_second_next_copy_hold_samples,
+        snapshot->copied_buffer_second_next_copy_hold_count),
   };
   NSError *error = nil;
   NSData *data = [NSJSONSerialization dataWithJSONObject:report
@@ -1725,6 +1830,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaClearPendingTextureFramesLocked];
+    [self inumaReleaseAllCopiedBufferHoldsLockedAt:
+              InumaMonotonicNanoseconds()];
 #endif
     if (_pixelBufferRef) {
       CVBufferRelease(_pixelBufferRef);
