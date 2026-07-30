@@ -71,6 +71,7 @@ typedef struct {
   uint64_t rescue_display_link_stale_fires;
   uint64_t rescue_display_link_callbacks;
   uint64_t rescue_display_link_deferrals;
+  uint64_t rescue_display_link_commit_fence_deferrals;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
   uint64_t strict_hold_timer_created;
@@ -106,6 +107,8 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   uint64_t rescue_display_link_fire_offset_samples[kInumaTextureTraceCapacity];
   uint64_t rescue_display_link_presentation_ack_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t rescue_display_link_first_presentation_ack_samples
       [kInumaTextureTraceCapacity];
   uint64_t rescue_display_link_callback_count_samples
       [kInumaTextureTraceCapacity];
@@ -234,6 +237,9 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_presentation_ack_samples,
                          rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      rescue_display_link_first_presentation_ack_samples,
+      rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_callback_count_samples,
                          rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_frame_timestamp_ns_samples,
@@ -377,6 +383,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
   uint64_t _inumaRescuePredecessorCopyUptimeNs;
+  uint64_t _inumaRescueFirstPresentationAckUptimeNs;
   NSUInteger _inumaRescueDisplayLinkEventIndex;
 #endif
 }
@@ -426,6 +433,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
     _inumaRescuePredecessorCopyUptimeNs = 0;
+    _inumaRescueFirstPresentationAckUptimeNs = 0;
     _inumaRescueDisplayLinkEventIndex = NSNotFound;
     _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
@@ -1280,6 +1288,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
             frameTimestampNs;
         strongSelf->_inumaRescuePredecessorCopyUptimeNs =
             predecessorCopyUptimeNs;
+        strongSelf->_inumaRescueFirstPresentationAckUptimeNs = 0;
         strongSelf->_inumaRescueDisplayLinkEventIndex = NSNotFound;
         if (strongSelf->_inumaTrace.enabled) {
           strongSelf->_inumaTrace.rescue_display_link_schedules += 1;
@@ -1356,6 +1365,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   int64_t frameTimestampNs = 0;
   bool rescueIsCurrent = false;
   bool predecessorWasPresented = false;
+  bool commitFenceSatisfied = false;
   bool deferUntilPresentation = false;
   os_unfair_lock_lock(&_lock);
   const bool ownsDisplayLink = _inumaRescueDisplayLink == displayLink;
@@ -1368,7 +1378,23 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     predecessorWasPresented =
         _inumaRescuePredecessorCopyUptimeNs > 0 &&
         displayedAtUptimeNs >= _inumaRescuePredecessorCopyUptimeNs;
-    deferUntilPresentation = rescueIsCurrent && !predecessorWasPresented;
+    const bool firstPresentationAcknowledged =
+        rescueIsCurrent && predecessorWasPresented &&
+        _inumaRescueFirstPresentationAckUptimeNs == 0;
+    if (firstPresentationAcknowledged) {
+      // The first timestamp proves that a refresh followed the raster copy,
+      // but that refresh can still precede the Core Animation transaction
+      // containing the copied texture. Keep the rescue link alive through one
+      // strictly newer refresh before allowing the successor notification.
+      _inumaRescueFirstPresentationAckUptimeNs = displayedAtUptimeNs;
+    }
+    commitFenceSatisfied =
+        _inumaRescueFirstPresentationAckUptimeNs > 0 &&
+        displayedAtUptimeNs >
+            _inumaRescueFirstPresentationAckUptimeNs;
+    deferUntilPresentation =
+        rescueIsCurrent &&
+        (!predecessorWasPresented || !commitFenceSatisfied);
     if (_inumaTrace.enabled) {
       _inumaTrace.rescue_display_link_callbacks += 1;
       const NSUInteger eventIndex = _inumaRescueDisplayLinkEventIndex;
@@ -1379,7 +1405,20 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       }
       if (deferUntilPresentation) {
         _inumaTrace.rescue_display_link_deferrals += 1;
-      } else if (rescueIsCurrent && predecessorWasPresented) {
+        if (firstPresentationAcknowledged) {
+          _inumaTrace.rescue_display_link_commit_fence_deferrals += 1;
+          if (eventIndex != NSNotFound &&
+              eventIndex <
+                  _inumaTrace.rescue_display_link_event_count) {
+            _inumaTrace
+                .rescue_display_link_first_presentation_ack_samples
+                    [eventIndex] =
+                displayedAtUptimeNs -
+                _inumaRescuePredecessorCopyUptimeNs;
+          }
+        }
+      } else if (rescueIsCurrent && predecessorWasPresented &&
+                 commitFenceSatisfied) {
         _inumaTrace.rescue_display_link_fires += 1;
         if (eventIndex != NSNotFound &&
             eventIndex < _inumaTrace.rescue_display_link_event_count &&
@@ -1399,6 +1438,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       _inumaRescueDisplayLink = nil;
       _inumaRescueDisplayLinkFrameTimestampNs = 0;
       _inumaRescuePredecessorCopyUptimeNs = 0;
+      _inumaRescueFirstPresentationAckUptimeNs = 0;
       _inumaRescueDisplayLinkEventIndex = NSNotFound;
     }
   }
@@ -1407,7 +1447,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     return;
   }
   [displayLink invalidate];
-  if (rescueIsCurrent && predecessorWasPresented) {
+  if (rescueIsCurrent && predecessorWasPresented &&
+      commitFenceSatisfied) {
     [self inumaScheduleTextureNotificationForTextureId:textureId
                                       frameTimestampNs:frameTimestampNs
                                      bypassMinimumHold:true
@@ -1435,6 +1476,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   _inumaRescueDisplayLink = nil;
   _inumaRescueDisplayLinkFrameTimestampNs = 0;
   _inumaRescuePredecessorCopyUptimeNs = 0;
+  _inumaRescueFirstPresentationAckUptimeNs = 0;
   _inumaRescueDisplayLinkEventIndex = NSNotFound;
   [displayLink invalidate];
   if (_inumaTrace.enabled) {
@@ -1523,7 +1565,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @18,
+    @"tail_diagnostics_version" : @19,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1578,6 +1620,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         @(snapshot->rescue_display_link_callbacks),
     @"rescue_display_link_deferrals" :
         @(snapshot->rescue_display_link_deferrals),
+    @"rescue_display_link_commit_fence_deferrals" :
+        @(snapshot->rescue_display_link_commit_fence_deferrals),
     @"texture_notification_platform_turn_schedules" :
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
@@ -1663,6 +1707,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"rescue_display_link_presentation_ack_ns" : InumaTraceSampleArray(
         snapshot->rescue_display_link_presentation_ack_samples,
         snapshot->rescue_display_link_event_count),
+    @"rescue_display_link_first_presentation_ack_ns" :
+        InumaTraceSampleArray(
+            snapshot->rescue_display_link_first_presentation_ack_samples,
+            snapshot->rescue_display_link_event_count),
     @"rescue_display_link_callback_count" : InumaTraceSampleArray(
         snapshot->rescue_display_link_callback_count_samples,
         snapshot->rescue_display_link_event_count),
