@@ -463,6 +463,10 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
                                InumaMonotonicNanoseconds() - conversionStarted);
       }
     }
+    _frameAvailable = framePrepared;
+    _inumaFrameReadyMonotonicNs =
+        _inumaTrace.enabled && framePrepared ? InumaMonotonicNanoseconds() : 0;
+    _inumaFrameTimestampNs = framePrepared ? frame.timeStampNs : 0;
     if (framePrepared && _textureId != -1) {
       const uint64_t notifyStarted =
           _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
@@ -473,10 +477,6 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
                                InumaMonotonicNanoseconds() - notifyStarted);
       }
     }
-    _frameAvailable = framePrepared;
-    _inumaFrameReadyMonotonicNs =
-        _inumaTrace.enabled && framePrepared ? InumaMonotonicNanoseconds() : 0;
-    _inumaFrameTimestampNs = framePrepared ? frame.timeStampNs : 0;
     if (_inumaTrace.enabled && framePrepared) {
       _inumaTrace.accepted_frames += 1;
       if (inumaRenderEventIndex != NSNotFound) {
@@ -665,9 +665,11 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @4,
+    @"tail_diagnostics_version" : @6,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
+    @"texture_notification_contract" :
+        @"frame_state_before_same_thread_notification",
     @"render_frames" : @(snapshot->render_frames),
     @"accepted_frames" : @(snapshot->accepted_frames),
     @"coalesced_frames" : @(snapshot->coalesced_frames),
