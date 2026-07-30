@@ -9,6 +9,7 @@
 #import <WebRTC/WebRTC.h>
 
 #import <objc/runtime.h>
+#include <math.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -65,6 +66,8 @@ typedef struct {
   uint64_t rescue_display_link_cancellations;
   uint64_t rescue_display_link_fallbacks;
   uint64_t rescue_display_link_stale_fires;
+  uint64_t rescue_display_link_callbacks;
+  uint64_t rescue_display_link_deferrals;
   uint64_t strict_hold_timer_created;
   uint64_t strict_hold_timer_fired;
   uint64_t strict_hold_timer_cancelled;
@@ -96,6 +99,10 @@ typedef struct {
   uint64_t rescue_display_link_schedule_offset_samples
       [kInumaTextureTraceCapacity];
   uint64_t rescue_display_link_fire_offset_samples[kInumaTextureTraceCapacity];
+  uint64_t rescue_display_link_presentation_ack_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t rescue_display_link_callback_count_samples
+      [kInumaTextureTraceCapacity];
   int64_t rescue_display_link_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_deadline_offset_samples
@@ -131,6 +138,20 @@ typedef struct {
 
 static uint64_t InumaMonotonicNanoseconds(void) {
   return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+}
+
+static uint64_t InumaUptimeNanoseconds(void) {
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static uint64_t InumaDisplayLinkTimestampNanoseconds(
+    CADisplayLink *displayLink) API_AVAILABLE(macos(14.0)) {
+  const CFTimeInterval timestamp = displayLink.timestamp;
+  if (!isfinite(timestamp) || timestamp <= 0.0 ||
+      timestamp >= ((CFTimeInterval)UINT64_MAX / 1000000000.0)) {
+    return 0;
+  }
+  return (uint64_t)(timestamp * 1000000000.0);
 }
 
 static void InumaAppendTraceSample(uint64_t *samples, NSUInteger *count,
@@ -218,7 +239,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
                                   recordRescueBypass:(bool)recordRescueBypass;
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
-                                        (int64_t)frameTimestampNs;
+                                        (int64_t)frameTimestampNs
+                            predecessorCopyUptimeNs:
+                                (uint64_t)predecessorCopyUptimeNs;
 - (void)inumaRescueDisplayLinkDidFire:(CADisplayLink *)displayLink
     API_AVAILABLE(macos(14.0));
 - (void)inumaCancelTextureHoldTimerLocked;
@@ -258,6 +281,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   dispatch_source_t _inumaTextureHoldTimer;
   CADisplayLink *_inumaRescueDisplayLink;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
+  uint64_t _inumaRescuePredecessorCopyUptimeNs;
+  NSUInteger _inumaRescueDisplayLinkEventIndex;
 #endif
 }
 
@@ -303,6 +328,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
+    _inumaRescuePredecessorCopyUptimeNs = 0;
+    _inumaRescueDisplayLinkEventIndex = NSNotFound;
     _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
@@ -338,6 +365,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   bool notifyPromotedFrame = false;
   int64_t promotedTextureId = -1;
   int64_t promotedFrameTimestampNs = 0;
+  uint64_t promotedPredecessorCopyUptimeNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -353,6 +381,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _frameAvailable = false;
 #if TARGET_OS_OSX
     const uint64_t copiedAt = InumaMonotonicNanoseconds();
+    const uint64_t copiedAtUptimeNs = InumaUptimeNanoseconds();
     _inumaLastCopyMonotonicNs = copiedAt;
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
@@ -394,6 +423,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       notifyPromotedFrame = _textureId != -1;
       promotedTextureId = _textureId;
       promotedFrameTimestampNs = promoted.frame_timestamp_ns;
+      promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
         _inumaTrace.rescue_hold_preservations += 1;
@@ -436,7 +466,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   if (notifyPromotedFrame) {
     [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
                                       frameTimestampNs:
-                                          promotedFrameTimestampNs];
+                                          promotedFrameTimestampNs
+                              predecessorCopyUptimeNs:
+                                  promotedPredecessorCopyUptimeNs];
   }
 #endif
   return buffer;
@@ -1084,7 +1116,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
 
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
-                                        (int64_t)frameTimestampNs {
+                                        (int64_t)frameTimestampNs
+                            predecessorCopyUptimeNs:
+                                (uint64_t)predecessorCopyUptimeNs {
   const uint64_t scheduledAt = InumaMonotonicNanoseconds();
   __weak FlutterRTCVideoRenderer *weakSelf = self;
   dispatch_async(dispatch_get_main_queue(), ^{
@@ -1108,6 +1142,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         strongSelf->_inumaRescueDisplayLink = displayLink;
         strongSelf->_inumaRescueDisplayLinkFrameTimestampNs =
             frameTimestampNs;
+        strongSelf->_inumaRescuePredecessorCopyUptimeNs =
+            predecessorCopyUptimeNs;
+        strongSelf->_inumaRescueDisplayLinkEventIndex = NSNotFound;
         if (strongSelf->_inumaTrace.enabled) {
           strongSelf->_inumaTrace.rescue_display_link_schedules += 1;
           if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
@@ -1122,6 +1159,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
             strongSelf->_inumaTrace
                 .rescue_display_link_frame_timestamp_ns_samples[eventIndex] =
                 frameTimestampNs;
+            strongSelf->_inumaRescueDisplayLinkEventIndex = eventIndex;
             strongSelf->_inumaTrace.rescue_display_link_event_count += 1;
           }
         }
@@ -1176,36 +1214,64 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
 - (void)inumaRescueDisplayLinkDidFire:(CADisplayLink *)displayLink
     API_AVAILABLE(macos(14.0)) {
   const uint64_t firedAt = InumaMonotonicNanoseconds();
+  const uint64_t displayedAtUptimeNs =
+      InumaDisplayLinkTimestampNanoseconds(displayLink);
   int64_t textureId = -1;
   int64_t frameTimestampNs = 0;
   bool rescueIsCurrent = false;
+  bool predecessorWasPresented = false;
+  bool deferUntilPresentation = false;
   os_unfair_lock_lock(&_lock);
   const bool ownsDisplayLink = _inumaRescueDisplayLink == displayLink;
   if (ownsDisplayLink) {
     textureId = _textureId;
     frameTimestampNs = _inumaRescueDisplayLinkFrameTimestampNs;
-    _inumaRescueDisplayLink = nil;
-    _inumaRescueDisplayLinkFrameTimestampNs = 0;
     rescueIsCurrent =
         textureId != -1 && _frameAvailable &&
         _inumaFrameTimestampNs == frameTimestampNs;
+    predecessorWasPresented =
+        _inumaRescuePredecessorCopyUptimeNs > 0 &&
+        displayedAtUptimeNs >= _inumaRescuePredecessorCopyUptimeNs;
+    deferUntilPresentation = rescueIsCurrent && !predecessorWasPresented;
     if (_inumaTrace.enabled) {
-      _inumaTrace.rescue_display_link_fires += 1;
+      _inumaTrace.rescue_display_link_callbacks += 1;
+      const NSUInteger eventIndex = _inumaRescueDisplayLinkEventIndex;
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.rescue_display_link_event_count) {
+        _inumaTrace.rescue_display_link_callback_count_samples[eventIndex] +=
+            1;
+      }
+      if (deferUntilPresentation) {
+        _inumaTrace.rescue_display_link_deferrals += 1;
+      } else if (rescueIsCurrent && predecessorWasPresented) {
+        _inumaTrace.rescue_display_link_fires += 1;
+        if (eventIndex != NSNotFound &&
+            eventIndex < _inumaTrace.rescue_display_link_event_count &&
+            _inumaTraceStartedMonotonicNs > 0 &&
+            firedAt >= _inumaTraceStartedMonotonicNs) {
+          _inumaTrace.rescue_display_link_fire_offset_samples[eventIndex] =
+              firedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.rescue_display_link_presentation_ack_samples[eventIndex] =
+              displayedAtUptimeNs - _inumaRescuePredecessorCopyUptimeNs;
+        }
+      }
       if (!rescueIsCurrent) {
         _inumaTrace.rescue_display_link_stale_fires += 1;
       }
-      const NSUInteger eventCount =
-          _inumaTrace.rescue_display_link_event_count;
-      if (eventCount > 0 && _inumaTraceStartedMonotonicNs > 0 &&
-          firedAt >= _inumaTraceStartedMonotonicNs) {
-        _inumaTrace.rescue_display_link_fire_offset_samples[eventCount - 1] =
-            firedAt - _inumaTraceStartedMonotonicNs;
-      }
+    }
+    if (!deferUntilPresentation) {
+      _inumaRescueDisplayLink = nil;
+      _inumaRescueDisplayLinkFrameTimestampNs = 0;
+      _inumaRescuePredecessorCopyUptimeNs = 0;
+      _inumaRescueDisplayLinkEventIndex = NSNotFound;
     }
   }
   os_unfair_lock_unlock(&_lock);
+  if (deferUntilPresentation) {
+    return;
+  }
   [displayLink invalidate];
-  if (rescueIsCurrent) {
+  if (rescueIsCurrent && predecessorWasPresented) {
     [self inumaScheduleTextureNotificationForTextureId:textureId
                                       frameTimestampNs:frameTimestampNs
                                      bypassMinimumHold:true
@@ -1232,6 +1298,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   }
   _inumaRescueDisplayLink = nil;
   _inumaRescueDisplayLinkFrameTimestampNs = 0;
+  _inumaRescuePredecessorCopyUptimeNs = 0;
+  _inumaRescueDisplayLinkEventIndex = NSNotFound;
   [displayLink invalidate];
   if (_inumaTrace.enabled) {
     _inumaTrace.rescue_display_link_cancellations += 1;
@@ -1311,7 +1379,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @14,
+    @"tail_diagnostics_version" : @15,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1358,6 +1426,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         @(snapshot->rescue_display_link_fallbacks),
     @"rescue_display_link_stale_fires" :
         @(snapshot->rescue_display_link_stale_fires),
+    @"rescue_display_link_callbacks" :
+        @(snapshot->rescue_display_link_callbacks),
+    @"rescue_display_link_deferrals" :
+        @(snapshot->rescue_display_link_deferrals),
     @"rescue_display_link_active_at_snapshot" :
         @(rescueDisplayLinkActive),
     @"strict_hold_timer_created" :
@@ -1435,6 +1507,12 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         snapshot->rescue_display_link_event_count),
     @"rescue_display_link_fire_offset_ns" : InumaTraceSampleArray(
         snapshot->rescue_display_link_fire_offset_samples,
+        snapshot->rescue_display_link_event_count),
+    @"rescue_display_link_presentation_ack_ns" : InumaTraceSampleArray(
+        snapshot->rescue_display_link_presentation_ack_samples,
+        snapshot->rescue_display_link_event_count),
+    @"rescue_display_link_callback_count" : InumaTraceSampleArray(
+        snapshot->rescue_display_link_callback_count_samples,
         snapshot->rescue_display_link_event_count),
     @"rescue_display_link_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->rescue_display_link_frame_timestamp_ns_samples,
