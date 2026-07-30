@@ -19,12 +19,19 @@
 enum {
   kInumaTextureTraceCapacity = 8192,
   kInumaStockBGRAPoolMinimumBufferCount = 4,
+  kInumaPendingTextureFrameCapacity = 4,
 };
 
 typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
   InumaMacOSPixelModeStockBGRA = 0,
   InumaMacOSPixelModeNativeNV12 = 1,
 };
+
+typedef struct {
+  CVPixelBufferRef pixel_buffer;
+  int64_t frame_timestamp_ns;
+  uint64_t ready_monotonic_ns;
+} InumaPendingTextureFrame;
 
 typedef struct {
   bool enabled;
@@ -42,6 +49,12 @@ typedef struct {
   uint64_t native_nv12_frames;
   uint64_t native_nv12_fallback_frames;
   uint64_t texture_hold_applied;
+  uint64_t stale_texture_notifications;
+  uint64_t queued_frames;
+  uint64_t queue_promotions;
+  uint64_t queue_overflows;
+  uint64_t queue_cleared_frames;
+  uint64_t queue_max_depth;
   uint64_t stock_bgra_pool_create_failures;
   uint64_t stock_bgra_pool_buffer_requests;
   uint64_t stock_bgra_pool_buffer_failures;
@@ -52,8 +65,16 @@ typedef struct {
   uint64_t texture_notify_dispatch_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
   uint64_t texture_hold_delay_samples[kInumaTextureTraceCapacity];
+  int64_t texture_hold_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t texture_notify_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_scheduled_delay_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_deadline_lateness_samples[kInumaTextureTraceCapacity];
+  uint64_t queue_wait_samples[kInumaTextureTraceCapacity];
+  uint64_t queue_enqueue_event_offset_samples[kInumaTextureTraceCapacity];
+  int64_t queue_enqueue_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t queue_promote_event_offset_samples[kInumaTextureTraceCapacity];
+  int64_t queue_promote_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t render_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint8_t render_outcome_samples[kInumaTextureTraceCapacity];
@@ -68,6 +89,9 @@ typedef struct {
   NSUInteger texture_notify_count;
   NSUInteger texture_hold_delay_count;
   NSUInteger texture_notify_event_count;
+  NSUInteger queue_wait_count;
+  NSUInteger queue_enqueue_event_count;
+  NSUInteger queue_promote_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
@@ -137,10 +161,28 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   return (uint64_t)(milliseconds * (double)NSEC_PER_MSEC);
 }
 
+static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_MAX_QUEUED_TEXTURE_FRAMES"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  const NSInteger frames = value.integerValue;
+  if (frames <= 0 || frames > kInumaPendingTextureFrameCapacity) {
+    return 0;
+  }
+  return (NSUInteger)frames;
+}
+
 @interface FlutterRTCVideoRenderer ()
 - (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer;
-- (bool)inumaAdoptNativeNV12BufferFromFrame:(RTCVideoFrame *)frame;
-- (bool)inumaPrepareFreshStockBGRABuffer;
+- (CVPixelBufferRef)inumaCreatePixelBufferFromFrame:(RTCVideoFrame *)frame;
+- (CVPixelBufferRef)inumaRetainNativeNV12BufferFromFrame:
+    (RTCVideoFrame *)frame;
+- (CVPixelBufferRef)inumaCreateFreshStockBGRABuffer;
+- (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
+                                    frameTimestampNs:(int64_t)frameTimestampNs;
+- (void)inumaClearPendingTextureFramesLocked;
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size;
 - (void)inumaWriteTextureTrace;
 @end
@@ -163,6 +205,11 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   uint64_t _inumaFrameReadyMonotonicNs;
   uint64_t _inumaLastCopyMonotonicNs;
   uint64_t _inumaMinimumTextureHoldNs;
+  NSUInteger _inumaMaxQueuedTextureFrames;
+  NSUInteger _inumaPendingTextureFrameHead;
+  NSUInteger _inumaPendingTextureFrameCount;
+  InumaPendingTextureFrame
+      _inumaPendingTextureFrames[kInumaPendingTextureFrameCapacity];
   int64_t _inumaFrameTimestampNs;
   CVPixelBufferPoolRef _inumaStockBGRAPixelBufferPool;
   dispatch_queue_t _inumaTraceQueue;
@@ -200,6 +247,10 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
     _inumaMinimumTextureHoldNs =
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
+    _inumaMaxQueuedTextureFrames =
+        InumaMaxQueuedTextureFramesFromEnvironment(environment);
+    _inumaPendingTextureFrameHead = 0;
+    _inumaPendingTextureFrameCount = 0;
     _inumaTraceStartedMonotonicNs =
         _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameReadyMonotonicNs = 0;
@@ -237,6 +288,9 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
 #if TARGET_OS_OSX
   const uint64_t started =
       _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+  bool notifyPromotedFrame = false;
+  int64_t promotedTextureId = -1;
+  int64_t promotedFrameTimestampNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -251,7 +305,8 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     buffer = CVBufferRetain(_pixelBufferRef);
     _frameAvailable = false;
 #if TARGET_OS_OSX
-    _inumaLastCopyMonotonicNs = InumaMonotonicNanoseconds();
+    const uint64_t copiedAt = InumaMonotonicNanoseconds();
+    _inumaLastCopyMonotonicNs = copiedAt;
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
       if (_inumaFrameReadyMonotonicNs > 0 &&
@@ -271,6 +326,49 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
         _inumaTrace.copy_event_count += 1;
       }
     }
+    if (_inumaPendingTextureFrameCount > 0) {
+      InumaPendingTextureFrame promoted =
+          _inumaPendingTextureFrames[_inumaPendingTextureFrameHead];
+      _inumaPendingTextureFrames[_inumaPendingTextureFrameHead] =
+          (InumaPendingTextureFrame){0};
+      _inumaPendingTextureFrameHead =
+          (_inumaPendingTextureFrameHead + 1) %
+          kInumaPendingTextureFrameCapacity;
+      _inumaPendingTextureFrameCount -= 1;
+
+      CVPixelBufferRef previousBuffer = _pixelBufferRef;
+      _pixelBufferRef = promoted.pixel_buffer;
+      _frameAvailable = true;
+      _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
+      _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
+      if (previousBuffer != nil) {
+        CVBufferRelease(previousBuffer);
+      }
+      notifyPromotedFrame = _textureId != -1;
+      promotedTextureId = _textureId;
+      promotedFrameTimestampNs = promoted.frame_timestamp_ns;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.queue_promotions += 1;
+        if (copiedAt >= promoted.ready_monotonic_ns) {
+          InumaAppendTraceSample(
+              _inumaTrace.queue_wait_samples,
+              &_inumaTrace.queue_wait_count,
+              copiedAt - promoted.ready_monotonic_ns);
+        }
+        if (_inumaTraceStartedMonotonicNs > 0 &&
+            copiedAt >= _inumaTraceStartedMonotonicNs &&
+            _inumaTrace.queue_promote_event_count <
+                kInumaTextureTraceCapacity) {
+          const NSUInteger promoteIndex =
+              _inumaTrace.queue_promote_event_count;
+          _inumaTrace.queue_promote_event_offset_samples[promoteIndex] =
+              copiedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.queue_promote_frame_timestamp_ns_samples[promoteIndex] =
+              promoted.frame_timestamp_ns;
+          _inumaTrace.queue_promote_event_count += 1;
+        }
+      }
+    }
 #endif
 #if TARGET_OS_OSX
   } else if (_inumaTrace.enabled) {
@@ -278,6 +376,13 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
 #endif
   }
   os_unfair_lock_unlock(&_lock);
+#if TARGET_OS_OSX
+  if (notifyPromotedFrame) {
+    [self inumaScheduleTextureNotificationForTextureId:promotedTextureId
+                                      frameTimestampNs:
+                                          promotedFrameTimestampNs];
+  }
+#endif
   return buffer;
 }
 
@@ -296,6 +401,7 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     _pixelBufferRef = nil;
   }
 #if TARGET_OS_OSX
+  [self inumaClearPendingTextureFramesLocked];
   if (_inumaStockBGRAPixelBufferPool) {
     CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
     _inumaStockBGRAPixelBufferPool = nil;
@@ -313,6 +419,12 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   if (oldValue != videoTrack) {
     os_unfair_lock_lock(&_lock);
     _videoTrack = videoTrack;
+#if TARGET_OS_OSX
+    [self inumaClearPendingTextureFramesLocked];
+    _inumaFrameReadyMonotonicNs = 0;
+    _inumaFrameTimestampNs = 0;
+#endif
+    _frameAvailable = false;
     os_unfair_lock_unlock(&_lock);
     _isFirstFrameRendered = false;
     if (oldValue) {
@@ -436,8 +548,6 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   bool inumaShouldNotifyTexture = false;
   int64_t inumaTextureIdToNotify = -1;
   int64_t inumaFrameTimestampToNotify = 0;
-  uint64_t inumaNotifyEnqueuedMonotonicNs = 0;
-  uint64_t inumaTextureHoldDelayNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -466,61 +576,66 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     return;
   }
 #if TARGET_OS_OSX
+  const bool canPrepareFrame =
+      _inumaPixelMode == InumaMacOSPixelModeNativeNV12 ||
+      _inumaStockBGRAPixelBufferPool != nil;
+  const bool queueHasCapacity =
+      _inumaMaxQueuedTextureFrames > 0 &&
+      _inumaPendingTextureFrameCount < _inumaMaxQueuedTextureFrames;
   const bool canAcceptFrame =
-      !_frameAvailable &&
-      (_inumaPixelMode == InumaMacOSPixelModeNativeNV12 ||
-       _inumaStockBGRAPixelBufferPool != nil);
+      canPrepareFrame && (!_frameAvailable || queueHasCapacity);
 #else
   const bool canAcceptFrame = !_frameAvailable && _pixelBufferRef != nil;
 #endif
   if (canAcceptFrame) {
 #if TARGET_OS_OSX
-    bool usedNativeNV12 = false;
-    bool framePrepared = false;
-    if (_inumaPixelMode == InumaMacOSPixelModeNativeNV12) {
-      usedNativeNV12 = [self inumaAdoptNativeNV12BufferFromFrame:frame];
-      if (_inumaTrace.enabled && !usedNativeNV12) {
-        _inumaTrace.native_nv12_fallback_frames += 1;
+    CVPixelBufferRef preparedBuffer =
+        [self inumaCreatePixelBufferFromFrame:frame];
+    const bool framePrepared = preparedBuffer != nil;
+    const uint64_t frameReadyNs =
+        framePrepared ? InumaMonotonicNanoseconds() : 0;
+    if (framePrepared && !_frameAvailable) {
+      CVPixelBufferRef previousBuffer = _pixelBufferRef;
+      _pixelBufferRef = preparedBuffer;
+      _frameAvailable = true;
+      _inumaFrameReadyMonotonicNs = frameReadyNs;
+      _inumaFrameTimestampNs = frame.timeStampNs;
+      if (previousBuffer != nil) {
+        CVBufferRelease(previousBuffer);
       }
-    }
-    framePrepared = usedNativeNV12;
-    if (!framePrepared && [self inumaPrepareFreshStockBGRABuffer]) {
-      const uint64_t conversionStarted =
-          _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
-      [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
-      framePrepared = true;
+      if (_textureId != -1) {
+        inumaShouldNotifyTexture = true;
+        inumaTextureIdToNotify = _textureId;
+        inumaFrameTimestampToNotify = frame.timeStampNs;
+      }
+    } else if (framePrepared) {
+      const NSUInteger queueIndex =
+          (_inumaPendingTextureFrameHead +
+           _inumaPendingTextureFrameCount) %
+          kInumaPendingTextureFrameCapacity;
+      _inumaPendingTextureFrames[queueIndex] =
+          (InumaPendingTextureFrame){
+              .pixel_buffer = preparedBuffer,
+              .frame_timestamp_ns = frame.timeStampNs,
+              .ready_monotonic_ns = frameReadyNs,
+          };
+      _inumaPendingTextureFrameCount += 1;
       if (_inumaTrace.enabled) {
-        InumaAppendTraceSample(_inumaTrace.conversion_samples,
-                               &_inumaTrace.conversion_count,
-                               InumaMonotonicNanoseconds() - conversionStarted);
-      }
-    }
-    _frameAvailable = framePrepared;
-    _inumaFrameReadyMonotonicNs =
-        _inumaTrace.enabled && framePrepared ? InumaMonotonicNanoseconds() : 0;
-    _inumaFrameTimestampNs = framePrepared ? frame.timeStampNs : 0;
-    if (framePrepared && _textureId != -1) {
-      inumaShouldNotifyTexture = true;
-      inumaTextureIdToNotify = _textureId;
-      inumaFrameTimestampToNotify = frame.timeStampNs;
-      inumaNotifyEnqueuedMonotonicNs =
-          _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
-      const uint64_t holdDecisionNs = InumaMonotonicNanoseconds();
-      if (_inumaMinimumTextureHoldNs > 0 &&
-          _inumaLastCopyMonotonicNs > 0 &&
-          holdDecisionNs >= _inumaLastCopyMonotonicNs) {
-        const uint64_t currentTenureNs =
-            holdDecisionNs - _inumaLastCopyMonotonicNs;
-        if (currentTenureNs < _inumaMinimumTextureHoldNs) {
-          inumaTextureHoldDelayNs =
-              _inumaMinimumTextureHoldNs - currentTenureNs;
-          if (_inumaTrace.enabled) {
-            _inumaTrace.texture_hold_applied += 1;
-            InumaAppendTraceSample(
-                _inumaTrace.texture_hold_delay_samples,
-                &_inumaTrace.texture_hold_delay_count,
-                inumaTextureHoldDelayNs);
-          }
+        _inumaTrace.queued_frames += 1;
+        _inumaTrace.queue_max_depth =
+            MAX(_inumaTrace.queue_max_depth,
+                (uint64_t)_inumaPendingTextureFrameCount);
+        if (_inumaTraceStartedMonotonicNs > 0 &&
+            frameReadyNs >= _inumaTraceStartedMonotonicNs &&
+            _inumaTrace.queue_enqueue_event_count <
+                kInumaTextureTraceCapacity) {
+          const NSUInteger enqueueIndex =
+              _inumaTrace.queue_enqueue_event_count;
+          _inumaTrace.queue_enqueue_event_offset_samples[enqueueIndex] =
+              frameReadyNs - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.queue_enqueue_frame_timestamp_ns_samples[enqueueIndex] =
+              frame.timeStampNs;
+          _inumaTrace.queue_enqueue_event_count += 1;
         }
       }
     }
@@ -540,6 +655,11 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
 #if TARGET_OS_OSX
   } else if (_inumaTrace.enabled) {
     _inumaTrace.coalesced_frames += 1;
+    if (_frameAvailable && _inumaMaxQueuedTextureFrames > 0 &&
+        _inumaPendingTextureFrameCount >=
+            _inumaMaxQueuedTextureFrames) {
+      _inumaTrace.queue_overflows += 1;
+    }
     if (inumaRenderEventIndex != NSNotFound) {
       _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 2;
     }
@@ -556,65 +676,10 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   __weak FlutterRTCVideoRenderer *weakSelf = self;
 #if TARGET_OS_OSX
   if (inumaShouldNotifyTexture) {
-    void (^notifyTextureFrameAvailable)(void) = ^{
-      FlutterRTCVideoRenderer *strongSelf = weakSelf;
-      if (strongSelf == nil) {
-        return;
-      }
-      const uint64_t notifyStarted = InumaMonotonicNanoseconds();
-      os_unfair_lock_lock(&strongSelf->_lock);
-      const bool notificationIsCurrent =
-          strongSelf->_textureId == inumaTextureIdToNotify &&
-          strongSelf->_frameAvailable &&
-          strongSelf->_inumaFrameTimestampNs == inumaFrameTimestampToNotify;
-      const bool traceEnabled = strongSelf->_inumaTrace.enabled;
-      id<FlutterTextureRegistry> registry = strongSelf->_registry;
-      if (traceEnabled && notificationIsCurrent && registry != nil &&
-          strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
-          notifyStarted >= strongSelf->_inumaTraceStartedMonotonicNs &&
-          strongSelf->_inumaTrace.texture_notify_event_count <
-              kInumaTextureTraceCapacity) {
-        const NSUInteger notifyEventIndex =
-            strongSelf->_inumaTrace.texture_notify_event_count;
-        strongSelf->_inumaTrace
-            .texture_notify_event_offset_samples[notifyEventIndex] =
-            notifyStarted - strongSelf->_inumaTraceStartedMonotonicNs;
-        strongSelf->_inumaTrace
-            .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
-            inumaFrameTimestampToNotify;
-        strongSelf->_inumaTrace.texture_notify_event_count += 1;
-      }
-      os_unfair_lock_unlock(&strongSelf->_lock);
-      if (!notificationIsCurrent || registry == nil) {
-        return;
-      }
-      [registry textureFrameAvailable:inumaTextureIdToNotify];
-      if (traceEnabled) {
-        const uint64_t notifyEnded = InumaMonotonicNanoseconds();
-        os_unfair_lock_lock(&strongSelf->_lock);
-        if (inumaNotifyEnqueuedMonotonicNs > 0 &&
-            notifyStarted >= inumaNotifyEnqueuedMonotonicNs) {
-          InumaAppendTraceSample(
-              strongSelf->_inumaTrace.texture_notify_dispatch_samples,
-              &strongSelf->_inumaTrace.texture_notify_dispatch_count,
-              notifyStarted - inumaNotifyEnqueuedMonotonicNs);
-        }
-        InumaAppendTraceSample(
-            strongSelf->_inumaTrace.texture_notify_samples,
-            &strongSelf->_inumaTrace.texture_notify_count,
-            notifyEnded - notifyStarted);
-        os_unfair_lock_unlock(&strongSelf->_lock);
-      }
-    };
-    if ([NSThread isMainThread] && inumaTextureHoldDelayNs == 0) {
-      notifyTextureFrameAvailable();
-    } else if (inumaTextureHoldDelayNs == 0) {
-      dispatch_async(dispatch_get_main_queue(), notifyTextureFrameAvailable);
-    } else {
-      dispatch_after(
-          dispatch_time(DISPATCH_TIME_NOW, (int64_t)inumaTextureHoldDelayNs),
-          dispatch_get_main_queue(), notifyTextureFrameAvailable);
-    }
+    [self inumaScheduleTextureNotificationForTextureId:
+              inumaTextureIdToNotify
+                                          frameTimestampNs:
+                                              inumaFrameTimestampToNotify];
   }
 #endif
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
@@ -678,10 +743,36 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   }
 }
 
-- (bool)inumaAdoptNativeNV12BufferFromFrame:(RTCVideoFrame *)frame {
+- (CVPixelBufferRef)inumaCreatePixelBufferFromFrame:(RTCVideoFrame *)frame {
+  CVPixelBufferRef preparedBuffer = nil;
+  if (_inumaPixelMode == InumaMacOSPixelModeNativeNV12) {
+    preparedBuffer = [self inumaRetainNativeNV12BufferFromFrame:frame];
+    if (_inumaTrace.enabled && preparedBuffer == nil) {
+      _inumaTrace.native_nv12_fallback_frames += 1;
+    }
+  }
+  if (preparedBuffer == nil) {
+    preparedBuffer = [self inumaCreateFreshStockBGRABuffer];
+    if (preparedBuffer != nil) {
+      const uint64_t conversionStarted =
+          _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+      [self copyI420ToCVPixelBuffer:preparedBuffer withFrame:frame];
+      if (_inumaTrace.enabled) {
+        InumaAppendTraceSample(
+            _inumaTrace.conversion_samples,
+            &_inumaTrace.conversion_count,
+            InumaMonotonicNanoseconds() - conversionStarted);
+      }
+    }
+  }
+  return preparedBuffer;
+}
+
+- (CVPixelBufferRef)inumaRetainNativeNV12BufferFromFrame:
+    (RTCVideoFrame *)frame {
   if (frame.rotation != RTCVideoRotation_0 ||
       ![frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
-    return false;
+    return nil;
   }
   RTCCVPixelBuffer *source = (RTCCVPixelBuffer *)frame.buffer;
   CVPixelBufferRef pixelBuffer = source.pixelBuffer;
@@ -691,21 +782,16 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
       [source requiresCropping] ||
       [source requiresScalingToWidth:frame.width height:frame.height] ||
       CVPixelBufferGetIOSurface(pixelBuffer) == nil) {
-    return false;
+    return nil;
   }
   CVBufferRetain(pixelBuffer);
-  CVPixelBufferRef oldBuffer = _pixelBufferRef;
-  _pixelBufferRef = pixelBuffer;
-  if (oldBuffer != nil) {
-    CVBufferRelease(oldBuffer);
-  }
   if (_inumaTrace.enabled) {
     _inumaTrace.native_nv12_frames += 1;
   }
-  return true;
+  return pixelBuffer;
 }
 
-- (bool)inumaPrepareFreshStockBGRABuffer {
+- (CVPixelBufferRef)inumaCreateFreshStockBGRABuffer {
   // Flutter retains the returned CVPixelBuffer while Metal presents it
   // asynchronously. Never overwrite that same backing for the next frame;
   // the pool recycles it only after downstream owners release it.
@@ -718,14 +804,139 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   }
   if (result != kCVReturnSuccess || freshBuffer == nil) {
     _inumaTrace.stock_bgra_pool_buffer_failures += 1;
-    return false;
+    return nil;
   }
-  CVPixelBufferRef oldBuffer = _pixelBufferRef;
-  _pixelBufferRef = freshBuffer;
-  if (oldBuffer != nil) {
-    CVBufferRelease(oldBuffer);
+  return freshBuffer;
+}
+
+- (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
+                                    frameTimestampNs:
+                                        (int64_t)frameTimestampNs {
+  const uint64_t enqueuedAt = InumaMonotonicNanoseconds();
+  __block uint64_t scheduledDelayNs = 0;
+  os_unfair_lock_lock(&_lock);
+  const bool notificationCanBeScheduled =
+      _textureId == textureId && _frameAvailable &&
+      _inumaFrameTimestampNs == frameTimestampNs;
+  if (notificationCanBeScheduled && _inumaMinimumTextureHoldNs > 0 &&
+      _inumaLastCopyMonotonicNs > 0 &&
+      enqueuedAt >= _inumaLastCopyMonotonicNs) {
+    const uint64_t currentTenureNs =
+        enqueuedAt - _inumaLastCopyMonotonicNs;
+    if (currentTenureNs < _inumaMinimumTextureHoldNs) {
+      scheduledDelayNs = _inumaMinimumTextureHoldNs - currentTenureNs;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.texture_hold_applied += 1;
+        const NSUInteger holdIndex =
+            _inumaTrace.texture_hold_delay_count;
+        InumaAppendTraceSample(
+            _inumaTrace.texture_hold_delay_samples,
+            &_inumaTrace.texture_hold_delay_count,
+            scheduledDelayNs);
+        if (holdIndex < kInumaTextureTraceCapacity) {
+          _inumaTrace
+              .texture_hold_frame_timestamp_ns_samples[holdIndex] =
+              frameTimestampNs;
+        }
+      }
+    }
   }
-  return true;
+  os_unfair_lock_unlock(&_lock);
+  if (!notificationCanBeScheduled) {
+    return;
+  }
+
+  __weak FlutterRTCVideoRenderer *weakSelf = self;
+  void (^notifyTextureFrameAvailable)(void) = ^{
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    const uint64_t notifyStarted = InumaMonotonicNanoseconds();
+    os_unfair_lock_lock(&strongSelf->_lock);
+    const bool notificationIsCurrent =
+        strongSelf->_textureId == textureId &&
+        strongSelf->_frameAvailable &&
+        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+    const bool traceEnabled = strongSelf->_inumaTrace.enabled;
+    id<FlutterTextureRegistry> registry = strongSelf->_registry;
+    if (traceEnabled && !notificationIsCurrent) {
+      strongSelf->_inumaTrace.stale_texture_notifications += 1;
+    }
+    if (traceEnabled && notificationIsCurrent && registry != nil &&
+        strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+        notifyStarted >= strongSelf->_inumaTraceStartedMonotonicNs &&
+        strongSelf->_inumaTrace.texture_notify_event_count <
+            kInumaTextureTraceCapacity) {
+      const NSUInteger notifyEventIndex =
+          strongSelf->_inumaTrace.texture_notify_event_count;
+      strongSelf->_inumaTrace
+          .texture_notify_event_offset_samples[notifyEventIndex] =
+          notifyStarted - strongSelf->_inumaTraceStartedMonotonicNs;
+      strongSelf->_inumaTrace
+          .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
+          frameTimestampNs;
+      strongSelf->_inumaTrace
+          .texture_notify_scheduled_delay_samples[notifyEventIndex] =
+          scheduledDelayNs;
+      const uint64_t plannedDeadlineNs = enqueuedAt + scheduledDelayNs;
+      strongSelf->_inumaTrace
+          .texture_notify_deadline_lateness_samples[notifyEventIndex] =
+          notifyStarted >= plannedDeadlineNs
+              ? notifyStarted - plannedDeadlineNs
+              : 0;
+      strongSelf->_inumaTrace.texture_notify_event_count += 1;
+    }
+    os_unfair_lock_unlock(&strongSelf->_lock);
+    if (!notificationIsCurrent || registry == nil) {
+      return;
+    }
+    [registry textureFrameAvailable:textureId];
+    if (traceEnabled) {
+      const uint64_t notifyEnded = InumaMonotonicNanoseconds();
+      os_unfair_lock_lock(&strongSelf->_lock);
+      if (notifyStarted >= enqueuedAt) {
+        InumaAppendTraceSample(
+            strongSelf->_inumaTrace.texture_notify_dispatch_samples,
+            &strongSelf->_inumaTrace.texture_notify_dispatch_count,
+            notifyStarted - enqueuedAt);
+      }
+      InumaAppendTraceSample(
+          strongSelf->_inumaTrace.texture_notify_samples,
+          &strongSelf->_inumaTrace.texture_notify_count,
+          notifyEnded - notifyStarted);
+      os_unfair_lock_unlock(&strongSelf->_lock);
+    }
+  };
+  if ([NSThread isMainThread] && scheduledDelayNs == 0) {
+    notifyTextureFrameAvailable();
+  } else if (scheduledDelayNs == 0) {
+    dispatch_async(dispatch_get_main_queue(), notifyTextureFrameAvailable);
+  } else {
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
+        dispatch_get_main_queue(), notifyTextureFrameAvailable);
+  }
+}
+
+- (void)inumaClearPendingTextureFramesLocked {
+  while (_inumaPendingTextureFrameCount > 0) {
+    InumaPendingTextureFrame pending =
+        _inumaPendingTextureFrames[_inumaPendingTextureFrameHead];
+    _inumaPendingTextureFrames[_inumaPendingTextureFrameHead] =
+        (InumaPendingTextureFrame){0};
+    _inumaPendingTextureFrameHead =
+        (_inumaPendingTextureFrameHead + 1) %
+        kInumaPendingTextureFrameCapacity;
+    _inumaPendingTextureFrameCount -= 1;
+    if (pending.pixel_buffer != nil) {
+      CVBufferRelease(pending.pixel_buffer);
+    }
+    if (_inumaTrace.enabled) {
+      _inumaTrace.queue_cleared_frames += 1;
+    }
+  }
+  _inumaPendingTextureFrameHead = 0;
 }
 
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size {
@@ -763,8 +974,10 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
   if (snapshot == NULL) {
     return;
   }
+  NSUInteger pendingTextureFrameCount = 0;
   os_unfair_lock_lock(&_lock);
   *snapshot = _inumaTrace;
+  pendingTextureFrameCount = _inumaPendingTextureFrameCount;
   os_unfair_lock_unlock(&_lock);
   NSString *mode = _inumaPixelMode == InumaMacOSPixelModeNativeNV12
                        ? @"native_nv12"
@@ -775,7 +988,7 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @9,
+    @"tail_diagnostics_version" : @10,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -800,6 +1013,15 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     @"native_nv12_fallback_frames" : @(snapshot->native_nv12_fallback_frames),
     @"minimum_texture_hold_ns" : @(_inumaMinimumTextureHoldNs),
     @"texture_hold_applied" : @(snapshot->texture_hold_applied),
+    @"stale_texture_notifications" :
+        @(snapshot->stale_texture_notifications),
+    @"max_queued_texture_frames" : @(_inumaMaxQueuedTextureFrames),
+    @"queued_frames" : @(snapshot->queued_frames),
+    @"queue_promotions" : @(snapshot->queue_promotions),
+    @"queue_overflows" : @(snapshot->queue_overflows),
+    @"queue_cleared_frames" : @(snapshot->queue_cleared_frames),
+    @"queue_max_depth" : @(snapshot->queue_max_depth),
+    @"queue_pending_at_snapshot" : @(pendingTextureFrameCount),
     @"stock_bgra_pool_minimum_buffer_count" :
         @(kInumaStockBGRAPoolMinimumBufferCount),
     @"stock_bgra_pool_create_failures" :
@@ -825,12 +1047,35 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
     @"texture_hold_delay_ns" : InumaTraceSampleArray(
         snapshot->texture_hold_delay_samples,
         snapshot->texture_hold_delay_count),
+    @"texture_hold_frame_timestamp_ns" : InumaTraceSignedSampleArray(
+        snapshot->texture_hold_frame_timestamp_ns_samples,
+        snapshot->texture_hold_delay_count),
     @"texture_notify_event_offset_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_event_offset_samples,
         snapshot->texture_notify_event_count),
     @"texture_notify_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->texture_notify_frame_timestamp_ns_samples,
         snapshot->texture_notify_event_count),
+    @"texture_notify_scheduled_delay_ns" : InumaTraceSampleArray(
+        snapshot->texture_notify_scheduled_delay_samples,
+        snapshot->texture_notify_event_count),
+    @"texture_notify_deadline_lateness_ns" : InumaTraceSampleArray(
+        snapshot->texture_notify_deadline_lateness_samples,
+        snapshot->texture_notify_event_count),
+    @"queue_wait_ns" : InumaTraceSampleArray(
+        snapshot->queue_wait_samples, snapshot->queue_wait_count),
+    @"queue_enqueue_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->queue_enqueue_event_offset_samples,
+        snapshot->queue_enqueue_event_count),
+    @"queue_enqueue_frame_timestamp_ns" : InumaTraceSignedSampleArray(
+        snapshot->queue_enqueue_frame_timestamp_ns_samples,
+        snapshot->queue_enqueue_event_count),
+    @"queue_promote_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->queue_promote_event_offset_samples,
+        snapshot->queue_promote_event_count),
+    @"queue_promote_frame_timestamp_ns" : InumaTraceSignedSampleArray(
+        snapshot->queue_promote_frame_timestamp_ns_samples,
+        snapshot->queue_promote_event_count),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
     @"render_event_offset_ns" : InumaTraceSampleArray(
         snapshot->render_event_offset_samples, snapshot->render_event_count),
@@ -874,6 +1119,9 @@ static uint64_t InumaTextureMinimumHoldNanosecondsFromEnvironment(
 - (void)setSize:(CGSize)size {
   os_unfair_lock_lock(&_lock);
   if (size.width != _frameSize.width || size.height != _frameSize.height) {
+#if TARGET_OS_OSX
+    [self inumaClearPendingTextureFramesLocked];
+#endif
     if (_pixelBufferRef) {
       CVBufferRelease(_pixelBufferRef);
       _pixelBufferRef = nil;
