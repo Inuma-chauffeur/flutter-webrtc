@@ -50,6 +50,8 @@ typedef struct {
   uint64_t copy_ready_age_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_dispatch_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_event_offset_samples[kInumaTextureTraceCapacity];
+  int64_t texture_notify_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t render_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint8_t render_outcome_samples[kInumaTextureTraceCapacity];
@@ -62,6 +64,7 @@ typedef struct {
   NSUInteger copy_ready_age_count;
   NSUInteger texture_notify_dispatch_count;
   NSUInteger texture_notify_count;
+  NSUInteger texture_notify_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
@@ -410,6 +413,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
   NSUInteger inumaRenderEventIndex = NSNotFound;
   bool inumaShouldNotifyTexture = false;
   int64_t inumaTextureIdToNotify = -1;
+  int64_t inumaFrameTimestampToNotify = 0;
   uint64_t inumaNotifyEnqueuedMonotonicNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
@@ -475,6 +479,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     if (framePrepared && _textureId != -1) {
       inumaShouldNotifyTexture = true;
       inumaTextureIdToNotify = _textureId;
+      inumaFrameTimestampToNotify = frame.timeStampNs;
       inumaNotifyEnqueuedMonotonicNs =
           _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     }
@@ -522,6 +527,21 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
           strongSelf->_frameAvailable;
       const bool traceEnabled = strongSelf->_inumaTrace.enabled;
       id<FlutterTextureRegistry> registry = strongSelf->_registry;
+      if (traceEnabled && notificationIsCurrent && registry != nil &&
+          strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+          notifyStarted >= strongSelf->_inumaTraceStartedMonotonicNs &&
+          strongSelf->_inumaTrace.texture_notify_event_count <
+              kInumaTextureTraceCapacity) {
+        const NSUInteger notifyEventIndex =
+            strongSelf->_inumaTrace.texture_notify_event_count;
+        strongSelf->_inumaTrace
+            .texture_notify_event_offset_samples[notifyEventIndex] =
+            notifyStarted - strongSelf->_inumaTraceStartedMonotonicNs;
+        strongSelf->_inumaTrace
+            .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
+            inumaFrameTimestampToNotify;
+        strongSelf->_inumaTrace.texture_notify_event_count += 1;
+      }
       os_unfair_lock_unlock(&strongSelf->_lock);
       if (!notificationIsCurrent || registry == nil) {
         return;
@@ -709,7 +729,7 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @7,
+    @"tail_diagnostics_version" : @8,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -754,6 +774,12 @@ InumaPixelModeFromEnvironment(NSDictionary<NSString *, NSString *> *env) {
         snapshot->texture_notify_dispatch_count),
     @"texture_notify_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_samples, snapshot->texture_notify_count),
+    @"texture_notify_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->texture_notify_event_offset_samples,
+        snapshot->texture_notify_event_count),
+    @"texture_notify_frame_timestamp_ns" : InumaTraceSignedSampleArray(
+        snapshot->texture_notify_frame_timestamp_ns_samples,
+        snapshot->texture_notify_event_count),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
     @"render_event_offset_ns" : InumaTraceSampleArray(
         snapshot->render_event_offset_samples, snapshot->render_event_count),
