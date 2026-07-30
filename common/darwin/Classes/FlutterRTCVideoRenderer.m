@@ -56,6 +56,10 @@ typedef struct {
   uint64_t queue_cleared_frames;
   uint64_t queue_max_depth;
   uint64_t rescue_hold_bypasses;
+  uint64_t strict_hold_timer_created;
+  uint64_t strict_hold_timer_fired;
+  uint64_t strict_hold_timer_cancelled;
+  uint64_t strict_hold_timer_create_failures;
   uint64_t stock_bgra_pool_create_failures;
   uint64_t stock_bgra_pool_buffer_requests;
   uint64_t stock_bgra_pool_buffer_failures;
@@ -78,6 +82,11 @@ typedef struct {
   int64_t queue_promote_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   int64_t rescue_hold_bypass_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t strict_hold_timer_deadline_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t strict_hold_timer_fire_offset_samples[kInumaTextureTraceCapacity];
+  int64_t strict_hold_timer_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
   uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t render_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
   uint8_t render_outcome_samples[kInumaTextureTraceCapacity];
@@ -96,6 +105,7 @@ typedef struct {
   NSUInteger queue_enqueue_event_count;
   NSUInteger queue_promote_event_count;
   NSUInteger rescue_hold_bypass_count;
+  NSUInteger strict_hold_timer_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
@@ -187,6 +197,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:(int64_t)frameTimestampNs
                                bypassMinimumHold:(bool)bypassMinimumHold;
+- (void)inumaCancelTextureHoldTimerLocked;
 - (void)inumaClearPendingTextureFramesLocked;
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size;
 - (void)inumaWriteTextureTrace;
@@ -219,6 +230,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   CVPixelBufferPoolRef _inumaStockBGRAPixelBufferPool;
   dispatch_queue_t _inumaTraceQueue;
   dispatch_source_t _inumaTraceTimer;
+  dispatch_source_t _inumaTextureHoldTimer;
 #endif
 }
 
@@ -261,6 +273,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaTextureHoldTimer = nil;
     _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
@@ -400,6 +413,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   }
 #endif
   os_unfair_lock_lock(&_lock);
+#if TARGET_OS_OSX
+  [self inumaCancelTextureHoldTimerLocked];
+#endif
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
   if (_pixelBufferRef) {
@@ -426,6 +442,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     os_unfair_lock_lock(&_lock);
     _videoTrack = videoTrack;
 #if TARGET_OS_OSX
+    [self inumaCancelTextureHoldTimerLocked];
     [self inumaClearPendingTextureFramesLocked];
     _inumaFrameReadyMonotonicNs = 0;
     _inumaFrameTimestampNs = 0;
@@ -934,9 +951,105 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   } else if (scheduledDelayNs == 0) {
     dispatch_async(dispatch_get_main_queue(), notifyTextureFrameAvailable);
   } else {
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
-        dispatch_get_main_queue(), notifyTextureFrameAvailable);
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+        dispatch_get_main_queue());
+    if (timer == nil) {
+      os_unfair_lock_lock(&_lock);
+      if (_inumaTrace.enabled) {
+        _inumaTrace.strict_hold_timer_create_failures += 1;
+      }
+      os_unfair_lock_unlock(&_lock);
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
+          dispatch_get_main_queue(), notifyTextureFrameAvailable);
+      return;
+    }
+
+    __block NSUInteger timerEventIndex = NSNotFound;
+    const uint64_t deadlineNs = enqueuedAt + scheduledDelayNs;
+    os_unfair_lock_lock(&_lock);
+    const bool timerIsCurrent =
+        _textureId == textureId && _frameAvailable &&
+        _inumaFrameTimestampNs == frameTimestampNs &&
+        _inumaTextureHoldTimer == nil;
+    if (timerIsCurrent) {
+      _inumaTextureHoldTimer = timer;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.strict_hold_timer_created += 1;
+        if (_inumaTraceStartedMonotonicNs > 0 &&
+            deadlineNs >= _inumaTraceStartedMonotonicNs &&
+            _inumaTrace.strict_hold_timer_event_count <
+                kInumaTextureTraceCapacity) {
+          timerEventIndex = _inumaTrace.strict_hold_timer_event_count;
+          _inumaTrace.strict_hold_timer_deadline_offset_samples
+              [timerEventIndex] =
+              deadlineNs - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.strict_hold_timer_frame_timestamp_ns_samples
+              [timerEventIndex] = frameTimestampNs;
+          _inumaTrace.strict_hold_timer_event_count += 1;
+        }
+      }
+    }
+    os_unfair_lock_unlock(&_lock);
+    if (!timerIsCurrent) {
+      dispatch_source_cancel(timer);
+      dispatch_resume(timer);
+      return;
+    }
+
+    __weak dispatch_source_t weakTimer = timer;
+    dispatch_source_set_event_handler(timer, ^{
+      dispatch_source_t strongTimer = weakTimer;
+      FlutterRTCVideoRenderer *strongSelf = weakSelf;
+      if (strongTimer == nil) {
+        return;
+      }
+      if (strongSelf == nil) {
+        dispatch_source_cancel(strongTimer);
+        return;
+      }
+      const uint64_t firedAt = InumaMonotonicNanoseconds();
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool ownsTimer =
+          strongSelf->_inumaTextureHoldTimer == strongTimer;
+      if (ownsTimer) {
+        strongSelf->_inumaTextureHoldTimer = nil;
+      }
+      if (strongSelf->_inumaTrace.enabled) {
+        strongSelf->_inumaTrace.strict_hold_timer_fired += 1;
+        if (timerEventIndex != NSNotFound &&
+            timerEventIndex <
+                strongSelf->_inumaTrace.strict_hold_timer_event_count &&
+            strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+            firedAt >= strongSelf->_inumaTraceStartedMonotonicNs) {
+          strongSelf->_inumaTrace.strict_hold_timer_fire_offset_samples
+              [timerEventIndex] =
+              firedAt - strongSelf->_inumaTraceStartedMonotonicNs;
+        }
+      }
+      os_unfair_lock_unlock(&strongSelf->_lock);
+      dispatch_source_cancel(strongTimer);
+      if (ownsTimer) {
+        notifyTextureFrameAvailable();
+      }
+    });
+    dispatch_source_set_timer(
+        timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
+        DISPATCH_TIME_FOREVER, 0);
+    dispatch_resume(timer);
+  }
+}
+
+- (void)inumaCancelTextureHoldTimerLocked {
+  dispatch_source_t timer = _inumaTextureHoldTimer;
+  if (timer == nil) {
+    return;
+  }
+  _inumaTextureHoldTimer = nil;
+  dispatch_source_cancel(timer);
+  if (_inumaTrace.enabled) {
+    _inumaTrace.strict_hold_timer_cancelled += 1;
   }
 }
 
@@ -996,9 +1109,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     return;
   }
   NSUInteger pendingTextureFrameCount = 0;
+  bool textureHoldTimerActive = false;
   os_unfair_lock_lock(&_lock);
   *snapshot = _inumaTrace;
   pendingTextureFrameCount = _inumaPendingTextureFrameCount;
+  textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   os_unfair_lock_unlock(&_lock);
   NSString *mode = _inumaPixelMode == InumaMacOSPixelModeNativeNV12
                        ? @"native_nv12"
@@ -1009,7 +1124,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @11,
+    @"tail_diagnostics_version" : @12,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1044,6 +1159,15 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"queue_max_depth" : @(snapshot->queue_max_depth),
     @"queue_pending_at_snapshot" : @(pendingTextureFrameCount),
     @"rescue_hold_bypasses" : @(snapshot->rescue_hold_bypasses),
+    @"strict_hold_timer_created" :
+        @(snapshot->strict_hold_timer_created),
+    @"strict_hold_timer_fired" : @(snapshot->strict_hold_timer_fired),
+    @"strict_hold_timer_cancelled" :
+        @(snapshot->strict_hold_timer_cancelled),
+    @"strict_hold_timer_create_failures" :
+        @(snapshot->strict_hold_timer_create_failures),
+    @"strict_hold_timer_active_at_snapshot" :
+        @(textureHoldTimerActive),
     @"stock_bgra_pool_minimum_buffer_count" :
         @(kInumaStockBGRAPoolMinimumBufferCount),
     @"stock_bgra_pool_create_failures" :
@@ -1101,6 +1225,15 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"rescue_hold_bypass_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->rescue_hold_bypass_frame_timestamp_ns_samples,
         snapshot->rescue_hold_bypass_count),
+    @"strict_hold_timer_deadline_offset_ns" : InumaTraceSampleArray(
+        snapshot->strict_hold_timer_deadline_offset_samples,
+        snapshot->strict_hold_timer_event_count),
+    @"strict_hold_timer_fire_offset_ns" : InumaTraceSampleArray(
+        snapshot->strict_hold_timer_fire_offset_samples,
+        snapshot->strict_hold_timer_event_count),
+    @"strict_hold_timer_frame_timestamp_ns" : InumaTraceSignedSampleArray(
+        snapshot->strict_hold_timer_frame_timestamp_ns_samples,
+        snapshot->strict_hold_timer_event_count),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
     @"render_event_offset_ns" : InumaTraceSampleArray(
         snapshot->render_event_offset_samples, snapshot->render_event_count),
@@ -1145,6 +1278,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   os_unfair_lock_lock(&_lock);
   if (size.width != _frameSize.width || size.height != _frameSize.height) {
 #if TARGET_OS_OSX
+    [self inumaCancelTextureHoldTimerLocked];
     [self inumaClearPendingTextureFramesLocked];
 #endif
     if (_pixelBufferRef) {
