@@ -21,6 +21,8 @@
 #if TARGET_OS_OSX
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
+#include <pthread/qos.h>
+#include <sys/qos.h>
 
 enum {
   // Covers a 30 FPS, 30-minute proof plus 20% startup/teardown headroom.
@@ -34,6 +36,18 @@ typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
   InumaMacOSPixelModeStockBGRA = 0,
   InumaMacOSPixelModeNativeNV12 = 1,
 };
+
+typedef NS_ENUM(NSUInteger, InumaRenderQoSPolicy) {
+  InumaRenderQoSPolicyInherit = 0,
+  InumaRenderQoSPolicyUserInteractive = 1,
+};
+
+typedef struct {
+  qos_class_t before;
+  qos_class_t after;
+  bool apply_attempted;
+  bool apply_succeeded;
+} InumaRenderQoSObservation;
 
 typedef struct {
   CVPixelBufferRef pixel_buffer;
@@ -74,6 +88,20 @@ typedef struct {
   uint64_t rescue_display_link_deferrals;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
+  uint64_t texture_notification_platform_turn_last_schedule_offset_ns;
+  uint64_t texture_notification_platform_turn_last_fire_offset_ns;
+  uint64_t render_qos_observations;
+  uint64_t render_qos_apply_attempts;
+  uint64_t render_qos_apply_successes;
+  uint64_t render_qos_apply_failures;
+  uint64_t render_qos_before_unspecified;
+  uint64_t render_qos_before_background;
+  uint64_t render_qos_before_utility;
+  uint64_t render_qos_before_default;
+  uint64_t render_qos_before_user_initiated;
+  uint64_t render_qos_before_user_interactive;
+  uint64_t render_qos_after_user_interactive;
+  uint64_t render_qos_after_not_user_interactive;
   uint64_t strict_hold_timer_created;
   uint64_t strict_hold_timer_fired;
   uint64_t strict_hold_timer_cancelled;
@@ -377,6 +405,98 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
   return [value isEqualToString:@"enabled"];
 }
 
+static InumaRenderQoSPolicy InumaRenderQoSPolicyFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_RENDER_QOS"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if ([value isEqualToString:@"user_interactive"]) {
+    return InumaRenderQoSPolicyUserInteractive;
+  }
+  return InumaRenderQoSPolicyInherit;
+}
+
+static NSString *InumaRenderQoSPolicyName(InumaRenderQoSPolicy policy) {
+  return policy == InumaRenderQoSPolicyUserInteractive
+             ? @"user_interactive"
+             : @"inherit";
+}
+
+static InumaRenderQoSObservation
+InumaObserveRenderQoS(InumaRenderQoSPolicy policy) {
+  static _Thread_local bool initialized = false;
+  static _Thread_local InumaRenderQoSPolicy initializedPolicy =
+      InumaRenderQoSPolicyInherit;
+  static _Thread_local InumaRenderQoSObservation observation;
+  if (!initialized || initializedPolicy != policy) {
+    const qos_class_t before = qos_class_self();
+    bool attempted = false;
+    bool succeeded = false;
+    if (policy == InumaRenderQoSPolicyUserInteractive &&
+        before != QOS_CLASS_USER_INTERACTIVE) {
+      attempted = true;
+      succeeded =
+          pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
+    }
+    observation = (InumaRenderQoSObservation){
+        .before = before,
+        .after = qos_class_self(),
+        .apply_attempted = attempted,
+        .apply_succeeded = succeeded,
+    };
+    initializedPolicy = policy;
+    initialized = true;
+    return observation;
+  }
+  return (InumaRenderQoSObservation){
+      .before = observation.after,
+      .after = observation.after,
+      .apply_attempted = false,
+      .apply_succeeded = false,
+  };
+}
+
+static void InumaRecordRenderQoSObservationLocked(
+    InumaTextureTrace *trace, InumaRenderQoSObservation observation) {
+  trace->render_qos_observations += 1;
+  switch (observation.before) {
+  case QOS_CLASS_BACKGROUND:
+    trace->render_qos_before_background += 1;
+    break;
+  case QOS_CLASS_UTILITY:
+    trace->render_qos_before_utility += 1;
+    break;
+  case QOS_CLASS_DEFAULT:
+    trace->render_qos_before_default += 1;
+    break;
+  case QOS_CLASS_USER_INITIATED:
+    trace->render_qos_before_user_initiated += 1;
+    break;
+  case QOS_CLASS_USER_INTERACTIVE:
+    trace->render_qos_before_user_interactive += 1;
+    break;
+  case QOS_CLASS_UNSPECIFIED:
+  default:
+    trace->render_qos_before_unspecified += 1;
+    break;
+  }
+  if (observation.apply_attempted) {
+    trace->render_qos_apply_attempts += 1;
+    if (observation.apply_succeeded &&
+        observation.after == QOS_CLASS_USER_INTERACTIVE) {
+      trace->render_qos_apply_successes += 1;
+    } else {
+      trace->render_qos_apply_failures += 1;
+    }
+  }
+  if (observation.after == QOS_CLASS_USER_INTERACTIVE) {
+    trace->render_qos_after_user_interactive += 1;
+  } else {
+    trace->render_qos_after_not_user_interactive += 1;
+  }
+}
+
 @interface FlutterRTCVideoRenderer ()
 - (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer;
 - (CVPixelBufferRef)inumaCreatePixelBufferFromFrame:(RTCVideoFrame *)frame;
@@ -421,6 +541,7 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
 #if TARGET_OS_OSX
   NSString *_inumaTracePath;
   InumaMacOSPixelMode _inumaPixelMode;
+  InumaRenderQoSPolicy _inumaRenderQoSPolicy;
   InumaTextureTrace _inumaTrace;
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
@@ -483,6 +604,8 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
         [environment[@"INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH"] copy];
     _inumaTrace.enabled = _inumaTracePath.length > 0;
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
+    _inumaRenderQoSPolicy =
+        InumaRenderQoSPolicyFromEnvironment(environment);
     _inumaMinimumTextureHoldNs =
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
     _inumaRasterRepeatGuardEnabled =
@@ -914,6 +1037,8 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
 - (void)renderFrame:(RTCVideoFrame *)frame {
 
 #if TARGET_OS_OSX
+  const InumaRenderQoSObservation inumaRenderQoS =
+      InumaObserveRenderQoS(_inumaRenderQoSPolicy);
   const uint64_t started =
       _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   NSUInteger inumaRenderEventIndex = NSNotFound;
@@ -925,6 +1050,7 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
 #if TARGET_OS_OSX
   const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   if (_inumaTrace.enabled) {
+    InumaRecordRenderQoSObservationLocked(&_inumaTrace, inumaRenderQoS);
     _inumaTrace.render_frames += 1;
     if (_inumaTraceStartedMonotonicNs > 0 &&
         locked >= _inumaTraceStartedMonotonicNs) {
@@ -1350,10 +1476,19 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
     if (strongSelf == nil) {
       return;
     }
+    const uint64_t platformTurnScheduledAt = InumaMonotonicNanoseconds();
     os_unfair_lock_lock(&strongSelf->_lock);
     if (strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.texture_notification_platform_turn_schedules +=
           1;
+      if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+          platformTurnScheduledAt >=
+              strongSelf->_inumaTraceStartedMonotonicNs) {
+        strongSelf->_inumaTrace
+            .texture_notification_platform_turn_last_schedule_offset_ns =
+            platformTurnScheduledAt -
+            strongSelf->_inumaTraceStartedMonotonicNs;
+      }
     }
     os_unfair_lock_unlock(&strongSelf->_lock);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1361,9 +1496,18 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
       if (innerSelf == nil) {
         return;
       }
+      const uint64_t platformTurnFiredAt = InumaMonotonicNanoseconds();
       os_unfair_lock_lock(&innerSelf->_lock);
       if (innerSelf->_inumaTrace.enabled) {
         innerSelf->_inumaTrace.texture_notification_platform_turn_fires += 1;
+        if (innerSelf->_inumaTraceStartedMonotonicNs > 0 &&
+            platformTurnFiredAt >=
+                innerSelf->_inumaTraceStartedMonotonicNs) {
+          innerSelf->_inumaTrace
+              .texture_notification_platform_turn_last_fire_offset_ns =
+              platformTurnFiredAt -
+              innerSelf->_inumaTraceStartedMonotonicNs;
+        }
       }
       os_unfair_lock_unlock(&innerSelf->_lock);
       notifyTextureFrameAvailable();
@@ -1800,7 +1944,7 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @26,
+    @"tail_diagnostics_version" : @27,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1876,6 +2020,38 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
         @(snapshot->texture_notification_platform_turn_fires),
+    @"texture_notification_platform_turn_last_schedule_offset_ns" :
+        @(snapshot
+              ->texture_notification_platform_turn_last_schedule_offset_ns),
+    @"texture_notification_platform_turn_last_fire_offset_ns" :
+        @(snapshot
+              ->texture_notification_platform_turn_last_fire_offset_ns),
+    @"render_qos_policy" :
+        InumaRenderQoSPolicyName(_inumaRenderQoSPolicy),
+    @"render_qos_observations" :
+        @(snapshot->render_qos_observations),
+    @"render_qos_apply_attempts" :
+        @(snapshot->render_qos_apply_attempts),
+    @"render_qos_apply_successes" :
+        @(snapshot->render_qos_apply_successes),
+    @"render_qos_apply_failures" :
+        @(snapshot->render_qos_apply_failures),
+    @"render_qos_before_unspecified" :
+        @(snapshot->render_qos_before_unspecified),
+    @"render_qos_before_background" :
+        @(snapshot->render_qos_before_background),
+    @"render_qos_before_utility" :
+        @(snapshot->render_qos_before_utility),
+    @"render_qos_before_default" :
+        @(snapshot->render_qos_before_default),
+    @"render_qos_before_user_initiated" :
+        @(snapshot->render_qos_before_user_initiated),
+    @"render_qos_before_user_interactive" :
+        @(snapshot->render_qos_before_user_interactive),
+    @"render_qos_after_user_interactive" :
+        @(snapshot->render_qos_after_user_interactive),
+    @"render_qos_after_not_user_interactive" :
+        @(snapshot->render_qos_after_not_user_interactive),
     @"rescue_display_link_active_at_snapshot" :
         @(rescueDisplayLinkActive),
     @"strict_hold_timer_created" :
