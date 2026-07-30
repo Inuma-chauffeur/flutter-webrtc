@@ -21,7 +21,8 @@
 #import <QuartzCore/CADisplayLink.h>
 
 enum {
-  kInumaTextureTraceCapacity = 8192,
+  // Covers a 30 FPS, 30-minute proof plus 20% startup/teardown headroom.
+  kInumaTextureTraceCapacity = 65536,
   kInumaStockBGRAPoolMinimumBufferCount = 4,
   kInumaPendingTextureFrameCapacity = 1,
 };
@@ -77,6 +78,7 @@ typedef struct {
   uint64_t stock_bgra_pool_create_failures;
   uint64_t stock_bgra_pool_buffer_requests;
   uint64_t stock_bgra_pool_buffer_failures;
+  uint64_t sample_capacity_exhaustions;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
   uint64_t copy_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -156,13 +158,27 @@ static uint64_t InumaDisplayLinkTimestampNanoseconds(
   return (uint64_t)(timestamp * 1000000000.0);
 }
 
-static void InumaAppendTraceSample(uint64_t *samples, NSUInteger *count,
-                                   uint64_t value) {
+static bool InumaAppendTraceSample(uint64_t *samples, NSUInteger *count,
+                                   uint64_t value,
+                                   uint64_t *capacityExhaustions) {
   if (*count >= kInumaTextureTraceCapacity) {
-    return;
+    *capacityExhaustions += 1;
+    return false;
   }
   samples[*count] = value;
   *count += 1;
+  return true;
+}
+
+static NSUInteger InumaReserveTraceSample(NSUInteger *count,
+                                          uint64_t *capacityExhaustions) {
+  if (*count >= kInumaTextureTraceCapacity) {
+    *capacityExhaustions += 1;
+    return NSNotFound;
+  }
+  const NSUInteger index = *count;
+  *count += 1;
+  return index;
 }
 
 static NSArray<NSNumber *> *InumaTraceSampleArray(const uint64_t *samples,
@@ -374,8 +390,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   if (_inumaTrace.enabled) {
     _inumaTrace.copy_calls += 1;
-    InumaAppendTraceSample(_inumaTrace.copy_lock_wait_samples,
-                           &_inumaTrace.copy_lock_wait_count, locked - started);
+    InumaAppendTraceSample(
+        _inumaTrace.copy_lock_wait_samples,
+        &_inumaTrace.copy_lock_wait_count, locked - started,
+        &_inumaTrace.sample_capacity_exhaustions);
   }
 #endif
   if (_pixelBufferRef != nil && _frameAvailable) {
@@ -389,19 +407,23 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       _inumaTrace.copy_hits += 1;
       if (_inumaFrameReadyMonotonicNs > 0 &&
           locked >= _inumaFrameReadyMonotonicNs) {
-        InumaAppendTraceSample(_inumaTrace.copy_ready_age_samples,
-                               &_inumaTrace.copy_ready_age_count,
-                               locked - _inumaFrameReadyMonotonicNs);
+        InumaAppendTraceSample(
+            _inumaTrace.copy_ready_age_samples,
+            &_inumaTrace.copy_ready_age_count,
+            locked - _inumaFrameReadyMonotonicNs,
+            &_inumaTrace.sample_capacity_exhaustions);
       }
       if (_inumaTraceStartedMonotonicNs > 0 &&
-          locked >= _inumaTraceStartedMonotonicNs &&
-          _inumaTrace.copy_event_count < kInumaTextureTraceCapacity) {
-        const NSUInteger copyEventIndex = _inumaTrace.copy_event_count;
-        _inumaTrace.copy_event_offset_samples[copyEventIndex] =
-            locked - _inumaTraceStartedMonotonicNs;
-        _inumaTrace.copy_frame_timestamp_ns_samples[copyEventIndex] =
-            _inumaFrameTimestampNs;
-        _inumaTrace.copy_event_count += 1;
+          locked >= _inumaTraceStartedMonotonicNs) {
+        const NSUInteger copyEventIndex = InumaReserveTraceSample(
+            &_inumaTrace.copy_event_count,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (copyEventIndex != NSNotFound) {
+          _inumaTrace.copy_event_offset_samples[copyEventIndex] =
+              locked - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.copy_frame_timestamp_ns_samples[copyEventIndex] =
+              _inumaFrameTimestampNs;
+        }
       }
     }
     if (_inumaPendingTextureFrameCount > 0) {
@@ -429,31 +451,32 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
         _inumaTrace.rescue_hold_preservations += 1;
-        const NSUInteger preservationIndex =
-            _inumaTrace.rescue_hold_preservation_count;
-        if (preservationIndex < kInumaTextureTraceCapacity) {
+        const NSUInteger preservationIndex = InumaReserveTraceSample(
+            &_inumaTrace.rescue_hold_preservation_count,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (preservationIndex != NSNotFound) {
           _inumaTrace
               .rescue_hold_preservation_frame_timestamp_ns_samples
                   [preservationIndex] = promoted.frame_timestamp_ns;
-          _inumaTrace.rescue_hold_preservation_count += 1;
         }
         if (copiedAt >= promoted.ready_monotonic_ns) {
           InumaAppendTraceSample(
               _inumaTrace.queue_wait_samples,
               &_inumaTrace.queue_wait_count,
-              copiedAt - promoted.ready_monotonic_ns);
+              copiedAt - promoted.ready_monotonic_ns,
+              &_inumaTrace.sample_capacity_exhaustions);
         }
         if (_inumaTraceStartedMonotonicNs > 0 &&
-            copiedAt >= _inumaTraceStartedMonotonicNs &&
-            _inumaTrace.queue_promote_event_count <
-                kInumaTextureTraceCapacity) {
-          const NSUInteger promoteIndex =
-              _inumaTrace.queue_promote_event_count;
-          _inumaTrace.queue_promote_event_offset_samples[promoteIndex] =
-              copiedAt - _inumaTraceStartedMonotonicNs;
-          _inumaTrace.queue_promote_frame_timestamp_ns_samples[promoteIndex] =
-              promoted.frame_timestamp_ns;
-          _inumaTrace.queue_promote_event_count += 1;
+            copiedAt >= _inumaTraceStartedMonotonicNs) {
+          const NSUInteger promoteIndex = InumaReserveTraceSample(
+              &_inumaTrace.queue_promote_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (promoteIndex != NSNotFound) {
+            _inumaTrace.queue_promote_event_offset_samples[promoteIndex] =
+                copiedAt - _inumaTraceStartedMonotonicNs;
+            _inumaTrace.queue_promote_frame_timestamp_ns_samples
+                [promoteIndex] = promoted.frame_timestamp_ns;
+          }
         }
       }
     }
@@ -651,19 +674,22 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   if (_inumaTrace.enabled) {
     _inumaTrace.render_frames += 1;
     if (_inumaTraceStartedMonotonicNs > 0 &&
-        locked >= _inumaTraceStartedMonotonicNs &&
-        _inumaTrace.render_event_count < kInumaTextureTraceCapacity) {
-      inumaRenderEventIndex = _inumaTrace.render_event_count;
-      _inumaTrace.render_event_offset_samples[inumaRenderEventIndex] =
-          locked - _inumaTraceStartedMonotonicNs;
-      _inumaTrace.render_frame_timestamp_ns_samples[inumaRenderEventIndex] =
-          frame.timeStampNs;
-      _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 0;
-      _inumaTrace.render_event_count += 1;
+        locked >= _inumaTraceStartedMonotonicNs) {
+      inumaRenderEventIndex = InumaReserveTraceSample(
+          &_inumaTrace.render_event_count,
+          &_inumaTrace.sample_capacity_exhaustions);
+      if (inumaRenderEventIndex != NSNotFound) {
+        _inumaTrace.render_event_offset_samples[inumaRenderEventIndex] =
+            locked - _inumaTraceStartedMonotonicNs;
+        _inumaTrace.render_frame_timestamp_ns_samples[inumaRenderEventIndex] =
+            frame.timeStampNs;
+        _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 0;
+      }
     }
-    InumaAppendTraceSample(_inumaTrace.render_lock_wait_samples,
-                           &_inumaTrace.render_lock_wait_count,
-                           locked - started);
+    InumaAppendTraceSample(
+        _inumaTrace.render_lock_wait_samples,
+        &_inumaTrace.render_lock_wait_count, locked - started,
+        &_inumaTrace.sample_capacity_exhaustions);
     [self inumaRecordSourceBuffer:frame.buffer];
   }
 #endif
@@ -723,16 +749,16 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
             MAX(_inumaTrace.queue_max_depth,
                 (uint64_t)_inumaPendingTextureFrameCount);
         if (_inumaTraceStartedMonotonicNs > 0 &&
-            frameReadyNs >= _inumaTraceStartedMonotonicNs &&
-            _inumaTrace.queue_enqueue_event_count <
-                kInumaTextureTraceCapacity) {
-          const NSUInteger enqueueIndex =
-              _inumaTrace.queue_enqueue_event_count;
-          _inumaTrace.queue_enqueue_event_offset_samples[enqueueIndex] =
-              frameReadyNs - _inumaTraceStartedMonotonicNs;
-          _inumaTrace.queue_enqueue_frame_timestamp_ns_samples[enqueueIndex] =
-              frame.timeStampNs;
-          _inumaTrace.queue_enqueue_event_count += 1;
+            frameReadyNs >= _inumaTraceStartedMonotonicNs) {
+          const NSUInteger enqueueIndex = InumaReserveTraceSample(
+              &_inumaTrace.queue_enqueue_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (enqueueIndex != NSNotFound) {
+            _inumaTrace.queue_enqueue_event_offset_samples[enqueueIndex] =
+                frameReadyNs - _inumaTraceStartedMonotonicNs;
+            _inumaTrace.queue_enqueue_frame_timestamp_ns_samples[enqueueIndex] =
+                frame.timeStampNs;
+          }
         }
       }
     }
@@ -762,9 +788,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     }
     if (_inumaFrameReadyMonotonicNs > 0 &&
         locked >= _inumaFrameReadyMonotonicNs) {
-      InumaAppendTraceSample(_inumaTrace.coalesced_pending_age_samples,
-                             &_inumaTrace.coalesced_pending_age_count,
-                             locked - _inumaFrameReadyMonotonicNs);
+      InumaAppendTraceSample(
+          _inumaTrace.coalesced_pending_age_samples,
+          &_inumaTrace.coalesced_pending_age_count,
+          locked - _inumaFrameReadyMonotonicNs,
+          &_inumaTrace.sample_capacity_exhaustions);
     }
 #endif
   }
@@ -860,7 +888,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         InumaAppendTraceSample(
             _inumaTrace.conversion_samples,
             &_inumaTrace.conversion_count,
-            InumaMonotonicNanoseconds() - conversionStarted);
+            InumaMonotonicNanoseconds() - conversionStarted,
+            &_inumaTrace.sample_capacity_exhaustions);
       }
     }
   }
@@ -922,12 +951,13 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   if (notificationCanBeScheduled && bypassMinimumHold && recordRescueBypass &&
       _inumaTrace.enabled) {
     _inumaTrace.rescue_hold_bypasses += 1;
-    const NSUInteger bypassIndex = _inumaTrace.rescue_hold_bypass_count;
-    if (bypassIndex < kInumaTextureTraceCapacity) {
+    const NSUInteger bypassIndex = InumaReserveTraceSample(
+        &_inumaTrace.rescue_hold_bypass_count,
+        &_inumaTrace.sample_capacity_exhaustions);
+    if (bypassIndex != NSNotFound) {
       _inumaTrace
           .rescue_hold_bypass_frame_timestamp_ns_samples[bypassIndex] =
           frameTimestampNs;
-      _inumaTrace.rescue_hold_bypass_count += 1;
     }
   }
   if (notificationCanBeScheduled && !bypassMinimumHold &&
@@ -940,13 +970,13 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       scheduledDelayNs = _inumaMinimumTextureHoldNs - currentTenureNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.texture_hold_applied += 1;
-        const NSUInteger holdIndex =
-            _inumaTrace.texture_hold_delay_count;
-        InumaAppendTraceSample(
+        const NSUInteger holdIndex = _inumaTrace.texture_hold_delay_count;
+        const bool holdRetained = InumaAppendTraceSample(
             _inumaTrace.texture_hold_delay_samples,
             &_inumaTrace.texture_hold_delay_count,
-            scheduledDelayNs);
-        if (holdIndex < kInumaTextureTraceCapacity) {
+            scheduledDelayNs,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (holdRetained) {
           _inumaTrace
               .texture_hold_frame_timestamp_ns_samples[holdIndex] =
               frameTimestampNs;
@@ -978,27 +1008,27 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     }
     if (traceEnabled && notificationIsCurrent && registry != nil &&
         strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
-        notifyStarted >= strongSelf->_inumaTraceStartedMonotonicNs &&
-        strongSelf->_inumaTrace.texture_notify_event_count <
-            kInumaTextureTraceCapacity) {
-      const NSUInteger notifyEventIndex =
-          strongSelf->_inumaTrace.texture_notify_event_count;
-      strongSelf->_inumaTrace
-          .texture_notify_event_offset_samples[notifyEventIndex] =
-          notifyStarted - strongSelf->_inumaTraceStartedMonotonicNs;
-      strongSelf->_inumaTrace
-          .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
-          frameTimestampNs;
-      strongSelf->_inumaTrace
-          .texture_notify_scheduled_delay_samples[notifyEventIndex] =
-          scheduledDelayNs;
-      const uint64_t plannedDeadlineNs = enqueuedAt + scheduledDelayNs;
-      strongSelf->_inumaTrace
-          .texture_notify_deadline_lateness_samples[notifyEventIndex] =
-          notifyStarted >= plannedDeadlineNs
-              ? notifyStarted - plannedDeadlineNs
-              : 0;
-      strongSelf->_inumaTrace.texture_notify_event_count += 1;
+        notifyStarted >= strongSelf->_inumaTraceStartedMonotonicNs) {
+      const NSUInteger notifyEventIndex = InumaReserveTraceSample(
+          &strongSelf->_inumaTrace.texture_notify_event_count,
+          &strongSelf->_inumaTrace.sample_capacity_exhaustions);
+      if (notifyEventIndex != NSNotFound) {
+        strongSelf->_inumaTrace
+            .texture_notify_event_offset_samples[notifyEventIndex] =
+            notifyStarted - strongSelf->_inumaTraceStartedMonotonicNs;
+        strongSelf->_inumaTrace
+            .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
+            frameTimestampNs;
+        strongSelf->_inumaTrace
+            .texture_notify_scheduled_delay_samples[notifyEventIndex] =
+            scheduledDelayNs;
+        const uint64_t plannedDeadlineNs = enqueuedAt + scheduledDelayNs;
+        strongSelf->_inumaTrace
+            .texture_notify_deadline_lateness_samples[notifyEventIndex] =
+            notifyStarted >= plannedDeadlineNs
+                ? notifyStarted - plannedDeadlineNs
+                : 0;
+      }
     }
     os_unfair_lock_unlock(&strongSelf->_lock);
     if (!notificationIsCurrent || registry == nil) {
@@ -1012,12 +1042,14 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         InumaAppendTraceSample(
             strongSelf->_inumaTrace.texture_notify_dispatch_samples,
             &strongSelf->_inumaTrace.texture_notify_dispatch_count,
-            notifyStarted - enqueuedAt);
+            notifyStarted - enqueuedAt,
+            &strongSelf->_inumaTrace.sample_capacity_exhaustions);
       }
       InumaAppendTraceSample(
           strongSelf->_inumaTrace.texture_notify_samples,
           &strongSelf->_inumaTrace.texture_notify_count,
-          notifyEnded - notifyStarted);
+          notifyEnded - notifyStarted,
+          &strongSelf->_inumaTrace.sample_capacity_exhaustions);
       os_unfair_lock_unlock(&strongSelf->_lock);
     }
   };
@@ -1075,16 +1107,17 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       if (_inumaTrace.enabled) {
         _inumaTrace.strict_hold_timer_created += 1;
         if (_inumaTraceStartedMonotonicNs > 0 &&
-            deadlineNs >= _inumaTraceStartedMonotonicNs &&
-            _inumaTrace.strict_hold_timer_event_count <
-                kInumaTextureTraceCapacity) {
-          timerEventIndex = _inumaTrace.strict_hold_timer_event_count;
-          _inumaTrace.strict_hold_timer_deadline_offset_samples
-              [timerEventIndex] =
-              deadlineNs - _inumaTraceStartedMonotonicNs;
-          _inumaTrace.strict_hold_timer_frame_timestamp_ns_samples
-              [timerEventIndex] = frameTimestampNs;
-          _inumaTrace.strict_hold_timer_event_count += 1;
+            deadlineNs >= _inumaTraceStartedMonotonicNs) {
+          timerEventIndex = InumaReserveTraceSample(
+              &_inumaTrace.strict_hold_timer_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (timerEventIndex != NSNotFound) {
+            _inumaTrace.strict_hold_timer_deadline_offset_samples
+                [timerEventIndex] =
+                deadlineNs - _inumaTraceStartedMonotonicNs;
+            _inumaTrace.strict_hold_timer_frame_timestamp_ns_samples
+                [timerEventIndex] = frameTimestampNs;
+          }
         }
       }
     }
@@ -1172,19 +1205,19 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         if (strongSelf->_inumaTrace.enabled) {
           strongSelf->_inumaTrace.rescue_display_link_schedules += 1;
           if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
-              scheduledAt >= strongSelf->_inumaTraceStartedMonotonicNs &&
-              strongSelf->_inumaTrace.rescue_display_link_event_count <
-                  kInumaTextureTraceCapacity) {
-            const NSUInteger eventIndex =
-                strongSelf->_inumaTrace.rescue_display_link_event_count;
-            strongSelf->_inumaTrace
-                .rescue_display_link_schedule_offset_samples[eventIndex] =
-                scheduledAt - strongSelf->_inumaTraceStartedMonotonicNs;
-            strongSelf->_inumaTrace
-                .rescue_display_link_frame_timestamp_ns_samples[eventIndex] =
-                frameTimestampNs;
-            strongSelf->_inumaRescueDisplayLinkEventIndex = eventIndex;
-            strongSelf->_inumaTrace.rescue_display_link_event_count += 1;
+              scheduledAt >= strongSelf->_inumaTraceStartedMonotonicNs) {
+            const NSUInteger eventIndex = InumaReserveTraceSample(
+                &strongSelf->_inumaTrace.rescue_display_link_event_count,
+                &strongSelf->_inumaTrace.sample_capacity_exhaustions);
+            if (eventIndex != NSNotFound) {
+              strongSelf->_inumaTrace
+                  .rescue_display_link_schedule_offset_samples[eventIndex] =
+                  scheduledAt - strongSelf->_inumaTraceStartedMonotonicNs;
+              strongSelf->_inumaTrace
+                  .rescue_display_link_frame_timestamp_ns_samples[eventIndex] =
+                  frameTimestampNs;
+              strongSelf->_inumaRescueDisplayLinkEventIndex = eventIndex;
+            }
           }
         }
       }
@@ -1403,7 +1436,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"pixel_mode" : mode,
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
-    @"tail_diagnostics_version" : @16,
+    @"sample_capacity_exhaustions" :
+        @(snapshot->sample_capacity_exhaustions),
+    @"tail_diagnostics_version" : @17,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
