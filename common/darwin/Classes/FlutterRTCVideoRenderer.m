@@ -84,6 +84,10 @@ typedef struct {
   uint64_t copied_buffer_holds;
   uint64_t copied_buffer_second_next_copy_releases;
   uint64_t copied_buffer_lifecycle_releases;
+  uint64_t raster_repeat_guard_eligible_copy_calls;
+  uint64_t raster_repeat_guard_repeats;
+  uint64_t raster_repeat_guard_missing_predecessor;
+  uint64_t raster_repeat_guard_retry_unavailable;
   uint64_t sample_capacity_exhaustions;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -126,6 +130,13 @@ typedef struct {
   uint64_t coalesced_pending_age_samples[kInumaTextureTraceCapacity];
   uint64_t copy_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t copy_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_event_offset_samples[kInumaTextureTraceCapacity];
+  int64_t raster_repeat_predecessor_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  int64_t raster_repeat_deferred_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_predecessor_tenure_samples
+      [kInumaTextureTraceCapacity];
   uint64_t copied_buffer_second_next_copy_hold_samples
       [kInumaTextureTraceCapacity];
   NSUInteger conversion_count;
@@ -146,6 +157,7 @@ typedef struct {
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
+  NSUInteger raster_repeat_event_count;
   NSUInteger copied_buffer_second_next_copy_hold_count;
 } InumaTextureTrace;
 
@@ -259,6 +271,15 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          coalesced_pending_age_count);
   INUMA_COPY_TRACE_ARRAY(copy_event_offset_samples, copy_event_count);
   INUMA_COPY_TRACE_ARRAY(copy_frame_timestamp_ns_samples, copy_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_event_offset_samples,
+                         raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_predecessor_frame_timestamp_ns_samples,
+      raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_deferred_frame_timestamp_ns_samples,
+                         raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_predecessor_tenure_samples,
+                         raster_repeat_event_count);
   INUMA_COPY_TRACE_ARRAY(copied_buffer_second_next_copy_hold_samples,
                          copied_buffer_second_next_copy_hold_count);
 
@@ -329,6 +350,15 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   return (NSUInteger)frames;
 }
 
+static bool InumaRasterRepeatGuardEnabledFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_RASTER_REPEAT_GUARD"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  return [value isEqualToString:@"enabled"];
+}
+
 @interface FlutterRTCVideoRenderer ()
 - (void)inumaRecordSourceBuffer:(id<RTCVideoFrameBuffer>)buffer;
 - (CVPixelBufferRef)inumaCreatePixelBufferFromFrame:(RTCVideoFrame *)frame;
@@ -375,7 +405,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
   uint64_t _inumaLastCopyMonotonicNs;
+  int64_t _inumaLastCopiedFrameTimestampNs;
   uint64_t _inumaMinimumTextureHoldNs;
+  bool _inumaRasterRepeatGuardEnabled;
+  bool _inumaCurrentFrameWasRescuePromoted;
   NSUInteger _inumaMaxQueuedTextureFrames;
   NSUInteger _inumaPendingTextureFrameHead;
   NSUInteger _inumaPendingTextureFrameCount;
@@ -432,6 +465,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
     _inumaMinimumTextureHoldNs =
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
+    _inumaRasterRepeatGuardEnabled =
+        InumaRasterRepeatGuardEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
         InumaMaxQueuedTextureFramesFromEnvironment(environment);
     _inumaPendingTextureFrameHead = 0;
@@ -440,6 +475,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
+    _inumaLastCopiedFrameTimestampNs = 0;
+    _inumaCurrentFrameWasRescuePromoted = false;
     _inumaFrameTimestampNs = 0;
     _inumaCopiedBufferHoldHead = 0;
     _inumaCopiedBufferHoldCount = 0;
@@ -486,6 +523,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   int64_t promotedTextureId = -1;
   int64_t promotedFrameTimestampNs = 0;
   uint64_t promotedPredecessorCopyUptimeNs = 0;
+  bool retryRasterRepeatedFrame = false;
+  int64_t repeatedFrameTextureId = -1;
+  int64_t repeatedDeferredFrameTimestampNs = 0;
+  uint64_t repeatedPredecessorCopyUptimeNs = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -497,8 +538,65 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         &_inumaTrace.copy_lock_wait_count, locked - started,
         &_inumaTrace.sample_capacity_exhaustions);
   }
+  const uint64_t repeatCheckedAt = InumaMonotonicNanoseconds();
+  // A rescue notification can reach Flutter's raster thread before Core
+  // Animation has had one full minimum-tenure opportunity for the predecessor.
+  // Return the retained predecessor once and leave the promoted frame pending;
+  // the existing display-linked rescue schedules its one permitted retry.
+  const bool repeatGuardEligible =
+      _inumaRasterRepeatGuardEnabled && _frameAvailable &&
+      _inumaCurrentFrameWasRescuePromoted &&
+      _inumaMinimumTextureHoldNs > 0 && _inumaLastCopyMonotonicNs > 0 &&
+      repeatCheckedAt >= _inumaLastCopyMonotonicNs &&
+      repeatCheckedAt - _inumaLastCopyMonotonicNs <
+          _inumaMinimumTextureHoldNs;
+  if (repeatGuardEligible) {
+    if (_inumaTrace.enabled) {
+      _inumaTrace.raster_repeat_guard_eligible_copy_calls += 1;
+    }
+    if (_inumaCopiedBufferHoldCount > 0 &&
+        _inumaLastCopiedFrameTimestampNs != 0) {
+      const NSUInteger newestHoldIndex =
+          (_inumaCopiedBufferHoldHead + _inumaCopiedBufferHoldCount - 1) %
+          kInumaCopiedBufferHoldCapacity;
+      CVPixelBufferRef predecessor =
+          _inumaCopiedBufferHoldRefs[newestHoldIndex];
+      if (predecessor != nil) {
+        buffer = CVBufferRetain(predecessor);
+        _inumaCurrentFrameWasRescuePromoted = false;
+        retryRasterRepeatedFrame = _textureId != -1;
+        repeatedFrameTextureId = _textureId;
+        repeatedDeferredFrameTimestampNs = _inumaFrameTimestampNs;
+        repeatedPredecessorCopyUptimeNs = InumaUptimeNanoseconds();
+        if (_inumaTrace.enabled) {
+          _inumaTrace.copy_hits += 1;
+          _inumaTrace.raster_repeat_guard_repeats += 1;
+          if (!retryRasterRepeatedFrame) {
+            _inumaTrace.raster_repeat_guard_retry_unavailable += 1;
+          }
+          const NSUInteger repeatIndex = InumaReserveTraceSample(
+              &_inumaTrace.raster_repeat_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (repeatIndex != NSNotFound) {
+            _inumaTrace.raster_repeat_event_offset_samples[repeatIndex] =
+                repeatCheckedAt - _inumaTraceStartedMonotonicNs;
+            _inumaTrace
+                .raster_repeat_predecessor_frame_timestamp_ns_samples
+                    [repeatIndex] = _inumaLastCopiedFrameTimestampNs;
+            _inumaTrace.raster_repeat_deferred_frame_timestamp_ns_samples
+                [repeatIndex] = _inumaFrameTimestampNs;
+            _inumaTrace.raster_repeat_predecessor_tenure_samples[repeatIndex] =
+                repeatCheckedAt - _inumaLastCopyMonotonicNs;
+          }
+        }
+      }
+    }
+    if (buffer == nil && _inumaTrace.enabled) {
+      _inumaTrace.raster_repeat_guard_missing_predecessor += 1;
+    }
+  }
 #endif
-  if (_pixelBufferRef != nil && _frameAvailable) {
+  if (buffer == nil && _pixelBufferRef != nil && _frameAvailable) {
     buffer = CVBufferRetain(_pixelBufferRef);
     _frameAvailable = false;
 #if TARGET_OS_OSX
@@ -512,6 +610,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     [self inumaRetainCopiedBufferHoldLocked:_pixelBufferRef
                                   copiedAt:copiedAt];
     _inumaLastCopyMonotonicNs = copiedAt;
+    _inumaLastCopiedFrameTimestampNs = _inumaFrameTimestampNs;
+    _inumaCurrentFrameWasRescuePromoted = false;
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
       if (_inumaFrameReadyMonotonicNs > 0 &&
@@ -550,6 +650,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
       _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
+      _inumaCurrentFrameWasRescuePromoted = true;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -591,12 +692,20 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     }
 #endif
 #if TARGET_OS_OSX
-  } else if (_inumaTrace.enabled) {
+  } else if (buffer == nil && _inumaTrace.enabled) {
     _inumaTrace.copy_misses += 1;
 #endif
   }
   os_unfair_lock_unlock(&_lock);
 #if TARGET_OS_OSX
+  if (retryRasterRepeatedFrame) {
+    [self inumaScheduleDisplayLinkedRescueForTextureId:
+              repeatedFrameTextureId
+                                      frameTimestampNs:
+                                          repeatedDeferredFrameTimestampNs
+                              predecessorCopyUptimeNs:
+                                  repeatedPredecessorCopyUptimeNs];
+  }
   if (notifyPromotedFrame) {
     [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
                                       frameTimestampNs:
@@ -630,6 +739,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   [self inumaClearPendingTextureFramesLocked];
   [self inumaReleaseAllCopiedBufferHoldsLockedAt:
             InumaMonotonicNanoseconds()];
+  _inumaFrameReadyMonotonicNs = 0;
+  _inumaLastCopyMonotonicNs = 0;
+  _inumaLastCopiedFrameTimestampNs = 0;
+  _inumaFrameTimestampNs = 0;
+  _inumaCurrentFrameWasRescuePromoted = false;
   if (_inumaStockBGRAPixelBufferPool) {
     CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
     _inumaStockBGRAPixelBufferPool = nil;
@@ -654,7 +768,10 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     [self inumaReleaseAllCopiedBufferHoldsLockedAt:
               InumaMonotonicNanoseconds()];
     _inumaFrameReadyMonotonicNs = 0;
+    _inumaLastCopyMonotonicNs = 0;
+    _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaCurrentFrameWasRescuePromoted = false;
 #endif
     _frameAvailable = false;
     os_unfair_lock_unlock(&_lock);
@@ -836,6 +953,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = frameReadyNs;
       _inumaFrameTimestampNs = frame.timeStampNs;
+      _inumaCurrentFrameWasRescuePromoted = false;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -1618,7 +1736,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @22,
+    @"tail_diagnostics_version" : @25,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1646,6 +1764,17 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"native_nv12_frames" : @(snapshot->native_nv12_frames),
     @"native_nv12_fallback_frames" : @(snapshot->native_nv12_fallback_frames),
     @"minimum_texture_hold_ns" : @(_inumaMinimumTextureHoldNs),
+    @"raster_repeat_guard_enabled" : @(_inumaRasterRepeatGuardEnabled),
+    @"raster_repeat_guard_contract" :
+        @"repeat_recent_rescue_predecessor_once_then_display_link_retry",
+    @"raster_repeat_guard_eligible_copy_calls" :
+        @(snapshot->raster_repeat_guard_eligible_copy_calls),
+    @"raster_repeat_guard_repeats" :
+        @(snapshot->raster_repeat_guard_repeats),
+    @"raster_repeat_guard_missing_predecessor" :
+        @(snapshot->raster_repeat_guard_missing_predecessor),
+    @"raster_repeat_guard_retry_unavailable" :
+        @(snapshot->raster_repeat_guard_retry_unavailable),
     @"texture_hold_applied" : @(snapshot->texture_hold_applied),
     @"stale_texture_notifications" :
         @(snapshot->stale_texture_notifications),
@@ -1801,6 +1930,20 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"copy_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->copy_frame_timestamp_ns_samples,
         snapshot->copy_event_count),
+    @"raster_repeat_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->raster_repeat_event_offset_samples,
+        snapshot->raster_repeat_event_count),
+    @"raster_repeat_predecessor_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->raster_repeat_predecessor_frame_timestamp_ns_samples,
+            snapshot->raster_repeat_event_count),
+    @"raster_repeat_deferred_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->raster_repeat_deferred_frame_timestamp_ns_samples,
+            snapshot->raster_repeat_event_count),
+    @"raster_repeat_predecessor_tenure_ns" : InumaTraceSampleArray(
+        snapshot->raster_repeat_predecessor_tenure_samples,
+        snapshot->raster_repeat_event_count),
     @"copied_buffer_second_next_copy_hold_ns" : InumaTraceSampleArray(
         snapshot->copied_buffer_second_next_copy_hold_samples,
         snapshot->copied_buffer_second_next_copy_hold_count),
@@ -1839,6 +1982,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     }
 #if TARGET_OS_OSX
     [self inumaResetStockBGRAPixelBufferPoolForSize:size];
+    _inumaFrameReadyMonotonicNs = 0;
+    _inumaLastCopyMonotonicNs = 0;
+    _inumaLastCopiedFrameTimestampNs = 0;
+    _inumaFrameTimestampNs = 0;
+    _inumaCurrentFrameWasRescuePromoted = false;
 #else
     NSDictionary *pixelAttributes =
         @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
