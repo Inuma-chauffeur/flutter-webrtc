@@ -26,7 +26,10 @@ enum {
   // Covers a 30 FPS, 30-minute proof plus 20% startup/teardown headroom.
   kInumaTextureTraceCapacity = 65536,
   kInumaStockBGRAPoolMinimumBufferCount = 4,
-  kInumaPendingTextureFrameCapacity = 1,
+  // One ordered rescue plus one bounded jitter absorber. The second slot is
+  // intentionally not a general playback queue: the gate rejects any
+  // overflow, >= 50 ms residence, stale notification, or undrained state.
+  kInumaPendingTextureFrameCapacity = 2,
   kInumaCopiedBufferHoldCapacity = 2,
 };
 
@@ -65,6 +68,7 @@ typedef struct {
   uint64_t queue_max_depth;
   uint64_t rescue_hold_bypasses;
   uint64_t rescue_hold_preservations;
+  uint64_t rescue_hold_intersections;
   uint64_t rescue_display_link_schedules;
   uint64_t rescue_display_link_fires;
   uint64_t rescue_display_link_cancellations;
@@ -74,6 +78,8 @@ typedef struct {
   uint64_t rescue_display_link_deferrals;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
+  uint64_t texture_notification_platform_turn_last_schedule_offset_ns;
+  uint64_t texture_notification_platform_turn_last_fire_offset_ns;
   uint64_t strict_hold_timer_created;
   uint64_t strict_hold_timer_fired;
   uint64_t strict_hold_timer_cancelled;
@@ -338,7 +344,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:(int64_t)frameTimestampNs
                                    bypassMinimumHold:(bool)bypassMinimumHold
-                                  recordRescueBypass:(bool)recordRescueBypass;
+                            recordRescueIntersection:
+                                (bool)recordRescueIntersection;
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
@@ -919,7 +926,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
                                           frameTimestampNs:
                                               inumaFrameTimestampToNotify
                                          bypassMinimumHold:false
-                                        recordRescueBypass:false];
+                                 recordRescueIntersection:false];
   }
 #endif
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
@@ -1054,25 +1061,14 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
                                    bypassMinimumHold:(bool)bypassMinimumHold
-                                  recordRescueBypass:(bool)recordRescueBypass {
+                            recordRescueIntersection:
+                                (bool)recordRescueIntersection {
   const uint64_t enqueuedAt = InumaMonotonicNanoseconds();
   __block uint64_t scheduledDelayNs = 0;
   os_unfair_lock_lock(&_lock);
   const bool notificationCanBeScheduled =
       _textureId == textureId && _frameAvailable &&
       _inumaFrameTimestampNs == frameTimestampNs;
-  if (notificationCanBeScheduled && bypassMinimumHold && recordRescueBypass &&
-      _inumaTrace.enabled) {
-    _inumaTrace.rescue_hold_bypasses += 1;
-    const NSUInteger bypassIndex = InumaReserveTraceSample(
-        &_inumaTrace.rescue_hold_bypass_count,
-        &_inumaTrace.sample_capacity_exhaustions);
-    if (bypassIndex != NSNotFound) {
-      _inumaTrace
-          .rescue_hold_bypass_frame_timestamp_ns_samples[bypassIndex] =
-          frameTimestampNs;
-    }
-  }
   if (notificationCanBeScheduled && !bypassMinimumHold &&
       _inumaMinimumTextureHoldNs > 0 &&
       _inumaLastCopyMonotonicNs > 0 &&
@@ -1083,6 +1079,9 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       scheduledDelayNs = _inumaMinimumTextureHoldNs - currentTenureNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.texture_hold_applied += 1;
+        if (recordRescueIntersection) {
+          _inumaTrace.rescue_hold_intersections += 1;
+        }
         const NSUInteger holdIndex = _inumaTrace.texture_hold_delay_count;
         const bool holdRetained = InumaAppendTraceSample(
             _inumaTrace.texture_hold_delay_samples,
@@ -1171,10 +1170,19 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     if (strongSelf == nil) {
       return;
     }
+    const uint64_t platformTurnScheduledAt = InumaMonotonicNanoseconds();
     os_unfair_lock_lock(&strongSelf->_lock);
     if (strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.texture_notification_platform_turn_schedules +=
           1;
+      if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+          platformTurnScheduledAt >=
+              strongSelf->_inumaTraceStartedMonotonicNs) {
+        strongSelf->_inumaTrace
+            .texture_notification_platform_turn_last_schedule_offset_ns =
+            platformTurnScheduledAt -
+            strongSelf->_inumaTraceStartedMonotonicNs;
+      }
     }
     os_unfair_lock_unlock(&strongSelf->_lock);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1182,9 +1190,18 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
       if (innerSelf == nil) {
         return;
       }
+      const uint64_t platformTurnFiredAt = InumaMonotonicNanoseconds();
       os_unfair_lock_lock(&innerSelf->_lock);
       if (innerSelf->_inumaTrace.enabled) {
         innerSelf->_inumaTrace.texture_notification_platform_turn_fires += 1;
+        if (innerSelf->_inumaTraceStartedMonotonicNs > 0 &&
+            platformTurnFiredAt >=
+                innerSelf->_inumaTraceStartedMonotonicNs) {
+          innerSelf->_inumaTrace
+              .texture_notification_platform_turn_last_fire_offset_ns =
+              platformTurnFiredAt -
+              innerSelf->_inumaTraceStartedMonotonicNs;
+        }
       }
       os_unfair_lock_unlock(&innerSelf->_lock);
       notifyTextureFrameAvailable();
@@ -1356,7 +1373,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
               inumaScheduleTextureNotificationForTextureId:textureId
                                           frameTimestampNs:frameTimestampNs
                                          bypassMinimumHold:false
-                                        recordRescueBypass:false];
+                                 recordRescueIntersection:false];
         }
       }
       return;
@@ -1376,7 +1393,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
                                              frameTimestampNs:
                                                  frameTimestampNs
                                             bypassMinimumHold:false
-                                           recordRescueBypass:false];
+                                    recordRescueIntersection:false];
     }
   });
 }
@@ -1444,8 +1461,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
   if (rescueIsCurrent && predecessorWasPresented) {
     [self inumaScheduleTextureNotificationForTextureId:textureId
                                       frameTimestampNs:frameTimestampNs
-                                     bypassMinimumHold:true
-                                    recordRescueBypass:false];
+                                     bypassMinimumHold:false
+                              recordRescueIntersection:true];
   }
 }
 
@@ -1618,7 +1635,7 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @22,
+    @"tail_diagnostics_version" : @23,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -1659,6 +1676,8 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
     @"rescue_hold_bypasses" : @(snapshot->rescue_hold_bypasses),
     @"rescue_hold_preservations" :
         @(snapshot->rescue_hold_preservations),
+    @"rescue_hold_intersections" :
+        @(snapshot->rescue_hold_intersections),
     @"rescue_display_link_schedules" :
         @(snapshot->rescue_display_link_schedules),
     @"rescue_display_link_fires" :
@@ -1677,6 +1696,11 @@ static NSUInteger InumaMaxQueuedTextureFramesFromEnvironment(
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
         @(snapshot->texture_notification_platform_turn_fires),
+    @"texture_notification_platform_turn_last_schedule_offset_ns" :
+        @(snapshot
+              ->texture_notification_platform_turn_last_schedule_offset_ns),
+    @"texture_notification_platform_turn_last_fire_offset_ns" :
+        @(snapshot->texture_notification_platform_turn_last_fire_offset_ns),
     @"rescue_display_link_active_at_snapshot" :
         @(rescueDisplayLinkActive),
     @"strict_hold_timer_created" :
