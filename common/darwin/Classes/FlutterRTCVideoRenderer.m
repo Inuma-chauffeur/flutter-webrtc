@@ -47,6 +47,15 @@ typedef NS_ENUM(NSUInteger, InumaRescueNotificationPhase) {
   InumaRescueNotificationPhasePlatformTurn = 1,
 };
 
+typedef NS_ENUM(uint8_t, InumaEmergencyGraceRefuseReason) {
+  InumaEmergencyGraceRefuseReasonNone = 0,
+  InumaEmergencyGraceRefuseReasonQueueShape = 1,
+  InumaEmergencyGraceRefuseReasonNotRepeatDeferred = 2,
+  InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge = 3,
+  InumaEmergencyGraceRefuseReasonOccupied = 4,
+  InumaEmergencyGraceRefuseReasonConversionFailure = 5,
+};
+
 typedef struct {
   qos_class_t before;
   qos_class_t after;
@@ -58,6 +67,8 @@ typedef struct {
   CVPixelBufferRef pixel_buffer;
   int64_t frame_timestamp_ns;
   uint64_t ready_monotonic_ns;
+  uint64_t emergency_grace_admitted_monotonic_ns;
+  bool from_emergency_grace;
 } InumaPendingTextureFrame;
 
 typedef struct {
@@ -124,6 +135,19 @@ typedef struct {
   uint64_t raster_repeat_platform_retry_schedules;
   uint64_t raster_repeat_platform_retry_fires;
   uint64_t raster_repeat_platform_retry_stale_fires;
+  uint64_t emergency_grace_eligible_frames;
+  uint64_t emergency_grace_admits;
+  uint64_t emergency_grace_shifts;
+  uint64_t emergency_grace_drains;
+  uint64_t emergency_grace_refuses;
+  uint64_t emergency_grace_clears;
+  uint64_t emergency_grace_would_have_overflows;
+  uint64_t emergency_grace_max_occupancy;
+  uint64_t emergency_grace_refuse_not_repeat_deferred;
+  uint64_t emergency_grace_refuse_primary_below_minimum_age;
+  uint64_t emergency_grace_refuse_occupied;
+  uint64_t emergency_grace_refuse_queue_shape;
+  uint64_t emergency_grace_refuse_conversion_failure;
   uint64_t sample_capacity_exhaustions;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -181,6 +205,32 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   uint64_t copied_buffer_second_next_copy_hold_samples
       [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_admit_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_admit_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_admit_current_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_admit_primary_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_admit_primary_age_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t emergency_grace_admit_retry_fired_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_shift_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_shift_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_drain_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_drain_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_residence_samples[kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_refuse_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t emergency_grace_refuse_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t emergency_grace_refuse_reason_samples[kInumaTextureTraceCapacity];
   NSUInteger conversion_count;
   NSUInteger render_lock_wait_count;
   NSUInteger copy_lock_wait_count;
@@ -202,6 +252,10 @@ typedef struct {
   NSUInteger raster_repeat_event_count;
   NSUInteger raster_repeat_platform_retry_event_count;
   NSUInteger copied_buffer_second_next_copy_hold_count;
+  NSUInteger emergency_grace_admit_event_count;
+  NSUInteger emergency_grace_shift_event_count;
+  NSUInteger emergency_grace_drain_event_count;
+  NSUInteger emergency_grace_refuse_event_count;
 } InumaTextureTrace;
 
 static uint64_t InumaMonotonicNanoseconds(void) {
@@ -243,6 +297,44 @@ static NSUInteger InumaReserveTraceSample(NSUInteger *count,
   const NSUInteger index = *count;
   *count += 1;
   return index;
+}
+
+static void InumaRecordEmergencyGraceRefusalLocked(
+    InumaTextureTrace *trace, uint64_t eventAt, uint64_t traceStartedAt,
+    int64_t frameTimestampNs, InumaEmergencyGraceRefuseReason reason) {
+  trace->emergency_grace_refuses += 1;
+  switch (reason) {
+  case InumaEmergencyGraceRefuseReasonNotRepeatDeferred:
+    trace->emergency_grace_refuse_not_repeat_deferred += 1;
+    break;
+  case InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge:
+    trace->emergency_grace_refuse_primary_below_minimum_age += 1;
+    break;
+  case InumaEmergencyGraceRefuseReasonOccupied:
+    trace->emergency_grace_refuse_occupied += 1;
+    break;
+  case InumaEmergencyGraceRefuseReasonConversionFailure:
+    trace->emergency_grace_refuse_conversion_failure += 1;
+    break;
+  case InumaEmergencyGraceRefuseReasonQueueShape:
+  case InumaEmergencyGraceRefuseReasonNone:
+  default:
+    trace->emergency_grace_refuse_queue_shape += 1;
+    break;
+  }
+  const NSUInteger refuseIndex = InumaReserveTraceSample(
+      &trace->emergency_grace_refuse_event_count,
+      &trace->sample_capacity_exhaustions);
+  if (refuseIndex == NSNotFound) {
+    return;
+  }
+  trace->emergency_grace_refuse_event_offset_samples[refuseIndex] =
+      traceStartedAt > 0 && eventAt >= traceStartedAt
+          ? eventAt - traceStartedAt
+          : 0;
+  trace->emergency_grace_refuse_frame_timestamp_ns_samples[refuseIndex] =
+      frameTimestampNs;
+  trace->emergency_grace_refuse_reason_samples[refuseIndex] = reason;
 }
 
 static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
@@ -333,6 +425,36 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
       raster_repeat_platform_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(copied_buffer_second_next_copy_hold_samples,
                          copied_buffer_second_next_copy_hold_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_event_offset_samples,
+                         emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_frame_timestamp_ns_samples,
+                         emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      emergency_grace_admit_current_frame_timestamp_ns_samples,
+      emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      emergency_grace_admit_primary_frame_timestamp_ns_samples,
+      emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_primary_age_samples,
+                         emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_retry_fired_samples,
+                         emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_shift_event_offset_samples,
+                         emergency_grace_shift_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_shift_frame_timestamp_ns_samples,
+                         emergency_grace_shift_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_drain_event_offset_samples,
+                         emergency_grace_drain_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_drain_frame_timestamp_ns_samples,
+                         emergency_grace_drain_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_residence_samples,
+                         emergency_grace_drain_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_event_offset_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_frame_timestamp_ns_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_reason_samples,
+                         emergency_grace_refuse_event_count);
 
 #undef INUMA_COPY_TRACE_ARRAY
 }
@@ -405,6 +527,15 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
     NSDictionary<NSString *, NSString *> *env) {
   NSString *value =
       [env[@"INUMA_FLUTTER_WEBRTC_MACOS_RASTER_REPEAT_GUARD"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  return [value isEqualToString:@"enabled"];
+}
+
+static bool InumaEmergencyGraceEnabledFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_EMERGENCY_GRACE_SLOT"]
           stringByTrimmingCharactersInSet:
               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
   return [value isEqualToString:@"enabled"];
@@ -576,11 +707,15 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaMinimumTextureHoldNs;
   bool _inumaRasterRepeatGuardEnabled;
   bool _inumaCurrentFrameWasRescuePromoted;
+  bool _inumaEmergencyGraceEnabled;
+  bool _inumaCurrentFrameRepeatDeferred;
+  bool _inumaCurrentRepeatRetryFired;
   NSUInteger _inumaMaxQueuedTextureFrames;
   NSUInteger _inumaPendingTextureFrameHead;
   NSUInteger _inumaPendingTextureFrameCount;
   InumaPendingTextureFrame
       _inumaPendingTextureFrames[kInumaPendingTextureFrameCapacity];
+  InumaPendingTextureFrame _inumaEmergencyGraceTextureFrame;
   int64_t _inumaFrameTimestampNs;
   CVPixelBufferRef
       _inumaCopiedBufferHoldRefs[kInumaCopiedBufferHoldCapacity];
@@ -638,6 +773,8 @@ static void InumaRecordRenderQoSObservationLocked(
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
     _inumaRasterRepeatGuardEnabled =
         InumaRasterRepeatGuardEnabledFromEnvironment(environment);
+    _inumaEmergencyGraceEnabled =
+        InumaEmergencyGraceEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
         InumaMaxQueuedTextureFramesFromEnvironment(environment);
     _inumaPendingTextureFrameHead = 0;
@@ -648,6 +785,9 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopyMonotonicNs = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameRepeatDeferred = false;
+    _inumaCurrentRepeatRetryFired = false;
+    _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
     _inumaFrameTimestampNs = 0;
     _inumaCopiedBufferHoldHead = 0;
     _inumaCopiedBufferHoldCount = 0;
@@ -734,6 +874,8 @@ static void InumaRecordRenderQoSObservationLocked(
       if (predecessor != nil) {
         buffer = CVBufferRetain(predecessor);
         _inumaCurrentFrameWasRescuePromoted = false;
+        _inumaCurrentFrameRepeatDeferred = true;
+        _inumaCurrentRepeatRetryFired = false;
         retryRasterRepeatedFrame = _textureId != -1;
         repeatedFrameTextureId = _textureId;
         repeatedDeferredFrameTimestampNs = _inumaFrameTimestampNs;
@@ -781,6 +923,8 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopyMonotonicNs = copiedAt;
     _inumaLastCopiedFrameTimestampNs = _inumaFrameTimestampNs;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameRepeatDeferred = false;
+    _inumaCurrentRepeatRetryFired = false;
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
       if (_inumaFrameReadyMonotonicNs > 0 &&
@@ -814,6 +958,32 @@ static void InumaRecordRenderQoSObservationLocked(
           kInumaPendingTextureFrameCapacity;
       _inumaPendingTextureFrameCount -= 1;
 
+      if (_inumaEmergencyGraceTextureFrame.pixel_buffer != nil) {
+        const InumaPendingTextureFrame shifted =
+            _inumaEmergencyGraceTextureFrame;
+        _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
+        const NSUInteger queueIndex =
+            (_inumaPendingTextureFrameHead +
+             _inumaPendingTextureFrameCount) %
+            kInumaPendingTextureFrameCapacity;
+        _inumaPendingTextureFrames[queueIndex] = shifted;
+        _inumaPendingTextureFrameCount += 1;
+        if (_inumaTrace.enabled) {
+          _inumaTrace.emergency_grace_shifts += 1;
+          const NSUInteger shiftIndex = InumaReserveTraceSample(
+              &_inumaTrace.emergency_grace_shift_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (shiftIndex != NSNotFound) {
+            _inumaTrace
+                .emergency_grace_shift_event_offset_samples[shiftIndex] =
+                copiedAt - _inumaTraceStartedMonotonicNs;
+            _inumaTrace
+                .emergency_grace_shift_frame_timestamp_ns_samples
+                    [shiftIndex] = shifted.frame_timestamp_ns;
+          }
+        }
+      }
+
       CVPixelBufferRef previousBuffer = _pixelBufferRef;
       _pixelBufferRef = promoted.pixel_buffer;
       _frameAvailable = true;
@@ -829,6 +999,27 @@ static void InumaRecordRenderQoSObservationLocked(
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
+        if (promoted.from_emergency_grace) {
+          _inumaTrace.emergency_grace_drains += 1;
+          const NSUInteger drainIndex = InumaReserveTraceSample(
+              &_inumaTrace.emergency_grace_drain_event_count,
+              &_inumaTrace.sample_capacity_exhaustions);
+          if (drainIndex != NSNotFound) {
+            _inumaTrace
+                .emergency_grace_drain_event_offset_samples[drainIndex] =
+                copiedAt - _inumaTraceStartedMonotonicNs;
+            _inumaTrace
+                .emergency_grace_drain_frame_timestamp_ns_samples
+                    [drainIndex] = promoted.frame_timestamp_ns;
+            _inumaTrace.emergency_grace_residence_samples[drainIndex] =
+                promoted.emergency_grace_admitted_monotonic_ns > 0 &&
+                        copiedAt >=
+                            promoted.emergency_grace_admitted_monotonic_ns
+                    ? copiedAt -
+                          promoted.emergency_grace_admitted_monotonic_ns
+                    : 0;
+          }
+        }
         if (_inumaRescueNotificationPhase ==
             InumaRescueNotificationPhaseDisplayLink) {
           _inumaTrace.rescue_hold_preservations += 1;
@@ -936,6 +1127,8 @@ static void InumaRecordRenderQoSObservationLocked(
   _inumaLastCopiedFrameTimestampNs = 0;
   _inumaFrameTimestampNs = 0;
   _inumaCurrentFrameWasRescuePromoted = false;
+  _inumaCurrentFrameRepeatDeferred = false;
+  _inumaCurrentRepeatRetryFired = false;
   if (_inumaStockBGRAPixelBufferPool) {
     CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
     _inumaStockBGRAPixelBufferPool = nil;
@@ -964,6 +1157,8 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameRepeatDeferred = false;
+    _inumaCurrentRepeatRetryFired = false;
 #endif
     _frameAvailable = false;
     os_unfair_lock_unlock(&_lock);
@@ -1130,8 +1325,53 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaMaxQueuedTextureFrames > 0 &&
       _inumaLastCopyMonotonicNs > 0 &&
       _inumaPendingTextureFrameCount < _inumaMaxQueuedTextureFrames;
+  const bool primaryQueueFull =
+      _frameAvailable && _inumaMaxQueuedTextureFrames > 0 &&
+      _inumaPendingTextureFrameCount >= _inumaMaxQueuedTextureFrames;
+  const uint64_t emergencyGraceCheckedAt =
+      _inumaEmergencyGraceEnabled ? InumaMonotonicNanoseconds() : 0;
+  const bool emergencyGraceQueueShape =
+      primaryQueueFull && _inumaMaxQueuedTextureFrames == 1 &&
+      _inumaPendingTextureFrameCount == 1;
+  const InumaPendingTextureFrame emergencyGracePrimary =
+      emergencyGraceQueueShape
+          ? _inumaPendingTextureFrames[_inumaPendingTextureFrameHead]
+          : (InumaPendingTextureFrame){0};
+  const bool emergencyGracePrimaryOldEnough =
+      emergencyGracePrimary.ready_monotonic_ns > 0 &&
+      _inumaMinimumTextureHoldNs > 0 &&
+      emergencyGraceCheckedAt >= emergencyGracePrimary.ready_monotonic_ns &&
+      emergencyGraceCheckedAt - emergencyGracePrimary.ready_monotonic_ns >=
+          _inumaMinimumTextureHoldNs;
+  const bool emergencyGraceStateEligible =
+      _inumaEmergencyGraceEnabled && emergencyGraceQueueShape &&
+      _inumaCurrentFrameRepeatDeferred && emergencyGracePrimaryOldEnough &&
+      _inumaEmergencyGraceTextureFrame.pixel_buffer == nil;
+  InumaEmergencyGraceRefuseReason emergencyGraceRefuseReason =
+      InumaEmergencyGraceRefuseReasonNone;
+  if (_inumaEmergencyGraceEnabled && primaryQueueFull &&
+      !emergencyGraceStateEligible) {
+    if (_inumaEmergencyGraceTextureFrame.pixel_buffer != nil) {
+      emergencyGraceRefuseReason =
+          InumaEmergencyGraceRefuseReasonOccupied;
+    } else if (!emergencyGraceQueueShape) {
+      emergencyGraceRefuseReason =
+          InumaEmergencyGraceRefuseReasonQueueShape;
+    } else if (!_inumaCurrentFrameRepeatDeferred) {
+      emergencyGraceRefuseReason =
+          InumaEmergencyGraceRefuseReasonNotRepeatDeferred;
+    } else {
+      emergencyGraceRefuseReason =
+          InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge;
+    }
+  }
+  if (_inumaTrace.enabled && emergencyGraceStateEligible) {
+    _inumaTrace.emergency_grace_eligible_frames += 1;
+    _inumaTrace.emergency_grace_would_have_overflows += 1;
+  }
   const bool canAcceptFrame =
-      canPrepareFrame && (!_frameAvailable || queueHasCapacity);
+      canPrepareFrame &&
+      (!_frameAvailable || queueHasCapacity || emergencyGraceStateEligible);
 #else
   const bool canAcceptFrame = !_frameAvailable && _pixelBufferRef != nil;
 #endif
@@ -1149,6 +1389,8 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaFrameReadyMonotonicNs = frameReadyNs;
       _inumaFrameTimestampNs = frame.timeStampNs;
       _inumaCurrentFrameWasRescuePromoted = false;
+      _inumaCurrentFrameRepeatDeferred = false;
+      _inumaCurrentRepeatRetryFired = false;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -1157,7 +1399,7 @@ static void InumaRecordRenderQoSObservationLocked(
         inumaTextureIdToNotify = _textureId;
         inumaFrameTimestampToNotify = frame.timeStampNs;
       }
-    } else if (framePrepared) {
+    } else if (framePrepared && queueHasCapacity) {
       const NSUInteger queueIndex =
           (_inumaPendingTextureFrameHead +
            _inumaPendingTextureFrameCount) %
@@ -1167,6 +1409,8 @@ static void InumaRecordRenderQoSObservationLocked(
               .pixel_buffer = preparedBuffer,
               .frame_timestamp_ns = frame.timeStampNs,
               .ready_monotonic_ns = frameReadyNs,
+              .emergency_grace_admitted_monotonic_ns = 0,
+              .from_emergency_grace = false,
           };
       _inumaPendingTextureFrameCount += 1;
       if (_inumaTrace.enabled) {
@@ -1187,11 +1431,60 @@ static void InumaRecordRenderQoSObservationLocked(
           }
         }
       }
+    } else if (framePrepared && emergencyGraceStateEligible) {
+      _inumaEmergencyGraceTextureFrame =
+          (InumaPendingTextureFrame){
+              .pixel_buffer = preparedBuffer,
+              .frame_timestamp_ns = frame.timeStampNs,
+              .ready_monotonic_ns = frameReadyNs,
+              .emergency_grace_admitted_monotonic_ns = frameReadyNs,
+              .from_emergency_grace = true,
+          };
+      if (_inumaTrace.enabled) {
+        _inumaTrace.emergency_grace_admits += 1;
+        _inumaTrace.emergency_grace_max_occupancy =
+            MAX(_inumaTrace.emergency_grace_max_occupancy, 1);
+        const NSUInteger admitIndex = InumaReserveTraceSample(
+            &_inumaTrace.emergency_grace_admit_event_count,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (admitIndex != NSNotFound) {
+          _inumaTrace
+              .emergency_grace_admit_event_offset_samples[admitIndex] =
+              frameReadyNs - _inumaTraceStartedMonotonicNs;
+          _inumaTrace
+              .emergency_grace_admit_frame_timestamp_ns_samples
+                  [admitIndex] = frame.timeStampNs;
+          _inumaTrace
+              .emergency_grace_admit_current_frame_timestamp_ns_samples
+                  [admitIndex] = _inumaFrameTimestampNs;
+          _inumaTrace
+              .emergency_grace_admit_primary_frame_timestamp_ns_samples
+                  [admitIndex] = emergencyGracePrimary.frame_timestamp_ns;
+          _inumaTrace.emergency_grace_admit_primary_age_samples[admitIndex] =
+              emergencyGraceCheckedAt -
+              emergencyGracePrimary.ready_monotonic_ns;
+          _inumaTrace
+              .emergency_grace_admit_retry_fired_samples[admitIndex] =
+              _inumaCurrentRepeatRetryFired ? 1 : 0;
+        }
+      }
     }
     if (_inumaTrace.enabled && framePrepared) {
       _inumaTrace.accepted_frames += 1;
       if (inumaRenderEventIndex != NSNotFound) {
-        _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 1;
+        _inumaTrace.render_outcome_samples[inumaRenderEventIndex] =
+            emergencyGraceStateEligible ? 3 : 1;
+      }
+    } else if (_inumaTrace.enabled && emergencyGraceStateEligible &&
+               !framePrepared) {
+      _inumaTrace.coalesced_frames += 1;
+      _inumaTrace.queue_overflows += 1;
+      InumaRecordEmergencyGraceRefusalLocked(
+          &_inumaTrace, emergencyGraceCheckedAt,
+          _inumaTraceStartedMonotonicNs, frame.timeStampNs,
+          InumaEmergencyGraceRefuseReasonConversionFailure);
+      if (inumaRenderEventIndex != NSNotFound) {
+        _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 2;
       }
     }
 #else
@@ -1208,6 +1501,16 @@ static void InumaRecordRenderQoSObservationLocked(
         _inumaPendingTextureFrameCount >=
             _inumaMaxQueuedTextureFrames) {
       _inumaTrace.queue_overflows += 1;
+      if (_inumaEmergencyGraceEnabled) {
+        InumaRecordEmergencyGraceRefusalLocked(
+            &_inumaTrace,
+            emergencyGraceCheckedAt > 0 ? emergencyGraceCheckedAt : locked,
+            _inumaTraceStartedMonotonicNs, frame.timeStampNs,
+            emergencyGraceRefuseReason ==
+                    InumaEmergencyGraceRefuseReasonNone
+                ? InumaEmergencyGraceRefuseReasonQueueShape
+                : emergencyGraceRefuseReason);
+      }
     }
     if (inumaRenderEventIndex != NSNotFound) {
       _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 2;
@@ -1451,6 +1754,10 @@ static void InumaRecordRenderQoSObservationLocked(
     id<FlutterTextureRegistry> registry = strongSelf->_registry;
     if (traceEnabled && !notificationIsCurrent) {
       strongSelf->_inumaTrace.stale_texture_notifications += 1;
+    }
+    if (recordRasterRepeatRetry && notificationIsCurrent &&
+        registry != nil && strongSelf->_inumaCurrentFrameRepeatDeferred) {
+      strongSelf->_inumaCurrentRepeatRetryFired = true;
     }
     if (traceEnabled && recordRasterRepeatRetry) {
       if (notificationIsCurrent && registry != nil) {
@@ -1922,9 +2229,19 @@ static void InumaRecordRenderQoSObservationLocked(
     }
     if (_inumaTrace.enabled) {
       _inumaTrace.queue_cleared_frames += 1;
+      if (pending.from_emergency_grace) {
+        _inumaTrace.emergency_grace_clears += 1;
+      }
     }
   }
   _inumaPendingTextureFrameHead = 0;
+  if (_inumaEmergencyGraceTextureFrame.pixel_buffer != nil) {
+    CVBufferRelease(_inumaEmergencyGraceTextureFrame.pixel_buffer);
+    _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
+    if (_inumaTrace.enabled) {
+      _inumaTrace.emergency_grace_clears += 1;
+    }
+  }
 }
 
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size {
@@ -1966,6 +2283,15 @@ static void InumaRecordRenderQoSObservationLocked(
   NSUInteger copiedBufferHoldCount = 0;
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
+  bool currentFrameRepeatDeferred = false;
+  bool currentRepeatRetryFired = false;
+  bool emergencyGraceOccupied = false;
+  bool primaryFromEmergencyGrace = false;
+  int64_t currentFrameTimestampNs = 0;
+  int64_t primaryFrameTimestampNs = 0;
+  int64_t emergencyGraceFrameTimestampNs = 0;
+  uint64_t primaryFrameAgeNs = 0;
+  uint64_t emergencyGraceResidenceNs = 0;
   os_unfair_lock_lock(&_lock);
   const uint64_t traceSnapshotMonotonicNs = InumaMonotonicNanoseconds();
   InumaCopyTextureTraceLocked(snapshot, &_inumaTrace);
@@ -1973,6 +2299,36 @@ static void InumaRecordRenderQoSObservationLocked(
   copiedBufferHoldCount = _inumaCopiedBufferHoldCount;
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
+  currentFrameRepeatDeferred = _inumaCurrentFrameRepeatDeferred;
+  currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
+  currentFrameTimestampNs = _inumaFrameTimestampNs;
+  if (_inumaPendingTextureFrameCount > 0) {
+    const InumaPendingTextureFrame primary =
+        _inumaPendingTextureFrames[_inumaPendingTextureFrameHead];
+    primaryFrameTimestampNs = primary.frame_timestamp_ns;
+    primaryFromEmergencyGrace = primary.from_emergency_grace;
+    if (primary.ready_monotonic_ns > 0 &&
+        traceSnapshotMonotonicNs >= primary.ready_monotonic_ns) {
+      primaryFrameAgeNs =
+          traceSnapshotMonotonicNs - primary.ready_monotonic_ns;
+    }
+  }
+  emergencyGraceOccupied =
+      _inumaEmergencyGraceTextureFrame.pixel_buffer != nil;
+  if (emergencyGraceOccupied) {
+    emergencyGraceFrameTimestampNs =
+        _inumaEmergencyGraceTextureFrame.frame_timestamp_ns;
+    if (_inumaEmergencyGraceTextureFrame
+                .emergency_grace_admitted_monotonic_ns > 0 &&
+        traceSnapshotMonotonicNs >=
+            _inumaEmergencyGraceTextureFrame
+                .emergency_grace_admitted_monotonic_ns) {
+      emergencyGraceResidenceNs =
+          traceSnapshotMonotonicNs -
+          _inumaEmergencyGraceTextureFrame
+              .emergency_grace_admitted_monotonic_ns;
+    }
+  }
   os_unfair_lock_unlock(&_lock);
   const uint64_t traceSnapshotLockHoldNs =
       InumaMonotonicNanoseconds() - traceSnapshotMonotonicNs;
@@ -1990,7 +2346,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @28,
+    @"tail_diagnostics_version" : @30,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -2039,6 +2395,50 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->raster_repeat_platform_retry_fires),
     @"raster_repeat_platform_retry_stale_fires" :
         @(snapshot->raster_repeat_platform_retry_stale_fires),
+    @"emergency_grace_enabled" : @(_inumaEmergencyGraceEnabled),
+    @"emergency_grace_default" : @"disabled",
+    @"emergency_grace_contract" :
+        @"one_native_frame_only_when_current_repeat_deferred_primary_full_"
+         @"primary_age_at_least_minimum_hold_and_grace_empty_then_fifo_shift",
+    @"emergency_grace_sustained_backlog_contract" :
+        @"second_arrival_while_grace_occupied_is_refused",
+    @"emergency_grace_eligible_frames" :
+        @(snapshot->emergency_grace_eligible_frames),
+    @"emergency_grace_admits" : @(snapshot->emergency_grace_admits),
+    @"emergency_grace_shifts" : @(snapshot->emergency_grace_shifts),
+    @"emergency_grace_drains" : @(snapshot->emergency_grace_drains),
+    @"emergency_grace_refuses" : @(snapshot->emergency_grace_refuses),
+    @"emergency_grace_clears" : @(snapshot->emergency_grace_clears),
+    @"emergency_grace_would_have_overflows" :
+        @(snapshot->emergency_grace_would_have_overflows),
+    @"emergency_grace_max_occupancy" :
+        @(snapshot->emergency_grace_max_occupancy),
+    @"emergency_grace_refuse_not_repeat_deferred" :
+        @(snapshot->emergency_grace_refuse_not_repeat_deferred),
+    @"emergency_grace_refuse_primary_below_minimum_age" :
+        @(snapshot->emergency_grace_refuse_primary_below_minimum_age),
+    @"emergency_grace_refuse_occupied" :
+        @(snapshot->emergency_grace_refuse_occupied),
+    @"emergency_grace_refuse_queue_shape" :
+        @(snapshot->emergency_grace_refuse_queue_shape),
+    @"emergency_grace_refuse_conversion_failure" :
+        @(snapshot->emergency_grace_refuse_conversion_failure),
+    @"emergency_grace_occupied_at_snapshot" : @(emergencyGraceOccupied),
+    @"current_frame_repeat_deferred_at_snapshot" :
+        @(currentFrameRepeatDeferred),
+    @"current_repeat_retry_fired_at_snapshot" :
+        @(currentRepeatRetryFired),
+    @"current_frame_timestamp_ns_at_snapshot" :
+        @(currentFrameTimestampNs),
+    @"primary_frame_timestamp_ns_at_snapshot" :
+        @(primaryFrameTimestampNs),
+    @"primary_from_emergency_grace_at_snapshot" :
+        @(primaryFromEmergencyGrace),
+    @"primary_frame_age_ns_at_snapshot" : @(primaryFrameAgeNs),
+    @"emergency_grace_frame_timestamp_ns_at_snapshot" :
+        @(emergencyGraceFrameTimestampNs),
+    @"emergency_grace_residence_ns_at_snapshot" :
+        @(emergencyGraceResidenceNs),
     @"texture_hold_applied" : @(snapshot->texture_hold_applied),
     @"stale_texture_notifications" :
         @(snapshot->stale_texture_notifications),
@@ -2217,6 +2617,7 @@ static void InumaRecordRenderQoSObservationLocked(
       @"0" : @"ignored",
       @"1" : @"accepted",
       @"2" : @"coalesced",
+      @"3" : @"accepted_emergency_grace",
     },
     @"coalesced_pending_age_ns" : InumaTraceSampleArray(
         snapshot->coalesced_pending_age_samples,
@@ -2255,6 +2656,64 @@ static void InumaRecordRenderQoSObservationLocked(
     @"copied_buffer_second_next_copy_hold_ns" : InumaTraceSampleArray(
         snapshot->copied_buffer_second_next_copy_hold_samples,
         snapshot->copied_buffer_second_next_copy_hold_count),
+    @"emergency_grace_admit_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_admit_event_offset_samples,
+        snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->emergency_grace_admit_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_current_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->emergency_grace_admit_current_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_primary_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->emergency_grace_admit_primary_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_primary_age_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_admit_primary_age_samples,
+        snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_retry_fired" : InumaTraceByteSampleArray(
+        snapshot->emergency_grace_admit_retry_fired_samples,
+        snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_shift_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_shift_event_offset_samples,
+        snapshot->emergency_grace_shift_event_count),
+    @"emergency_grace_shift_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->emergency_grace_shift_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_shift_event_count),
+    @"emergency_grace_drain_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_drain_event_offset_samples,
+        snapshot->emergency_grace_drain_event_count),
+    @"emergency_grace_drain_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->emergency_grace_drain_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_drain_event_count),
+    @"emergency_grace_residence_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_residence_samples,
+        snapshot->emergency_grace_drain_event_count),
+    @"emergency_grace_refuse_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_refuse_event_offset_samples,
+        snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->emergency_grace_refuse_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_reason" : InumaTraceByteSampleArray(
+        snapshot->emergency_grace_refuse_reason_samples,
+        snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_reason_codes" : @{
+      @"0" : @"none",
+      @"1" : @"queue_shape",
+      @"2" : @"not_repeat_deferred",
+      @"3" : @"primary_below_minimum_age",
+      @"4" : @"occupied",
+      @"5" : @"conversion_failure",
+    },
   };
   NSError *error = nil;
   NSData *data = [NSJSONSerialization dataWithJSONObject:report
@@ -2295,6 +2754,8 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameRepeatDeferred = false;
+    _inumaCurrentRepeatRetryFired = false;
 #else
     NSDictionary *pixelAttributes =
         @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
