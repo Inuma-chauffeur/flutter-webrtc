@@ -13,6 +13,10 @@ A new flutter plugin project.
   s.author           = { 'CloudWebRTC' => 'duanweiwei1982@gmail.com' }
   s.source           = { :path => '.' }
   s.source_files     = ['Classes/**/*']
+  # This inline policy is consumed only by the renderer implementation. Keep
+  # its source-tree forwarding header out of the generated public umbrella;
+  # the relative common/ path does not exist after framework installation.
+  s.private_header_files = 'Classes/InumaEmergencyGracePolicy.h'
 
   s.dependency 'FlutterMacOS'
   s.weak_frameworks = 'ScreenCaptureKit'
