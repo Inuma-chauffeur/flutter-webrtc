@@ -32,3 +32,25 @@
   Jetson runtime gate.
 - Platform claim: this experiment provides no Android, iOS, Linux, Windows,
   physical-panel, or human-undetectable-stutter evidence.
+
+## macOS repeat-only 20 ms boundary v31
+
+- Parent: exact v30 commit
+  `37478496db3c4802df7a7d24acc4c28cc7201651`.
+- Default behavior is unchanged. The new repeat boundary is disabled unless
+  `INUMA_FLUTTER_WEBRTC_MACOS_RASTER_REPEAT_BOUNDARY_MS` is positive.
+- The accepted normal `19 ms` texture hold, one-slot native queue, immediate
+  serialized platform-turn retry, two copied IOSurface generations, renderer
+  QoS and bounded emergency grace remain unchanged.
+- When enabled at `20 ms`, only a rescue-promoted successor whose copied
+  predecessor tenure is below that boundary repeats the predecessor once.
+  The existing retry then asks Flutter raster for the still-current successor.
+  No timer, display link, ordinary notification delay, queue depth or backing-
+  lifetime generation is added.
+- Schema v31 retains the configured boundary, every evaluation's exact
+  predecessor/successor frame timestamps, tenure and outcome, plus balanced
+  repeat/retry, queue, grace, lifetime and lifecycle evidence. The pure C
+  policy boundary is compiled and executed from the exact resolved package
+  before a signed Mac build.
+- This is a bounded Stage19 experiment, not accepted product behavior until
+  the exact 1m/3m/15m/30m ladder and regression/fault gates pass.

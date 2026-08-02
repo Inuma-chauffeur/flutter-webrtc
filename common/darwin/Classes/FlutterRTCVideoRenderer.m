@@ -20,6 +20,7 @@
 
 #if TARGET_OS_OSX
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
 #include <pthread/qos.h>
@@ -127,6 +128,10 @@ typedef struct {
   uint64_t raster_repeat_platform_retry_schedules;
   uint64_t raster_repeat_platform_retry_fires;
   uint64_t raster_repeat_platform_retry_stale_fires;
+  uint64_t raster_repeat_boundary_evaluations;
+  uint64_t raster_repeat_boundary_applies;
+  uint64_t raster_repeat_boundary_extended_applies;
+  uint64_t raster_repeat_boundary_bypasses;
   uint64_t emergency_grace_eligible_frames;
   uint64_t emergency_grace_admits;
   uint64_t emergency_grace_shifts;
@@ -189,6 +194,15 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_predecessor_tenure_samples
       [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_boundary_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t raster_repeat_boundary_predecessor_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  int64_t raster_repeat_boundary_successor_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_boundary_predecessor_tenure_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t raster_repeat_boundary_outcome_samples[kInumaTextureTraceCapacity];
   uint64_t raster_repeat_platform_retry_schedule_offset_samples
       [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_platform_retry_fire_offset_samples
@@ -242,6 +256,7 @@ typedef struct {
   NSUInteger coalesced_pending_age_count;
   NSUInteger copy_event_count;
   NSUInteger raster_repeat_event_count;
+  NSUInteger raster_repeat_boundary_event_count;
   NSUInteger raster_repeat_platform_retry_event_count;
   NSUInteger copied_buffer_second_next_copy_hold_count;
   NSUInteger emergency_grace_admit_event_count;
@@ -407,6 +422,18 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          raster_repeat_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_predecessor_tenure_samples,
                          raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_boundary_event_offset_samples,
+                         raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_boundary_predecessor_frame_timestamp_ns_samples,
+      raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_boundary_successor_frame_timestamp_ns_samples,
+      raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_boundary_predecessor_tenure_samples,
+                         raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_boundary_outcome_samples,
+                         raster_repeat_boundary_event_count);
   INUMA_COPY_TRACE_ARRAY(
       raster_repeat_platform_retry_schedule_offset_samples,
       raster_repeat_platform_retry_event_count);
@@ -522,6 +549,19 @@ static bool InumaRasterRepeatGuardEnabledFromEnvironment(
           stringByTrimmingCharactersInSet:
               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
   return [value isEqualToString:@"enabled"];
+}
+
+static uint64_t InumaRasterRepeatBoundaryNanosecondsFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_RASTER_REPEAT_BOUNDARY_MS"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  const double milliseconds = value.doubleValue;
+  if (milliseconds <= 0.0 || milliseconds > 100.0) {
+    return 0;
+  }
+  return (uint64_t)(milliseconds * (double)NSEC_PER_MSEC);
 }
 
 static bool InumaEmergencyGraceEnabledFromEnvironment(
@@ -698,6 +738,7 @@ static void InumaRecordRenderQoSObservationLocked(
   int64_t _inumaLastCopiedFrameTimestampNs;
   uint64_t _inumaMinimumTextureHoldNs;
   bool _inumaRasterRepeatGuardEnabled;
+  uint64_t _inumaRasterRepeatBoundaryNs;
   bool _inumaCurrentFrameWasRescuePromoted;
   bool _inumaEmergencyGraceEnabled;
   bool _inumaCurrentFrameRepeatDeferred;
@@ -765,6 +806,8 @@ static void InumaRecordRenderQoSObservationLocked(
         InumaTextureMinimumHoldNanosecondsFromEnvironment(environment);
     _inumaRasterRepeatGuardEnabled =
         InumaRasterRepeatGuardEnabledFromEnvironment(environment);
+    _inumaRasterRepeatBoundaryNs =
+        InumaRasterRepeatBoundaryNanosecondsFromEnvironment(environment);
     _inumaEmergencyGraceEnabled =
         InumaEmergencyGraceEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
@@ -845,13 +888,57 @@ static void InumaRecordRenderQoSObservationLocked(
   // Animation has had one full minimum-tenure opportunity for the predecessor.
   // Return the retained predecessor once and leave the promoted frame pending;
   // the serialized platform-turn owner schedules its one permitted retry.
-  const bool repeatGuardEligible =
+  const bool baseRepeatCandidate =
       _inumaRasterRepeatGuardEnabled && _frameAvailable &&
       _inumaCurrentFrameWasRescuePromoted &&
       _inumaMinimumTextureHoldNs > 0 && _inumaLastCopyMonotonicNs > 0 &&
-      repeatCheckedAt >= _inumaLastCopyMonotonicNs &&
-      repeatCheckedAt - _inumaLastCopyMonotonicNs <
-          _inumaMinimumTextureHoldNs;
+      repeatCheckedAt >= _inumaLastCopyMonotonicNs;
+  const uint64_t predecessorTenureNs =
+      baseRepeatCandidate ? repeatCheckedAt - _inumaLastCopyMonotonicNs : 0;
+  const InumaRepeatBoundaryPolicyDecision repeatBoundaryDecision =
+      InumaRepeatBoundaryEvaluate((InumaRepeatBoundaryPolicyInput){
+          .enabled = _inumaRasterRepeatBoundaryNs > 0,
+          .base_repeat_candidate = baseRepeatCandidate,
+          .predecessor_tenure_ns = predecessorTenureNs,
+          .normal_minimum_hold_ns = _inumaMinimumTextureHoldNs,
+          .repeat_boundary_ns = _inumaRasterRepeatBoundaryNs,
+      });
+  const bool repeatGuardEligible =
+      repeatBoundaryDecision.evaluated
+          ? repeatBoundaryDecision.repeat
+          : baseRepeatCandidate &&
+                predecessorTenureNs < _inumaMinimumTextureHoldNs;
+  if (_inumaTrace.enabled && repeatBoundaryDecision.evaluated) {
+    _inumaTrace.raster_repeat_boundary_evaluations += 1;
+    if (repeatBoundaryDecision.repeat) {
+      _inumaTrace.raster_repeat_boundary_applies += 1;
+      if (repeatBoundaryDecision.extends_normal_hold) {
+        _inumaTrace.raster_repeat_boundary_extended_applies += 1;
+      }
+    } else {
+      _inumaTrace.raster_repeat_boundary_bypasses += 1;
+    }
+    const NSUInteger boundaryIndex = InumaReserveTraceSample(
+        &_inumaTrace.raster_repeat_boundary_event_count,
+        &_inumaTrace.sample_capacity_exhaustions);
+    if (boundaryIndex != NSNotFound) {
+      _inumaTrace.raster_repeat_boundary_event_offset_samples[boundaryIndex] =
+          repeatCheckedAt - _inumaTraceStartedMonotonicNs;
+      _inumaTrace
+          .raster_repeat_boundary_predecessor_frame_timestamp_ns_samples
+              [boundaryIndex] = _inumaLastCopiedFrameTimestampNs;
+      _inumaTrace
+          .raster_repeat_boundary_successor_frame_timestamp_ns_samples
+              [boundaryIndex] = _inumaFrameTimestampNs;
+      _inumaTrace
+          .raster_repeat_boundary_predecessor_tenure_samples[boundaryIndex] =
+          predecessorTenureNs;
+      _inumaTrace.raster_repeat_boundary_outcome_samples[boundaryIndex] =
+          repeatBoundaryDecision.extends_normal_hold
+              ? 2
+              : (repeatBoundaryDecision.repeat ? 1 : 0);
+    }
+  }
   if (repeatGuardEligible) {
     if (_inumaTrace.enabled) {
       _inumaTrace.raster_repeat_guard_eligible_copy_calls += 1;
@@ -2330,7 +2417,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @30,
+    @"tail_diagnostics_version" : @31,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -2361,6 +2448,20 @@ static void InumaRecordRenderQoSObservationLocked(
     @"raster_repeat_guard_enabled" : @(_inumaRasterRepeatGuardEnabled),
     @"raster_repeat_guard_contract" :
         @"repeat_recent_rescue_predecessor_once_then_platform_turn_retry",
+    @"raster_repeat_boundary_enabled" :
+        @(_inumaRasterRepeatBoundaryNs > 0),
+    @"raster_repeat_boundary_default" : @"disabled",
+    @"raster_repeat_boundary_ns" : @(_inumaRasterRepeatBoundaryNs),
+    @"raster_repeat_boundary_contract" :
+        @"opt_in_repeat_only_predecessor_boundary_no_normal_hold_or_retry_delay_change",
+    @"raster_repeat_boundary_evaluations" :
+        @(snapshot->raster_repeat_boundary_evaluations),
+    @"raster_repeat_boundary_applies" :
+        @(snapshot->raster_repeat_boundary_applies),
+    @"raster_repeat_boundary_extended_applies" :
+        @(snapshot->raster_repeat_boundary_extended_applies),
+    @"raster_repeat_boundary_bypasses" :
+        @(snapshot->raster_repeat_boundary_bypasses),
     @"rescue_notification_phase" :
         InumaRescueNotificationPhaseName(_inumaRescueNotificationPhase),
     @"rescue_notification_contract" :
@@ -2625,6 +2726,31 @@ static void InumaRecordRenderQoSObservationLocked(
     @"raster_repeat_predecessor_tenure_ns" : InumaTraceSampleArray(
         snapshot->raster_repeat_predecessor_tenure_samples,
         snapshot->raster_repeat_event_count),
+    @"raster_repeat_boundary_outcome_codes" : @{
+      @"0" : @"bypassed_at_or_above_boundary",
+      @"1" : @"repeated_within_normal_hold",
+      @"2" : @"repeated_by_extended_boundary",
+    },
+    @"raster_repeat_boundary_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->raster_repeat_boundary_event_offset_samples,
+        snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_predecessor_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->raster_repeat_boundary_predecessor_frame_timestamp_ns_samples,
+            snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_successor_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->raster_repeat_boundary_successor_frame_timestamp_ns_samples,
+            snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_predecessor_tenure_ns" :
+        InumaTraceSampleArray(
+            snapshot->raster_repeat_boundary_predecessor_tenure_samples,
+            snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_outcome" : InumaTraceByteSampleArray(
+        snapshot->raster_repeat_boundary_outcome_samples,
+        snapshot->raster_repeat_boundary_event_count),
     @"raster_repeat_platform_retry_schedule_offset_ns" :
         InumaTraceSampleArray(
             snapshot->raster_repeat_platform_retry_schedule_offset_samples,

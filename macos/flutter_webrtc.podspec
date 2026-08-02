@@ -16,7 +16,10 @@ A new flutter plugin project.
   # This inline policy is consumed only by the renderer implementation. Keep
   # its source-tree forwarding header out of the generated public umbrella;
   # the relative common/ path does not exist after framework installation.
-  s.private_header_files = 'Classes/InumaEmergencyGracePolicy.h'
+  s.private_header_files = [
+    'Classes/InumaEmergencyGracePolicy.h',
+    'Classes/InumaRepeatBoundaryPolicy.h',
+  ]
 
   s.dependency 'FlutterMacOS'
   s.weak_frameworks = 'ScreenCaptureKit'
