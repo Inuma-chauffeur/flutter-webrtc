@@ -19,6 +19,7 @@
 #import <os/lock.h>
 
 #if TARGET_OS_OSX
+#include "InumaEmergencyGracePolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
 #include <pthread/qos.h>
@@ -45,15 +46,6 @@ typedef NS_ENUM(NSUInteger, InumaRenderQoSPolicy) {
 typedef NS_ENUM(NSUInteger, InumaRescueNotificationPhase) {
   InumaRescueNotificationPhaseDisplayLink = 0,
   InumaRescueNotificationPhasePlatformTurn = 1,
-};
-
-typedef NS_ENUM(uint8_t, InumaEmergencyGraceRefuseReason) {
-  InumaEmergencyGraceRefuseReasonNone = 0,
-  InumaEmergencyGraceRefuseReasonQueueShape = 1,
-  InumaEmergencyGraceRefuseReasonNotRepeatDeferred = 2,
-  InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge = 3,
-  InumaEmergencyGraceRefuseReasonOccupied = 4,
-  InumaEmergencyGraceRefuseReasonConversionFailure = 5,
 };
 
 typedef struct {
@@ -958,7 +950,9 @@ static void InumaRecordRenderQoSObservationLocked(
           kInumaPendingTextureFrameCapacity;
       _inumaPendingTextureFrameCount -= 1;
 
-      if (_inumaEmergencyGraceTextureFrame.pixel_buffer != nil) {
+      if (InumaEmergencyGraceShouldShift(
+              _inumaEmergencyGraceTextureFrame.pixel_buffer != nil,
+              _inumaPendingTextureFrameCount)) {
         const InumaPendingTextureFrame shifted =
             _inumaEmergencyGraceTextureFrame;
         _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
@@ -999,7 +993,8 @@ static void InumaRecordRenderQoSObservationLocked(
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
-        if (promoted.from_emergency_grace) {
+        if (InumaEmergencyGracePromotedFrameDrains(
+                promoted.from_emergency_grace)) {
           _inumaTrace.emergency_grace_drains += 1;
           const NSUInteger drainIndex = InumaReserveTraceSample(
               &_inumaTrace.emergency_grace_drain_event_count,
@@ -1337,34 +1332,23 @@ static void InumaRecordRenderQoSObservationLocked(
       emergencyGraceQueueShape
           ? _inumaPendingTextureFrames[_inumaPendingTextureFrameHead]
           : (InumaPendingTextureFrame){0};
-  const bool emergencyGracePrimaryOldEnough =
-      emergencyGracePrimary.ready_monotonic_ns > 0 &&
-      _inumaMinimumTextureHoldNs > 0 &&
-      emergencyGraceCheckedAt >= emergencyGracePrimary.ready_monotonic_ns &&
-      emergencyGraceCheckedAt - emergencyGracePrimary.ready_monotonic_ns >=
-          _inumaMinimumTextureHoldNs;
-  const bool emergencyGraceStateEligible =
-      _inumaEmergencyGraceEnabled && emergencyGraceQueueShape &&
-      _inumaCurrentFrameRepeatDeferred && emergencyGracePrimaryOldEnough &&
-      _inumaEmergencyGraceTextureFrame.pixel_buffer == nil;
-  InumaEmergencyGraceRefuseReason emergencyGraceRefuseReason =
-      InumaEmergencyGraceRefuseReasonNone;
-  if (_inumaEmergencyGraceEnabled && primaryQueueFull &&
-      !emergencyGraceStateEligible) {
-    if (_inumaEmergencyGraceTextureFrame.pixel_buffer != nil) {
-      emergencyGraceRefuseReason =
-          InumaEmergencyGraceRefuseReasonOccupied;
-    } else if (!emergencyGraceQueueShape) {
-      emergencyGraceRefuseReason =
-          InumaEmergencyGraceRefuseReasonQueueShape;
-    } else if (!_inumaCurrentFrameRepeatDeferred) {
-      emergencyGraceRefuseReason =
-          InumaEmergencyGraceRefuseReasonNotRepeatDeferred;
-    } else {
-      emergencyGraceRefuseReason =
-          InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge;
-    }
-  }
+  const InumaEmergencyGracePolicyDecision emergencyGraceDecision =
+      InumaEmergencyGraceEvaluate((InumaEmergencyGracePolicyInput){
+          .enabled = _inumaEmergencyGraceEnabled,
+          .primary_queue_full = primaryQueueFull,
+          .maximum_queued_frames = _inumaMaxQueuedTextureFrames,
+          .pending_frame_count = _inumaPendingTextureFrameCount,
+          .current_frame_repeat_deferred = _inumaCurrentFrameRepeatDeferred,
+          .primary_ready_monotonic_ns =
+              emergencyGracePrimary.ready_monotonic_ns,
+          .checked_monotonic_ns = emergencyGraceCheckedAt,
+          .minimum_hold_ns = _inumaMinimumTextureHoldNs,
+          .grace_occupied =
+              _inumaEmergencyGraceTextureFrame.pixel_buffer != nil,
+      });
+  const bool emergencyGraceStateEligible = emergencyGraceDecision.eligible;
+  const InumaEmergencyGraceRefuseReason emergencyGraceRefuseReason =
+      emergencyGraceDecision.refuse_reason;
   if (_inumaTrace.enabled && emergencyGraceStateEligible) {
     _inumaTrace.emergency_grace_eligible_frames += 1;
     _inumaTrace.emergency_grace_would_have_overflows += 1;
