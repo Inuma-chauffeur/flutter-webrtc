@@ -2543,7 +2543,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"raster_repeat_guard_contract" :
         @"repeat_recent_rescue_predecessor_once_then_platform_turn_retry",
     @"raster_repeat_boundary_enabled" :
-        @(_inumaRasterRepeatBoundaryNs > 0),
+        @((BOOL)(_inumaRasterRepeatBoundaryNs > 0)),
     @"raster_repeat_boundary_default" : @"disabled",
     @"raster_repeat_boundary_ns" : @(_inumaRasterRepeatBoundaryNs),
     @"raster_repeat_boundary_contract" :
