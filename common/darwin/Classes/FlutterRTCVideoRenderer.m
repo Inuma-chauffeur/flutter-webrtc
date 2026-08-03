@@ -693,6 +693,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (CVPixelBufferRef)inumaCreateFreshStockBGRABuffer;
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:(int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
                                    bypassMinimumHold:(bool)bypassMinimumHold
                                   recordRescueBypass:(bool)recordRescueBypass
                             recordRasterRepeatRetry:
@@ -700,6 +702,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
                             predecessorCopyUptimeNs:
                                 (uint64_t)predecessorCopyUptimeNs;
 - (void)inumaRescueDisplayLinkDidFire:(CADisplayLink *)displayLink
@@ -735,6 +739,7 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameReadyMonotonicNs;
   uint64_t _inumaLastCopyMonotonicNs;
+  uint64_t _inumaRendererStateGeneration;
   int64_t _inumaLastCopiedFrameTimestampNs;
   uint64_t _inumaMinimumTextureHoldNs;
   bool _inumaRasterRepeatGuardEnabled;
@@ -765,6 +770,7 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaTraceSnapshotCount;
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
+  uint64_t _inumaRescueDisplayLinkRendererStateGeneration;
   uint64_t _inumaRescuePredecessorCopyUptimeNs;
   NSUInteger _inumaRescueDisplayLinkEventIndex;
 #endif
@@ -818,6 +824,7 @@ static void InumaRecordRenderQoSObservationLocked(
         _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
+    _inumaRendererStateGeneration = 1;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
@@ -831,6 +838,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaTraceSnapshotCount = 0;
     _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
+    _inumaRescueDisplayLinkRendererStateGeneration = 0;
     _inumaRescuePredecessorCopyUptimeNs = 0;
     _inumaRescueDisplayLinkEventIndex = NSNotFound;
     _inumaStockBGRAPixelBufferPool = nil;
@@ -868,10 +876,12 @@ static void InumaRecordRenderQoSObservationLocked(
   bool notifyPromotedFrame = false;
   int64_t promotedTextureId = -1;
   int64_t promotedFrameTimestampNs = 0;
+  uint64_t promotedRendererStateGeneration = 0;
   uint64_t promotedPredecessorCopyUptimeNs = 0;
   bool retryRasterRepeatedFrame = false;
   int64_t repeatedFrameTextureId = -1;
   int64_t repeatedDeferredFrameTimestampNs = 0;
+  uint64_t repeatedRendererStateGeneration = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -958,6 +968,7 @@ static void InumaRecordRenderQoSObservationLocked(
         retryRasterRepeatedFrame = _textureId != -1;
         repeatedFrameTextureId = _textureId;
         repeatedDeferredFrameTimestampNs = _inumaFrameTimestampNs;
+        repeatedRendererStateGeneration = _inumaRendererStateGeneration;
         if (_inumaTrace.enabled) {
           _inumaTrace.copy_hits += 1;
           _inumaTrace.raster_repeat_guard_repeats += 1;
@@ -1077,6 +1088,7 @@ static void InumaRecordRenderQoSObservationLocked(
       notifyPromotedFrame = _textureId != -1;
       promotedTextureId = _textureId;
       promotedFrameTimestampNs = promoted.frame_timestamp_ns;
+      promotedRendererStateGeneration = _inumaRendererStateGeneration;
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
@@ -1152,6 +1164,8 @@ static void InumaRecordRenderQoSObservationLocked(
               repeatedFrameTextureId
                                           frameTimestampNs:
                                               repeatedDeferredFrameTimestampNs
+                                   rendererStateGeneration:
+                                       repeatedRendererStateGeneration
                                          bypassMinimumHold:true
                                         recordRescueBypass:false
                                   recordRasterRepeatRetry:true];
@@ -1167,6 +1181,8 @@ static void InumaRecordRenderQoSObservationLocked(
       [self inumaScheduleTextureNotificationForTextureId:promotedTextureId
                                         frameTimestampNs:
                                             promotedFrameTimestampNs
+                                 rendererStateGeneration:
+                                     promotedRendererStateGeneration
                                        bypassMinimumHold:true
                                       recordRescueBypass:true
                                 recordRasterRepeatRetry:false];
@@ -1174,6 +1190,8 @@ static void InumaRecordRenderQoSObservationLocked(
       [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
                                         frameTimestampNs:
                                             promotedFrameTimestampNs
+                                 rendererStateGeneration:
+                                     promotedRendererStateGeneration
                                 predecessorCopyUptimeNs:
                                     promotedPredecessorCopyUptimeNs];
     }
@@ -1191,6 +1209,7 @@ static void InumaRecordRenderQoSObservationLocked(
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
+  _inumaRendererStateGeneration += 1;
   [self inumaCancelTextureHoldTimerLocked];
   [self inumaCancelRescueDisplayLinkLocked];
 #endif
@@ -1229,6 +1248,7 @@ static void InumaRecordRenderQoSObservationLocked(
     os_unfair_lock_lock(&_lock);
     _videoTrack = videoTrack;
 #if TARGET_OS_OSX
+    _inumaRendererStateGeneration += 1;
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaClearPendingTextureFramesLocked];
@@ -1368,6 +1388,7 @@ static void InumaRecordRenderQoSObservationLocked(
   bool inumaShouldNotifyTexture = false;
   int64_t inumaTextureIdToNotify = -1;
   int64_t inumaFrameTimestampToNotify = 0;
+  uint64_t inumaRendererStateGenerationToNotify = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -1469,6 +1490,8 @@ static void InumaRecordRenderQoSObservationLocked(
         inumaShouldNotifyTexture = true;
         inumaTextureIdToNotify = _textureId;
         inumaFrameTimestampToNotify = frame.timeStampNs;
+        inumaRendererStateGenerationToNotify =
+            _inumaRendererStateGeneration;
       }
     } else if (framePrepared && queueHasCapacity) {
       const NSUInteger queueIndex =
@@ -1605,6 +1628,8 @@ static void InumaRecordRenderQoSObservationLocked(
               inumaTextureIdToNotify
                                           frameTimestampNs:
                                               inumaFrameTimestampToNotify
+                                   rendererStateGeneration:
+                                       inumaRendererStateGenerationToNotify
                                          bypassMinimumHold:false
                                         recordRescueBypass:false
                                   recordRasterRepeatRetry:false];
@@ -1741,6 +1766,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
                                    bypassMinimumHold:(bool)bypassMinimumHold
                                   recordRescueBypass:(bool)recordRescueBypass
                             recordRasterRepeatRetry:
@@ -1750,10 +1777,10 @@ static void InumaRecordRenderQoSObservationLocked(
   __block NSUInteger rasterRepeatRetryEventIndex = NSNotFound;
   os_unfair_lock_lock(&_lock);
   const bool notificationCanBeScheduled =
+      _inumaRendererStateGeneration == rendererStateGeneration &&
       _textureId == textureId && _frameAvailable &&
       _inumaFrameTimestampNs == frameTimestampNs;
-  if (notificationCanBeScheduled && recordRasterRepeatRetry &&
-      _inumaTrace.enabled) {
+  if (recordRasterRepeatRetry && _inumaTrace.enabled) {
     _inumaTrace.raster_repeat_platform_retry_schedules += 1;
     rasterRepeatRetryEventIndex = InumaReserveTraceSample(
         &_inumaTrace.raster_repeat_platform_retry_event_count,
@@ -1766,6 +1793,18 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaTrace
           .raster_repeat_platform_retry_frame_timestamp_ns_samples
               [rasterRepeatRetryEventIndex] = frameTimestampNs;
+    }
+    if (!notificationCanBeScheduled) {
+      // The raster repeat already owns this retry even if lifecycle state
+      // changed between copyPixelBuffer unlocking and this first scheduler
+      // lock.  Close that schedule once here; no delayed branch will run.
+      _inumaTrace.raster_repeat_platform_retry_stale_fires += 1;
+      if (rasterRepeatRetryEventIndex != NSNotFound &&
+          rasterRepeatRetryEventIndex <
+              _inumaTrace.raster_repeat_platform_retry_event_count) {
+        _inumaTrace.raster_repeat_platform_retry_fire_offset_samples
+            [rasterRepeatRetryEventIndex] = 0;
+      }
     }
   }
   if (notificationCanBeScheduled && bypassMinimumHold && recordRescueBypass &&
@@ -1818,6 +1857,8 @@ static void InumaRecordRenderQoSObservationLocked(
     const uint64_t notifyStarted = InumaMonotonicNanoseconds();
     os_unfair_lock_lock(&strongSelf->_lock);
     const bool notificationIsCurrent =
+        strongSelf->_inumaRendererStateGeneration ==
+            rendererStateGeneration &&
         strongSelf->_textureId == textureId &&
         strongSelf->_frameAvailable &&
         strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
@@ -1902,7 +1943,13 @@ static void InumaRecordRenderQoSObservationLocked(
     }
     const uint64_t platformTurnScheduledAt = InumaMonotonicNanoseconds();
     os_unfair_lock_lock(&strongSelf->_lock);
-    if (strongSelf->_inumaTrace.enabled) {
+    const bool platformTurnCanBeScheduled =
+        strongSelf->_inumaRendererStateGeneration ==
+            rendererStateGeneration &&
+        strongSelf->_textureId == textureId &&
+        strongSelf->_frameAvailable &&
+        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+    if (platformTurnCanBeScheduled && strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.texture_notification_platform_turn_schedules +=
           1;
       if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
@@ -1913,13 +1960,28 @@ static void InumaRecordRenderQoSObservationLocked(
             platformTurnScheduledAt -
             strongSelf->_inumaTraceStartedMonotonicNs;
       }
+    } else if (!platformTurnCanBeScheduled && recordRasterRepeatRetry &&
+               strongSelf->_inumaTrace.enabled) {
+      // Repeat ownership was already recorded at method entry.  If lifecycle
+      // state changes before the platform block can be queued, close that one
+      // schedule as stale here and leave its fire-offset sample at zero.
+      strongSelf->_inumaTrace.raster_repeat_platform_retry_stale_fires += 1;
+      if (rasterRepeatRetryEventIndex != NSNotFound &&
+          rasterRepeatRetryEventIndex <
+              strongSelf->_inumaTrace
+                  .raster_repeat_platform_retry_event_count) {
+        strongSelf->_inumaTrace
+            .raster_repeat_platform_retry_fire_offset_samples
+                [rasterRepeatRetryEventIndex] = 0;
+      }
     }
     os_unfair_lock_unlock(&strongSelf->_lock);
+    if (!platformTurnCanBeScheduled) {
+      return;
+    }
+    FlutterRTCVideoRenderer *platformTurnOwner = strongSelf;
     dispatch_async(dispatch_get_main_queue(), ^{
-      FlutterRTCVideoRenderer *innerSelf = weakSelf;
-      if (innerSelf == nil) {
-        return;
-      }
+      FlutterRTCVideoRenderer *innerSelf = platformTurnOwner;
       const uint64_t platformTurnFiredAt = InumaMonotonicNanoseconds();
       os_unfair_lock_lock(&innerSelf->_lock);
       if (innerSelf->_inumaTrace.enabled) {
@@ -1934,6 +1996,9 @@ static void InumaRecordRenderQoSObservationLocked(
         }
       }
       os_unfair_lock_unlock(&innerSelf->_lock);
+      // Always enter the final guarded closure for an owned platform turn.
+      // A lifecycle generation change is recorded there as a stale retry, and
+      // the registry call remains unreachable unless the full state matches.
       notifyTextureFrameAvailable();
     });
   };
@@ -1959,6 +2024,7 @@ static void InumaRecordRenderQoSObservationLocked(
     const uint64_t deadlineNs = enqueuedAt + scheduledDelayNs;
     os_unfair_lock_lock(&_lock);
     const bool timerIsCurrent =
+        _inumaRendererStateGeneration == rendererStateGeneration &&
         _textureId == textureId && _frameAvailable &&
         _inumaFrameTimestampNs == frameTimestampNs &&
         _inumaTextureHoldTimer == nil;
@@ -2003,6 +2069,12 @@ static void InumaRecordRenderQoSObservationLocked(
       os_unfair_lock_lock(&strongSelf->_lock);
       const bool ownsTimer =
           strongSelf->_inumaTextureHoldTimer == strongTimer;
+      const bool timerStateIsCurrent =
+          ownsTimer && strongSelf->_inumaRendererStateGeneration ==
+                           rendererStateGeneration &&
+          strongSelf->_textureId == textureId &&
+          strongSelf->_frameAvailable &&
+          strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
       if (ownsTimer) {
         strongSelf->_inumaTextureHoldTimer = nil;
       }
@@ -2020,7 +2092,7 @@ static void InumaRecordRenderQoSObservationLocked(
       }
       os_unfair_lock_unlock(&strongSelf->_lock);
       dispatch_source_cancel(strongTimer);
-      if (ownsTimer) {
+      if (timerStateIsCurrent) {
         notifyOnNextPlatformTurn();
       }
     });
@@ -2034,6 +2106,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
                             predecessorCopyUptimeNs:
                                 (uint64_t)predecessorCopyUptimeNs {
   const uint64_t scheduledAt = InumaMonotonicNanoseconds();
@@ -2051,6 +2125,8 @@ static void InumaRecordRenderQoSObservationLocked(
       os_unfair_lock_lock(&strongSelf->_lock);
       const bool rescueIsCurrent =
           screen != nil && displayLink != nil &&
+          strongSelf->_inumaRendererStateGeneration ==
+              rendererStateGeneration &&
           strongSelf->_textureId == textureId &&
           strongSelf->_frameAvailable &&
           strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
@@ -2059,6 +2135,8 @@ static void InumaRecordRenderQoSObservationLocked(
         strongSelf->_inumaRescueDisplayLink = displayLink;
         strongSelf->_inumaRescueDisplayLinkFrameTimestampNs =
             frameTimestampNs;
+        strongSelf->_inumaRescueDisplayLinkRendererStateGeneration =
+            rendererStateGeneration;
         strongSelf->_inumaRescuePredecessorCopyUptimeNs =
             predecessorCopyUptimeNs;
         strongSelf->_inumaRescueDisplayLinkEventIndex = NSNotFound;
@@ -2091,6 +2169,8 @@ static void InumaRecordRenderQoSObservationLocked(
       if (screen == nil || displayLink == nil) {
         os_unfair_lock_lock(&strongSelf->_lock);
         const bool fallbackIsCurrent =
+            strongSelf->_inumaRendererStateGeneration ==
+                rendererStateGeneration &&
             strongSelf->_textureId == textureId &&
             strongSelf->_frameAvailable &&
             strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
@@ -2102,6 +2182,8 @@ static void InumaRecordRenderQoSObservationLocked(
           [strongSelf
               inumaScheduleTextureNotificationForTextureId:textureId
                                           frameTimestampNs:frameTimestampNs
+                                   rendererStateGeneration:
+                                       rendererStateGeneration
                                          bypassMinimumHold:false
                                         recordRescueBypass:false
                                   recordRasterRepeatRetry:false];
@@ -2112,6 +2194,8 @@ static void InumaRecordRenderQoSObservationLocked(
 
     os_unfair_lock_lock(&strongSelf->_lock);
     const bool fallbackIsCurrent =
+        strongSelf->_inumaRendererStateGeneration ==
+            rendererStateGeneration &&
         strongSelf->_textureId == textureId &&
         strongSelf->_frameAvailable &&
         strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
@@ -2123,6 +2207,8 @@ static void InumaRecordRenderQoSObservationLocked(
       [strongSelf inumaScheduleTextureNotificationForTextureId:textureId
                                              frameTimestampNs:
                                                  frameTimestampNs
+                                      rendererStateGeneration:
+                                          rendererStateGeneration
                                             bypassMinimumHold:false
                                            recordRescueBypass:false
                                      recordRasterRepeatRetry:false];
@@ -2137,6 +2223,7 @@ static void InumaRecordRenderQoSObservationLocked(
       InumaDisplayLinkTimestampNanoseconds(displayLink);
   int64_t textureId = -1;
   int64_t frameTimestampNs = 0;
+  uint64_t rendererStateGeneration = 0;
   bool rescueIsCurrent = false;
   bool predecessorWasPresented = false;
   bool deferUntilPresentation = false;
@@ -2145,7 +2232,10 @@ static void InumaRecordRenderQoSObservationLocked(
   if (ownsDisplayLink) {
     textureId = _textureId;
     frameTimestampNs = _inumaRescueDisplayLinkFrameTimestampNs;
+    rendererStateGeneration =
+        _inumaRescueDisplayLinkRendererStateGeneration;
     rescueIsCurrent =
+        _inumaRendererStateGeneration == rendererStateGeneration &&
         textureId != -1 && _frameAvailable &&
         _inumaFrameTimestampNs == frameTimestampNs;
     predecessorWasPresented =
@@ -2181,6 +2271,7 @@ static void InumaRecordRenderQoSObservationLocked(
     if (!deferUntilPresentation) {
       _inumaRescueDisplayLink = nil;
       _inumaRescueDisplayLinkFrameTimestampNs = 0;
+      _inumaRescueDisplayLinkRendererStateGeneration = 0;
       _inumaRescuePredecessorCopyUptimeNs = 0;
       _inumaRescueDisplayLinkEventIndex = NSNotFound;
     }
@@ -2193,6 +2284,8 @@ static void InumaRecordRenderQoSObservationLocked(
   if (rescueIsCurrent && predecessorWasPresented) {
     [self inumaScheduleTextureNotificationForTextureId:textureId
                                       frameTimestampNs:frameTimestampNs
+                               rendererStateGeneration:
+                                   rendererStateGeneration
                                      bypassMinimumHold:true
                                     recordRescueBypass:false
                               recordRasterRepeatRetry:false];
@@ -2218,6 +2311,7 @@ static void InumaRecordRenderQoSObservationLocked(
   }
   _inumaRescueDisplayLink = nil;
   _inumaRescueDisplayLinkFrameTimestampNs = 0;
+  _inumaRescueDisplayLinkRendererStateGeneration = 0;
   _inumaRescuePredecessorCopyUptimeNs = 0;
   _inumaRescueDisplayLinkEventIndex = NSNotFound;
   [displayLink invalidate];
@@ -2847,6 +2941,7 @@ static void InumaRecordRenderQoSObservationLocked(
   os_unfair_lock_lock(&_lock);
   if (size.width != _frameSize.width || size.height != _frameSize.height) {
 #if TARGET_OS_OSX
+    _inumaRendererStateGeneration += 1;
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaClearPendingTextureFramesLocked];

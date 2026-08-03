@@ -69,7 +69,9 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
 
 static inline bool InumaEmergencyGraceShouldShift(bool grace_occupied,
                                                   size_t pending_frame_count) {
-  return grace_occupied && pending_frame_count == 1;
+  // The renderer calls this after popping the one-slot primary queue.  The
+  // grace frame may move into that newly empty slot only at exact depth zero.
+  return grace_occupied && pending_frame_count == 0;
 }
 
 static inline bool InumaEmergencyGracePromotedFrameDrains(

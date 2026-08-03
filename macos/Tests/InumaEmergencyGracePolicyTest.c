@@ -1,5 +1,8 @@
+// Entry point for the pure-C renderer policy and deterministic state suite.
+
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
+#include "InumaRendererQueueSimulation.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -81,9 +84,9 @@ static void TestNoRefusalWithoutFullPrimaryQueue(void) {
 }
 
 static void TestBoundedFifoActions(void) {
-  assert(InumaEmergencyGraceShouldShift(true, 1));
-  assert(!InumaEmergencyGraceShouldShift(false, 1));
-  assert(!InumaEmergencyGraceShouldShift(true, 0));
+  assert(InumaEmergencyGraceShouldShift(true, 0));
+  assert(!InumaEmergencyGraceShouldShift(false, 0));
+  assert(!InumaEmergencyGraceShouldShift(true, 1));
   assert(!InumaEmergencyGraceShouldShift(true, 2));
   assert(InumaEmergencyGracePromotedFrameDrains(true));
   assert(!InumaEmergencyGracePromotedFrameDrains(false));
@@ -101,7 +104,7 @@ static void TestThreeFrameQueueGraceSequence(void) {
       InumaEmergencyGraceEvaluate(second);
   assert(!refused.eligible);
   assert(refused.refuse_reason == InumaEmergencyGraceRefuseReasonOccupied);
-  assert(InumaEmergencyGraceShouldShift(true, 1));
+  assert(InumaEmergencyGraceShouldShift(true, 0));
   assert(InumaEmergencyGracePromotedFrameDrains(true));
 }
 
@@ -175,32 +178,6 @@ static void TestRepeatBoundaryDefaultOffAndBaseGuard(void) {
   assert(!decision.extends_normal_hold);
 }
 
-static void TestRepeatBoundaryThirtyAndSixtyHzPhaseSweep(void) {
-  const uint64_t periods_ns[] = {33333333, 16666667};
-  const int64_t jitters_ns[] = {-250000, 0, 250000};
-  for (size_t cadence = 0;
-       cadence < sizeof(periods_ns) / sizeof(periods_ns[0]); cadence++) {
-    for (size_t jitter = 0;
-         jitter < sizeof(jitters_ns) / sizeof(jitters_ns[0]); jitter++) {
-      for (uint64_t phase_ns = 0; phase_ns < periods_ns[cadence];
-           phase_ns += 250000) {
-        int64_t shifted_phase = (int64_t)phase_ns + jitters_ns[jitter];
-        while (shifted_phase < 0) {
-          shifted_phase += 2000001;
-        }
-        const uint64_t tenure_ns =
-            18500000 + (uint64_t)(shifted_phase % 2000001);
-        const InumaRepeatBoundaryPolicyDecision decision =
-            RepeatBoundaryAt(tenure_ns);
-        assert(decision.evaluated);
-        assert(decision.repeat == (tenure_ns < 20000000));
-        assert(decision.extends_normal_hold ==
-               (tenure_ns >= kMinimumHoldNs && tenure_ns < 20000000));
-      }
-    }
-  }
-}
-
 int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
@@ -210,6 +187,6 @@ int main(void) {
   TestThreeFrameQueueGraceSequence();
   TestRepeatOnlyBoundary();
   TestRepeatBoundaryDefaultOffAndBaseGuard();
-  TestRepeatBoundaryThirtyAndSixtyHzPhaseSweep();
+  InumaRunRendererQueueSimulationScenarios();
   return 0;
 }
