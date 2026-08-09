@@ -19,6 +19,7 @@
 #import <os/lock.h>
 
 #if TARGET_OS_OSX
+#include "InumaDecoderBoundaryTrace.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
@@ -3056,7 +3057,8 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @37,
+    @"tail_diagnostics_version" : @38,
+    @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :

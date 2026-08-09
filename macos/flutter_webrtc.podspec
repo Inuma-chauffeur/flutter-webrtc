@@ -17,6 +17,7 @@ A new flutter plugin project.
   # its source-tree forwarding header out of the generated public umbrella;
   # the relative common/ path does not exist after framework installation.
   s.private_header_files = [
+    'Classes/InumaDecoderBoundaryTrace.h',
     'Classes/InumaDirectFrameDisplayRetryPolicy.h',
     'Classes/InumaEmergencyGracePolicy.h',
     'Classes/InumaRepeatBoundaryPolicy.h',

@@ -18,6 +18,16 @@
 #endif
 #import "AudioManager.h"
 
+#if TARGET_OS_OSX
+#import "InumaDecoderBoundaryTrace.h"
+#import <os/lock.h>
+#include <pthread/qos.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/qos.h>
+#include <time.h>
+#endif
+
 #import <AVFoundation/AVFoundation.h>
 #import <WebRTC/RTCFieldTrials.h>
 #import <WebRTC/WebRTC.h>
@@ -41,6 +51,355 @@
 
 @interface VideoDecoderFactory : RTCDefaultVideoDecoderFactory
 @end
+
+#if TARGET_OS_OSX
+enum {
+  // Covers 30 FPS for 30 minutes plus startup/teardown headroom.
+  kInumaDecoderBoundaryTraceCapacity = 65536,
+};
+
+typedef struct {
+  BOOL enabled;
+  uint64_t trace_started_monotonic_ns;
+  uint64_t wrapped_decoder_count;
+  uint64_t callback_set_count;
+  uint64_t release_count;
+  uint64_t sample_capacity_exhaustions;
+  NSUInteger decode_count;
+  NSUInteger output_count;
+  uint64_t decode_call_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
+  uint64_t decode_return_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
+  uint32_t decode_rtp_timestamp[kInumaDecoderBoundaryTraceCapacity];
+  int64_t decode_capture_time_ms[kInumaDecoderBoundaryTraceCapacity];
+  int64_t decode_render_time_ms[kInumaDecoderBoundaryTraceCapacity];
+  int64_t decode_status[kInumaDecoderBoundaryTraceCapacity];
+  uint8_t decode_missing_frames[kInumaDecoderBoundaryTraceCapacity];
+  uint8_t decode_qos_class[kInumaDecoderBoundaryTraceCapacity];
+  uint64_t output_callback_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
+  uint64_t output_return_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
+  uint32_t output_rtp_timestamp[kInumaDecoderBoundaryTraceCapacity];
+  int64_t output_timestamp_ns[kInumaDecoderBoundaryTraceCapacity];
+  uint8_t output_qos_class[kInumaDecoderBoundaryTraceCapacity];
+} InumaDecoderBoundaryTrace;
+
+static os_unfair_lock gInumaDecoderBoundaryTraceLock = OS_UNFAIR_LOCK_INIT;
+static InumaDecoderBoundaryTrace gInumaDecoderBoundaryTrace = {0};
+static NSString *gInumaDecoderBoundaryTraceCodecName = nil;
+static NSString *gInumaDecoderBoundaryTraceImplementationName = nil;
+
+static uint64_t InumaDecoderMonotonicNanoseconds(void) {
+  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+}
+
+static BOOL InumaDecoderTraceEnvironmentEnabled(void) {
+  NSString *value = NSProcessInfo.processInfo.environment[
+      @"INUMA_FLUTTER_WEBRTC_DECODER_BOUNDARY_TRACE"];
+  NSString *normalized = value.lowercaseString;
+  return [normalized isEqualToString:@"1"] ||
+         [normalized isEqualToString:@"true"] ||
+         [normalized isEqualToString:@"yes"] ||
+         [normalized isEqualToString:@"on"];
+}
+
+static void InumaInitializeDecoderBoundaryTraceIfNeeded(void) {
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  if (!gInumaDecoderBoundaryTrace.enabled &&
+      InumaDecoderTraceEnvironmentEnabled()) {
+    gInumaDecoderBoundaryTrace.enabled = YES;
+    gInumaDecoderBoundaryTrace.trace_started_monotonic_ns =
+        InumaDecoderMonotonicNanoseconds();
+  }
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+}
+
+static BOOL InumaDecoderBoundaryTraceIsEnabled(void) {
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  const BOOL enabled = gInumaDecoderBoundaryTrace.enabled;
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  return enabled;
+}
+
+static NSUInteger InumaDecoderTraceBeginDecode(
+    RTCEncodedImage *encodedImage, BOOL missingFrames, int64_t renderTimeMs) {
+  const uint64_t calledAt = InumaDecoderMonotonicNanoseconds();
+  const qos_class_t qos = qos_class_self();
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  if (!gInumaDecoderBoundaryTrace.enabled) {
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
+  if (gInumaDecoderBoundaryTrace.decode_count >=
+      kInumaDecoderBoundaryTraceCapacity) {
+    gInumaDecoderBoundaryTrace.sample_capacity_exhaustions += 1;
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
+  const NSUInteger index = gInumaDecoderBoundaryTrace.decode_count++;
+  gInumaDecoderBoundaryTrace.decode_call_monotonic_ns[index] = calledAt;
+  gInumaDecoderBoundaryTrace.decode_rtp_timestamp[index] =
+      encodedImage.timeStamp;
+  gInumaDecoderBoundaryTrace.decode_capture_time_ms[index] =
+      encodedImage.captureTimeMs;
+  gInumaDecoderBoundaryTrace.decode_render_time_ms[index] = renderTimeMs;
+  gInumaDecoderBoundaryTrace.decode_status[index] = NSIntegerMin;
+  gInumaDecoderBoundaryTrace.decode_missing_frames[index] =
+      missingFrames ? 1 : 0;
+  gInumaDecoderBoundaryTrace.decode_qos_class[index] = (uint8_t)qos;
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  return index;
+}
+
+static void InumaDecoderTraceFinishDecode(NSUInteger index,
+                                          NSInteger status) {
+  if (index == NSNotFound) {
+    return;
+  }
+  const uint64_t returnedAt = InumaDecoderMonotonicNanoseconds();
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  if (index < gInumaDecoderBoundaryTrace.decode_count) {
+    gInumaDecoderBoundaryTrace.decode_return_monotonic_ns[index] =
+        returnedAt;
+    gInumaDecoderBoundaryTrace.decode_status[index] = status;
+  }
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+}
+
+static NSUInteger InumaDecoderTraceBeginOutput(RTCVideoFrame *frame) {
+  const uint64_t calledAt = InumaDecoderMonotonicNanoseconds();
+  const qos_class_t qos = qos_class_self();
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  if (!gInumaDecoderBoundaryTrace.enabled) {
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
+  if (gInumaDecoderBoundaryTrace.output_count >=
+      kInumaDecoderBoundaryTraceCapacity) {
+    gInumaDecoderBoundaryTrace.sample_capacity_exhaustions += 1;
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
+  const NSUInteger index = gInumaDecoderBoundaryTrace.output_count++;
+  gInumaDecoderBoundaryTrace.output_callback_monotonic_ns[index] = calledAt;
+  gInumaDecoderBoundaryTrace.output_rtp_timestamp[index] =
+      (uint32_t)frame.timeStamp;
+  gInumaDecoderBoundaryTrace.output_timestamp_ns[index] = frame.timeStampNs;
+  gInumaDecoderBoundaryTrace.output_qos_class[index] = (uint8_t)qos;
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  return index;
+}
+
+static void InumaDecoderTraceFinishOutput(NSUInteger index) {
+  if (index == NSNotFound) {
+    return;
+  }
+  const uint64_t returnedAt = InumaDecoderMonotonicNanoseconds();
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  if (index < gInumaDecoderBoundaryTrace.output_count) {
+    gInumaDecoderBoundaryTrace.output_return_monotonic_ns[index] =
+        returnedAt;
+  }
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+}
+
+static NSArray<NSNumber *> *InumaDecoderUnsigned64Array(
+    const uint64_t *samples, NSUInteger count) {
+  NSMutableArray<NSNumber *> *values =
+      [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+static NSArray<NSNumber *> *InumaDecoderSigned64Array(
+    const int64_t *samples, NSUInteger count) {
+  NSMutableArray<NSNumber *> *values =
+      [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+static NSArray<NSNumber *> *InumaDecoderUnsigned32Array(
+    const uint32_t *samples, NSUInteger count) {
+  NSMutableArray<NSNumber *> *values =
+      [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+static NSArray<NSNumber *> *InumaDecoderByteArray(const uint8_t *samples,
+                                                   NSUInteger count) {
+  NSMutableArray<NSNumber *> *values =
+      [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger index = 0; index < count; index++) {
+    [values addObject:@(samples[index])];
+  }
+  return values;
+}
+
+NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
+  InumaDecoderBoundaryTrace *snapshot =
+      calloc(1, sizeof(InumaDecoderBoundaryTrace));
+  if (snapshot == NULL) {
+    return @{
+      @"schema" : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
+      @"status" : @"fail",
+      @"finding" : @"decoder_boundary_trace_snapshot_allocation_failed",
+      @"enabled" : @(NO),
+      @"payload_policy" : @"scalar_timing_and_counts_only_no_media_payloads",
+    };
+  }
+  NSString *codecName = @"";
+  NSString *implementationName = @"";
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  memcpy(snapshot, &gInumaDecoderBoundaryTrace,
+         sizeof(InumaDecoderBoundaryTrace));
+  codecName = [gInumaDecoderBoundaryTraceCodecName copy] ?: @"";
+  implementationName =
+      [gInumaDecoderBoundaryTraceImplementationName copy] ?: @"";
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+
+  if (!snapshot->enabled) {
+    free(snapshot);
+    return @{
+      @"schema" : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
+      @"status" : @"disabled",
+      @"finding" : @"decoder_boundary_trace_disabled",
+      @"enabled" : @(NO),
+      @"payload_policy" : @"scalar_timing_and_counts_only_no_media_payloads",
+    };
+  }
+
+  NSDictionary<NSString *, id> *report = @{
+    @"schema" : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
+    @"status" : @"pass",
+    @"finding" : @"decoder_input_and_output_callback_boundaries_retained",
+    @"enabled" : @(YES),
+    @"payload_policy" : @"scalar_timing_and_counts_only_no_media_payloads",
+    @"clock_domain" : @"macos_clock_monotonic_raw_shared_mach_host_time",
+    @"sample_capacity" : @(kInumaDecoderBoundaryTraceCapacity),
+    @"sample_capacity_exhaustions" :
+        @(snapshot->sample_capacity_exhaustions),
+    @"trace_started_monotonic_ns" :
+        @(snapshot->trace_started_monotonic_ns),
+    @"wrapped_decoder_count" : @(snapshot->wrapped_decoder_count),
+    @"callback_set_count" : @(snapshot->callback_set_count),
+    @"release_count" : @(snapshot->release_count),
+    @"codec_name" : codecName,
+    @"inner_decoder_implementation" : implementationName,
+    @"decode_count" : @(snapshot->decode_count),
+    @"output_count" : @(snapshot->output_count),
+    @"decode_call_monotonic_ns" : InumaDecoderUnsigned64Array(
+        snapshot->decode_call_monotonic_ns, snapshot->decode_count),
+    @"decode_return_monotonic_ns" : InumaDecoderUnsigned64Array(
+        snapshot->decode_return_monotonic_ns, snapshot->decode_count),
+    @"decode_rtp_timestamp" : InumaDecoderUnsigned32Array(
+        snapshot->decode_rtp_timestamp, snapshot->decode_count),
+    @"decode_capture_time_ms" : InumaDecoderSigned64Array(
+        snapshot->decode_capture_time_ms, snapshot->decode_count),
+    @"decode_render_time_ms" : InumaDecoderSigned64Array(
+        snapshot->decode_render_time_ms, snapshot->decode_count),
+    @"decode_status" : InumaDecoderSigned64Array(
+        snapshot->decode_status, snapshot->decode_count),
+    @"decode_missing_frames" : InumaDecoderByteArray(
+        snapshot->decode_missing_frames, snapshot->decode_count),
+    @"decode_qos_class" : InumaDecoderByteArray(
+        snapshot->decode_qos_class, snapshot->decode_count),
+    @"output_callback_monotonic_ns" : InumaDecoderUnsigned64Array(
+        snapshot->output_callback_monotonic_ns, snapshot->output_count),
+    @"output_return_monotonic_ns" : InumaDecoderUnsigned64Array(
+        snapshot->output_return_monotonic_ns, snapshot->output_count),
+    @"output_rtp_timestamp" : InumaDecoderUnsigned32Array(
+        snapshot->output_rtp_timestamp, snapshot->output_count),
+    @"output_timestamp_ns" : InumaDecoderSigned64Array(
+        snapshot->output_timestamp_ns, snapshot->output_count),
+    @"output_qos_class" : InumaDecoderByteArray(
+        snapshot->output_qos_class, snapshot->output_count),
+  };
+  free(snapshot);
+  return report;
+}
+
+@interface InumaTracingVideoDecoder : NSObject <RTCVideoDecoder>
+- (instancetype)initWithDecoder:(id<RTCVideoDecoder>)decoder
+                       codecName:(NSString *)codecName;
+@end
+
+@implementation InumaTracingVideoDecoder {
+  id<RTCVideoDecoder> _decoder;
+  RTCVideoDecoderCallback _callback;
+}
+
+- (instancetype)initWithDecoder:(id<RTCVideoDecoder>)decoder
+                       codecName:(NSString *)codecName {
+  self = [super init];
+  if (self) {
+    _decoder = decoder;
+    os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+    gInumaDecoderBoundaryTrace.wrapped_decoder_count += 1;
+    gInumaDecoderBoundaryTraceCodecName = [codecName copy];
+    gInumaDecoderBoundaryTraceImplementationName =
+        [[decoder implementationName] copy];
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  }
+  return self;
+}
+
+- (void)setCallback:(RTCVideoDecoderCallback)callback {
+  _callback = [callback copy];
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  gInumaDecoderBoundaryTrace.callback_set_count += 1;
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  __weak InumaTracingVideoDecoder *weakSelf = self;
+  [_decoder setCallback:^(RTCVideoFrame *frame) {
+    const NSUInteger index = InumaDecoderTraceBeginOutput(frame);
+    InumaTracingVideoDecoder *strongSelf = weakSelf;
+    RTCVideoDecoderCallback outputCallback =
+        strongSelf != nil ? strongSelf->_callback : nil;
+    if (outputCallback != nil) {
+      outputCallback(frame);
+    }
+    InumaDecoderTraceFinishOutput(index);
+  }];
+}
+
+- (NSInteger)startDecodeWithNumberOfCores:(int)numberOfCores {
+  return [_decoder startDecodeWithNumberOfCores:numberOfCores];
+}
+
+- (NSInteger)releaseDecoder {
+  const NSInteger status = [_decoder releaseDecoder];
+  _callback = nil;
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  gInumaDecoderBoundaryTrace.release_count += 1;
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  return status;
+}
+
+- (NSInteger)decode:(RTCEncodedImage *)encodedImage
+        missingFrames:(BOOL)missingFrames
+    codecSpecificInfo:(id<RTCCodecSpecificInfo>)info
+         renderTimeMs:(int64_t)renderTimeMs {
+  const NSUInteger index = InumaDecoderTraceBeginDecode(
+      encodedImage, missingFrames, renderTimeMs);
+  const NSInteger status = [_decoder decode:encodedImage
+                              missingFrames:missingFrames
+                          codecSpecificInfo:info
+                               renderTimeMs:renderTimeMs];
+  InumaDecoderTraceFinishDecode(index, status);
+  return status;
+}
+
+- (NSString *)implementationName {
+  return [_decoder implementationName];
+}
+
+@end
+#endif
 
 @interface VideoEncoderFactorySimulcast : RTCVideoEncoderFactorySimulcast
 @end
@@ -87,6 +446,20 @@ NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* motifyH264ProfileLevelId(
 - (NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>*)supportedCodecs {
   NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo)*>* codecs = [super supportedCodecs];
   return motifyH264ProfileLevelId(codecs);
+}
+
+- (id<RTC_OBJC_TYPE(RTCVideoDecoder)>)createDecoder:
+    (RTC_OBJC_TYPE(RTCVideoCodecInfo) *)info {
+  id<RTC_OBJC_TYPE(RTCVideoDecoder)> decoder = [super createDecoder:info];
+#if TARGET_OS_OSX
+  InumaInitializeDecoderBoundaryTraceIfNeeded();
+  if (decoder != nil && InumaDecoderBoundaryTraceIsEnabled() &&
+      [info.name isEqualToString:kRTCVideoCodecH264Name]) {
+    return [[InumaTracingVideoDecoder alloc] initWithDecoder:decoder
+                                                  codecName:info.name];
+  }
+#endif
+  return decoder;
 }
 @end
 
