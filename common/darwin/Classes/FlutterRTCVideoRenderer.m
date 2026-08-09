@@ -23,6 +23,7 @@
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaMainRunLoopNotificationPolicy.h"
+#include "InumaLowLatencyVideoPlayoutConfiguration.h"
 #include "InumaPrerendererSmoothingConfiguration.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
@@ -3584,6 +3585,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                        : @"stock_bgra";
   const uint64_t prerendererSmoothingDisabledConfigurationCount =
       InumaPrerendererSmoothingDisabledConfigurationCount();
+  const uint64_t lowLatencyVideoPlayoutEnabledConfigurationCount =
+      InumaLowLatencyVideoPlayoutEnabledConfigurationCount();
   NSDictionary *report = @{
     @"schema" : @"inuma.flutter_webrtc.macos_texture_trace.v1",
     @"status" : @"pass",
@@ -3592,7 +3595,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @44,
+    @"tail_diagnostics_version" : @45,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"prerenderer_smoothing_configuration_contract" :
         @"explicit_objc_to_native_peer_configuration",
@@ -3600,6 +3603,20 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         @(prerendererSmoothingDisabledConfigurationCount),
     @"prerenderer_smoothing_disabled_applied" :
         prerendererSmoothingDisabledConfigurationCount > 0 ? @YES : @NO,
+    @"low_latency_video_playout_configuration_contract" :
+        @"explicit_dart_to_objc_factory_field_trials",
+    @"low_latency_video_playout_enabled_configuration_count" :
+        @(lowLatencyVideoPlayoutEnabledConfigurationCount),
+    @"low_latency_video_playout_enabled" :
+        lowLatencyVideoPlayoutEnabledConfigurationCount > 0 ? @YES : @NO,
+    @"low_latency_video_playout_forced_minimum_ms" :
+        @(InumaLowLatencyVideoPlayoutForcedMinimumMs()),
+    @"low_latency_video_playout_forced_maximum_ms" :
+        @(InumaLowLatencyVideoPlayoutForcedMaximumMs()),
+    @"low_latency_video_playout_minimum_pacing_ms" :
+        @(InumaLowLatencyVideoPlayoutMinimumPacingMs()),
+    @"low_latency_video_playout_maximum_decode_queue_size" :
+        @(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize()),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -3857,7 +3874,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"render_qos_execution_owner" :
         _inumaRenderQoSQueue != nil ? @"owned_serial_enforced_qos_sync"
                                     : @"calling_thread",
-    @"render_qos_queue_configured" : @(_inumaRenderQoSQueue != nil),
+    @"render_qos_queue_configured" :
+        _inumaRenderQoSQueue != nil ? @YES : @NO,
     @"render_qos_queue_class" :
         _inumaRenderQoSQueue != nil &&
                 dispatch_queue_get_qos_class(_inumaRenderQoSQueue, NULL) ==

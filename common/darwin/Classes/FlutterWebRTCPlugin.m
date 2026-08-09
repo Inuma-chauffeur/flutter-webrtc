@@ -20,6 +20,7 @@
 
 #if TARGET_OS_OSX
 #import "InumaDecoderBoundaryTrace.h"
+#import "InumaLowLatencyVideoPlayoutConfiguration.h"
 #import "InumaPrerendererSmoothingConfiguration.h"
 #import <os/lock.h>
 #include <pthread/qos.h>
@@ -694,11 +695,20 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
 - (void)initialize:(NSArray*)networkIgnoreMask
     bypassVoiceProcessing:(BOOL)bypassVoiceProcessing
+  lowLatencyVideoPlayout:(BOOL)lowLatencyVideoPlayout
                  severity:(RTCLoggingSeverity)severity {
     // RTCSetMinDebugLogLevel(severity);
     [self initLoggerCallback:severity];
 
     if (!_peerConnectionFactory) {
+#if TARGET_OS_OSX
+        InumaRecordLowLatencyVideoPlayoutConfiguration(
+            lowLatencyVideoPlayout);
+        if (lowLatencyVideoPlayout) {
+            [RTCPeerConnectionFactory configureFieldTrials:
+                InumaLowLatencyVideoPlayoutFieldTrials()];
+        }
+#endif
         VideoDecoderFactory* decoderFactory = [[VideoDecoderFactory alloc] init];
         VideoEncoderFactory* encoderFactory = [[VideoEncoderFactory alloc] init];
 
@@ -795,7 +805,25 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       severity = [self str2LogSeverity:severityStr];
     }
 
-    [self initialize:networkIgnoreMask bypassVoiceProcessing:enableBypassVoiceProcessing
+    BOOL lowLatencyVideoPlayout = NO;
+#if TARGET_OS_OSX
+    InumaLowLatencyVideoPlayoutParseResult lowLatencyVideoPlayoutResult =
+        InumaParseLowLatencyVideoPlayoutConfiguration(
+            options,
+            &lowLatencyVideoPlayout);
+    if (lowLatencyVideoPlayoutResult ==
+        InumaLowLatencyVideoPlayoutParseResultInvalid) {
+      result([FlutterError
+          errorWithCode:@"invalid-options"
+                message:@"lowLatencyVideoPlayout must be a Boolean"
+                details:nil]);
+      return;
+    }
+#endif
+
+    [self initialize:networkIgnoreMask
+        bypassVoiceProcessing:enableBypassVoiceProcessing
+       lowLatencyVideoPlayout:lowLatencyVideoPlayout
                      severity:severity];
     result(@"");
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {

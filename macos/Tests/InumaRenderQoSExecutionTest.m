@@ -40,6 +40,29 @@ int main(void) {
               (unsigned int)configuredQoS, relativePriority);
       return 1;
     }
+
+    NSDictionary* trace = @{
+      @"render_qos_queue_configured" : queue != nil ? @YES : @NO,
+    };
+    NSError* encodeError = nil;
+    NSData* encoded = [NSJSONSerialization dataWithJSONObject:trace
+                                                      options:0
+                                                        error:&encodeError];
+    NSError* decodeError = nil;
+    NSDictionary* decoded =
+        encoded == nil
+            ? nil
+            : [NSJSONSerialization JSONObjectWithData:encoded
+                                               options:0
+                                                 error:&decodeError];
+    id configured = decoded[@"render_qos_queue_configured"];
+    if (encodeError != nil || decodeError != nil ||
+        ![configured isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((__bridge CFTypeRef)configured) != CFBooleanGetTypeID() ||
+        ![configured boolValue]) {
+      fprintf(stderr, "queue-configured trace did not retain JSON Boolean true\n");
+      return 1;
+    }
   }
   return 0;
 }
