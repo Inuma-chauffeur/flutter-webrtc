@@ -777,52 +777,73 @@ static void TestThirtyHzSourceSixtyHzDisplayPhaseAndJitterSweep(void) {
 }
 
 static void TestC19ForeignInvalidationPreservesNormalSuccessor(void) {
-  RepeatBoundarySimulation simulation;
-  InitializeSimulation(&simulation);
-  const uint64_t origin_ns = 1000000000;
+  typedef struct {
+    uint64_t predecessor_frame;
+    uint64_t predecessor_tenure_ns;
+    uint64_t successor_arrival_to_copy_ns;
+  } C19ForeignInvalidationCase;
+  const C19ForeignInvalidationCase cases[] = {
+      {275, 16812000, 895750},
+      {389, 17710500, 1743917},
+      {1011, 16912542, 1303375},
+      {2327, 16806541, 16659958},
+  };
   const uint64_t minimum_hold_ns = 19000000;
 
-  // C19's skipped identity was copied by its direct retry. A following normal
-  // source frame then replaced it because the older dirty mark caused a raster
-  // acquisition before the successor's own 19 ms notification.
-  SimulateSourceArrival(&simulation, 275, origin_ns);
-  assert(!SimulateRasterCopy(&simulation, origin_ns + 1000000));
-  assert(simulation.last_copied_frame == 275);
-  SimulateDirectNormalSourceArrivalAwaitingOwnNotification(
-      &simulation, 276, origin_ns + 2000000);
+  for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+    RepeatBoundarySimulation simulation;
+    InitializeSimulation(&simulation);
+    const uint64_t origin_ns = 1000000000 + index * 1000000000;
+    const uint64_t predecessor_frame = cases[index].predecessor_frame;
+    const uint64_t successor_frame = predecessor_frame + 1;
 
-  const uint64_t foreign_acquisition_ns =
-      simulation.last_copy_ns + 16812000;
-  assert(SimulateRasterCopy(&simulation, foreign_acquisition_ns));
-  assert(simulation.current_frame == 276);
-  assert(simulation.last_copied_frame == 275);
-  assert(simulation.pre_notification_guard_evaluations == 1);
-  assert(simulation.pre_notification_guard_repeats == 1);
-  assert(simulation.pre_notification_guard_duplicate_suppressions == 0);
-  assert(simulation.retry_schedules == 0);
-  assert(simulation.retry_fires == 0);
+    // C19's skipped identity was copied by its direct retry. The following
+    // normal source then arrived at the exact measured offset before a raster
+    // acquisition caused by the older dirty mark. That acquisition must
+    // repeat the predecessor without consuming the successor before its own
+    // authoritative 19 ms notification.
+    SimulateSourceArrival(&simulation, predecessor_frame, origin_ns);
+    assert(!SimulateRasterCopy(&simulation, origin_ns + 1000000));
+    assert(simulation.last_copied_frame == predecessor_frame);
+    const uint64_t foreign_acquisition_ns =
+        simulation.last_copy_ns + cases[index].predecessor_tenure_ns;
+    const uint64_t successor_arrival_ns =
+        foreign_acquisition_ns - cases[index].successor_arrival_to_copy_ns;
+    assert(successor_arrival_ns > simulation.last_copy_ns);
+    SimulateDirectNormalSourceArrivalAwaitingOwnNotification(
+        &simulation, successor_frame, successor_arrival_ns);
 
-  // A second foreign request cannot consume the current frame or create a
-  // second predecessor repeat. It is suppressed until the authoritative
-  // normal notification is issued.
-  assert(!SimulateRasterCopy(&simulation,
-                             foreign_acquisition_ns + 100000));
-  assert(simulation.current_frame == 276);
-  assert(simulation.last_copied_frame == 275);
-  assert(simulation.pre_notification_guard_evaluations == 2);
-  assert(simulation.pre_notification_guard_repeats == 1);
-  assert(simulation.pre_notification_guard_duplicate_suppressions == 1);
+    assert(SimulateRasterCopy(&simulation, foreign_acquisition_ns));
+    assert(simulation.current_frame == successor_frame);
+    assert(simulation.last_copied_frame == predecessor_frame);
+    assert(simulation.pre_notification_guard_evaluations == 1);
+    assert(simulation.pre_notification_guard_repeats == 1);
+    assert(simulation.pre_notification_guard_duplicate_suppressions == 0);
+    assert(simulation.retry_schedules == 0);
+    assert(simulation.retry_fires == 0);
 
-  SimulateNormalOwnNotification(&simulation, 276);
-  assert(!SimulateRasterCopy(&simulation,
-                             simulation.last_copy_ns + minimum_hold_ns));
-  AssertTerminal(&simulation);
-  assert(simulation.copied_count == 2);
-  assert(simulation.copied_frames[0] == 275);
-  assert(simulation.copied_frames[1] == 276);
-  assert(simulation.retry_schedules == 0);
-  assert(simulation.retry_fires == 0);
-  assert(simulation.grace_admits == 0);
+    // A duplicate foreign request cannot consume the current frame or create
+    // another predecessor repeat. It stays suppressed until the current
+    // frame's own normal notification is issued.
+    assert(!SimulateRasterCopy(&simulation,
+                               foreign_acquisition_ns + 100000));
+    assert(simulation.current_frame == successor_frame);
+    assert(simulation.last_copied_frame == predecessor_frame);
+    assert(simulation.pre_notification_guard_evaluations == 2);
+    assert(simulation.pre_notification_guard_repeats == 1);
+    assert(simulation.pre_notification_guard_duplicate_suppressions == 1);
+
+    SimulateNormalOwnNotification(&simulation, successor_frame);
+    assert(!SimulateRasterCopy(&simulation,
+                               simulation.last_copy_ns + minimum_hold_ns));
+    AssertTerminal(&simulation);
+    assert(simulation.copied_count == 2);
+    assert(simulation.copied_frames[0] == predecessor_frame);
+    assert(simulation.copied_frames[1] == successor_frame);
+    assert(simulation.retry_schedules == 0);
+    assert(simulation.retry_fires == 0);
+    assert(simulation.grace_admits == 0);
+  }
 }
 
 
