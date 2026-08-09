@@ -2,6 +2,7 @@
 
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
+#include "InumaPostCopyExactReplayPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #include "InumaRendererQueueSimulation.h"
 
@@ -326,6 +327,106 @@ static void TestDirectRetryDefaultOffAndStrictOwnership(void) {
   assert(decision.stale);
 }
 
+static InumaPostCopyExactReplayScheduleInput ExactReplayScheduleInput(void) {
+  return (InumaPostCopyExactReplayScheduleInput){
+      .enabled = true,
+      .new_source_copy = true,
+      .texture_registered = true,
+      .buffer_available = true,
+      .frame_timestamp_valid = true,
+      .slot_occupied = false,
+  };
+}
+
+static void TestPostCopyExactReplayScheduleContract(void) {
+  InumaPostCopyExactReplayScheduleInput input = ExactReplayScheduleInput();
+  InumaPostCopyExactReplayScheduleDecision decision =
+      InumaPostCopyExactReplayEvaluateSchedule(input);
+  assert(decision.evaluated);
+  assert(decision.schedule);
+  assert(decision.defer_current_notification);
+  assert(decision.reason == InumaPostCopyExactReplayScheduleReasonAccepted);
+
+  input.enabled = false;
+  decision = InumaPostCopyExactReplayEvaluateSchedule(input);
+  assert(!decision.evaluated);
+  assert(!decision.schedule);
+
+  input = ExactReplayScheduleInput();
+  input.new_source_copy = false;
+  decision = InumaPostCopyExactReplayEvaluateSchedule(input);
+  assert(!decision.schedule);
+  assert(decision.reason ==
+         InumaPostCopyExactReplayScheduleReasonRecursiveCopy);
+
+  input = ExactReplayScheduleInput();
+  input.slot_occupied = true;
+  decision = InumaPostCopyExactReplayEvaluateSchedule(input);
+  assert(!decision.schedule);
+  assert(decision.reason ==
+         InumaPostCopyExactReplayScheduleReasonSlotOccupied);
+
+  input = ExactReplayScheduleInput();
+  input.texture_registered = false;
+  decision = InumaPostCopyExactReplayEvaluateSchedule(input);
+  assert(!decision.schedule);
+  assert(decision.reason ==
+         InumaPostCopyExactReplayScheduleReasonInvalidOwner);
+}
+
+static void TestPostCopyExactReplayFireAndConsumeContract(void) {
+  InumaPostCopyExactReplayFireInput fire = {
+      .enabled = true,
+      .owns_display_link = true,
+      .renderer_state_matches = true,
+      .texture_registered = true,
+      .slot_occupied = true,
+      .buffer_available = true,
+      .notification_issued = false,
+  };
+  InumaPostCopyExactReplayFireDecision fire_decision =
+      InumaPostCopyExactReplayEvaluateFire(fire);
+  assert(fire_decision.evaluated);
+  assert(fire_decision.state_current);
+  assert(fire_decision.fire);
+  assert(!fire_decision.stale);
+
+  fire.renderer_state_matches = false;
+  fire_decision = InumaPostCopyExactReplayEvaluateFire(fire);
+  assert(!fire_decision.fire);
+  assert(fire_decision.stale);
+
+  fire.renderer_state_matches = true;
+  fire.notification_issued = true;
+  fire_decision = InumaPostCopyExactReplayEvaluateFire(fire);
+  assert(!fire_decision.fire);
+  assert(fire_decision.stale);
+
+  InumaPostCopyExactReplayConsumeDecision consume =
+      InumaPostCopyExactReplayEvaluateConsume(
+          (InumaPostCopyExactReplayConsumeInput){
+              .enabled = true,
+              .slot_occupied = true,
+              .buffer_available = true,
+              .notification_issued = true,
+              .current_frame_available = true,
+          });
+  assert(consume.evaluated);
+  assert(consume.consume);
+  assert(consume.renotify_current);
+
+  consume = InumaPostCopyExactReplayEvaluateConsume(
+      (InumaPostCopyExactReplayConsumeInput){
+          .enabled = true,
+          .slot_occupied = true,
+          .buffer_available = true,
+          .notification_issued = false,
+          .current_frame_available = true,
+      });
+  assert(!consume.consume);
+  assert(!consume.renotify_current);
+}
+
 int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
@@ -339,6 +440,8 @@ int main(void) {
   TestRepeatBoundaryDefaultOffAndBaseGuard();
   TestDirectRetryExactAgeBoundary();
   TestDirectRetryDefaultOffAndStrictOwnership();
+  TestPostCopyExactReplayScheduleContract();
+  TestPostCopyExactReplayFireAndConsumeContract();
   InumaRunRendererQueueSimulationScenarios();
   return 0;
 }

@@ -22,6 +22,7 @@
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaPostCopyExactReplayPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
@@ -61,6 +62,14 @@ typedef NS_ENUM(uint8_t, InumaDirectFrameDisplayRetryOutcome) {
   InumaDirectFrameDisplayRetryOutcomeFired = 1,
   InumaDirectFrameDisplayRetryOutcomeStale = 2,
   InumaDirectFrameDisplayRetryOutcomeCancelled = 3,
+};
+
+typedef NS_ENUM(uint8_t, InumaPostCopyExactReplayOutcome) {
+  InumaPostCopyExactReplayOutcomePending = 0,
+  InumaPostCopyExactReplayOutcomeNotified = 1,
+  InumaPostCopyExactReplayOutcomeCopied = 2,
+  InumaPostCopyExactReplayOutcomeCancelled = 3,
+  InumaPostCopyExactReplayOutcomeStale = 4,
 };
 
 typedef struct {
@@ -123,6 +132,28 @@ typedef struct {
   uint64_t direct_frame_display_retry_link_invalidations;
   uint64_t direct_frame_display_retry_link_abandoned_creations;
   uint64_t direct_frame_display_retry_notifications;
+  uint64_t post_copy_exact_replay_schedules;
+  uint64_t post_copy_exact_replay_callbacks;
+  uint64_t post_copy_exact_replay_fires;
+  uint64_t post_copy_exact_replay_notifications;
+  uint64_t post_copy_exact_replay_copies;
+  uint64_t post_copy_exact_replay_current_notification_deferrals;
+  uint64_t post_copy_exact_replay_current_renotifications;
+  uint64_t post_copy_exact_replay_occupied_refusals;
+  uint64_t post_copy_exact_replay_invalid_owner_refusals;
+  uint64_t post_copy_exact_replay_recursive_copy_refusals;
+  uint64_t post_copy_exact_replay_stale_callbacks;
+  uint64_t post_copy_exact_replay_cancellations;
+  uint64_t post_copy_exact_replay_create_failures;
+  uint64_t post_copy_exact_replay_link_creations;
+  uint64_t post_copy_exact_replay_link_reuses;
+  uint64_t post_copy_exact_replay_link_arms;
+  uint64_t post_copy_exact_replay_link_pauses;
+  uint64_t post_copy_exact_replay_link_invalidations;
+  uint64_t post_copy_exact_replay_buffer_retains;
+  uint64_t post_copy_exact_replay_buffer_copy_releases;
+  uint64_t post_copy_exact_replay_buffer_cancel_releases;
+  uint64_t post_copy_exact_replay_buffer_lifecycle_releases;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
   uint64_t texture_notification_platform_turn_last_schedule_offset_ns;
@@ -222,6 +253,20 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   uint8_t direct_frame_display_retry_outcome_samples
       [kInumaTextureTraceCapacity];
+  uint64_t post_copy_exact_replay_schedule_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t post_copy_exact_replay_callback_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t post_copy_exact_replay_notification_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t post_copy_exact_replay_copy_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t post_copy_exact_replay_copy_age_samples
+      [kInumaTextureTraceCapacity];
+  int64_t post_copy_exact_replay_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t post_copy_exact_replay_outcome_samples
+      [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_deadline_offset_samples
       [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_fire_offset_samples[kInumaTextureTraceCapacity];
@@ -308,6 +353,7 @@ typedef struct {
   NSUInteger rescue_hold_preservation_count;
   NSUInteger rescue_display_link_event_count;
   NSUInteger direct_frame_display_retry_event_count;
+  NSUInteger post_copy_exact_replay_event_count;
   NSUInteger strict_hold_timer_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
@@ -482,6 +528,20 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_outcome_samples,
                          direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_schedule_offset_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_callback_offset_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_notification_offset_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_copy_offset_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_copy_age_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_frame_timestamp_ns_samples,
+                         post_copy_exact_replay_event_count);
+  INUMA_COPY_TRACE_ARRAY(post_copy_exact_replay_outcome_samples,
+                         post_copy_exact_replay_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_deadline_offset_samples,
                          strict_hold_timer_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_fire_offset_samples,
@@ -676,6 +736,15 @@ static bool InumaDirectFrameDisplayRetryEnabledFromEnvironment(
   return [value isEqualToString:@"enabled"];
 }
 
+static bool InumaPostCopyExactReplayEnabledFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_POST_COPY_EXACT_REPLAY"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  return [value isEqualToString:@"enabled"];
+}
+
 static InumaRenderQoSPolicy InumaRenderQoSPolicyFromEnvironment(
     NSDictionary<NSString *, NSString *> *env) {
   NSString *value =
@@ -818,10 +887,18 @@ static void InumaRecordRenderQoSObservationLocked(
                                      (uint64_t)rendererStateGeneration;
 - (void)inumaDirectFrameDisplayRetryDidFire:(CADisplayLink *)displayLink
     API_AVAILABLE(macos(14.0));
+- (void)inumaArmPostCopyExactReplayForTextureId:(int64_t)textureId
+                              frameTimestampNs:(int64_t)frameTimestampNs
+                       rendererStateGeneration:
+                           (uint64_t)rendererStateGeneration;
+- (void)inumaPostCopyExactReplayDidFire:(CADisplayLink *)displayLink
+    API_AVAILABLE(macos(14.0));
 - (void)inumaCancelTextureHoldTimerLocked;
 - (void)inumaCancelRescueDisplayLinkLocked;
 - (void)inumaCancelDirectFrameDisplayRetryLocked;
 - (void)inumaInvalidateDirectFrameDisplayRetryLinkLocked;
+- (void)inumaCancelPostCopyExactReplayLockedLifecycle:(bool)lifecycle;
+- (void)inumaInvalidatePostCopyExactReplayLinkLocked;
 - (void)inumaRetainCopiedBufferHoldLocked:(CVPixelBufferRef)pixelBuffer
                                  copiedAt:(uint64_t)copiedAt;
 - (void)inumaReleaseOldestCopiedBufferHoldLockedAt:(uint64_t)releasedAt
@@ -859,6 +936,7 @@ static void InumaRecordRenderQoSObservationLocked(
   bool _inumaCurrentFrameWasRescuePromoted;
   bool _inumaEmergencyGraceEnabled;
   bool _inumaDirectFrameDisplayRetryEnabled;
+  bool _inumaPostCopyExactReplayEnabled;
   bool _inumaEmergencyGraceBurstArmed;
   bool _inumaCurrentFrameRepeatDeferred;
   bool _inumaCurrentRepeatRetryFired;
@@ -882,7 +960,11 @@ static void InumaRecordRenderQoSObservationLocked(
   dispatch_source_t _inumaTextureHoldTimer;
   CADisplayLink *_inumaRescueDisplayLink;
   CADisplayLink *_inumaDirectFrameDisplayRetryLink;
+  id _inumaPostCopyExactReplayLink;
   bool _inumaDirectFrameDisplayRetryActive;
+  bool _inumaPostCopyExactReplayActive;
+  bool _inumaPostCopyExactReplayNotificationIssued;
+  CVPixelBufferRef _inumaPostCopyExactReplayBuffer;
   uint64_t _inumaTraceSnapshotCount;
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
@@ -894,6 +976,10 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs;
   uint64_t _inumaDirectFrameDisplayRetryScheduledMonotonicNs;
   NSUInteger _inumaDirectFrameDisplayRetryEventIndex;
+  int64_t _inumaPostCopyExactReplayFrameTimestampNs;
+  uint64_t _inumaPostCopyExactReplayRendererStateGeneration;
+  uint64_t _inumaPostCopyExactReplayOriginalCopyMonotonicNs;
+  NSUInteger _inumaPostCopyExactReplayEventIndex;
 #endif
 }
 
@@ -939,6 +1025,8 @@ static void InumaRecordRenderQoSObservationLocked(
         InumaEmergencyGraceEnabledFromEnvironment(environment);
     _inumaDirectFrameDisplayRetryEnabled =
         InumaDirectFrameDisplayRetryEnabledFromEnvironment(environment);
+    _inumaPostCopyExactReplayEnabled =
+        InumaPostCopyExactReplayEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
         InumaMaxQueuedTextureFramesFromEnvironment(environment);
     _inumaPendingTextureFrameHead = 0;
@@ -960,7 +1048,11 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
     _inumaDirectFrameDisplayRetryLink = nil;
+    _inumaPostCopyExactReplayLink = nil;
     _inumaDirectFrameDisplayRetryActive = false;
+    _inumaPostCopyExactReplayActive = false;
+    _inumaPostCopyExactReplayNotificationIssued = false;
+    _inumaPostCopyExactReplayBuffer = nil;
     _inumaTraceSnapshotCount = 0;
     _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
@@ -972,6 +1064,10 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
     _inumaDirectFrameDisplayRetryScheduledMonotonicNs = 0;
     _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
+    _inumaPostCopyExactReplayFrameTimestampNs = 0;
+    _inumaPostCopyExactReplayRendererStateGeneration = 0;
+    _inumaPostCopyExactReplayOriginalCopyMonotonicNs = 0;
+    _inumaPostCopyExactReplayEventIndex = NSNotFound;
     _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
@@ -1013,6 +1109,14 @@ static void InumaRecordRenderQoSObservationLocked(
   int64_t repeatedFrameTextureId = -1;
   int64_t repeatedDeferredFrameTimestampNs = 0;
   uint64_t repeatedRendererStateGeneration = 0;
+  bool armPostCopyExactReplay = false;
+  int64_t exactReplayTextureId = -1;
+  int64_t exactReplayFrameTimestampNs = 0;
+  uint64_t exactReplayRendererStateGeneration = 0;
+  bool renotifyCurrentAfterExactReplay = false;
+  int64_t exactReplayCurrentTextureId = -1;
+  int64_t exactReplayCurrentFrameTimestampNs = 0;
+  uint64_t exactReplayCurrentRendererStateGeneration = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -1024,13 +1128,64 @@ static void InumaRecordRenderQoSObservationLocked(
         &_inumaTrace.copy_lock_wait_count, locked - started,
         &_inumaTrace.sample_capacity_exhaustions);
   }
+  const InumaPostCopyExactReplayConsumeDecision exactReplayConsumeDecision =
+      InumaPostCopyExactReplayEvaluateConsume(
+          (InumaPostCopyExactReplayConsumeInput){
+              .enabled = _inumaPostCopyExactReplayEnabled,
+              .slot_occupied = _inumaPostCopyExactReplayBuffer != nil,
+              .buffer_available = _inumaPostCopyExactReplayBuffer != nil,
+              .notification_issued =
+                  _inumaPostCopyExactReplayNotificationIssued,
+              .current_frame_available = _frameAvailable,
+          });
+  if (exactReplayConsumeDecision.consume) {
+    const uint64_t copiedAt = InumaMonotonicNanoseconds();
+    const NSUInteger eventIndex = _inumaPostCopyExactReplayEventIndex;
+    const uint64_t originalCopyMonotonicNs =
+        _inumaPostCopyExactReplayOriginalCopyMonotonicNs;
+    buffer = CVBufferRetain(_inumaPostCopyExactReplayBuffer);
+    CVBufferRelease(_inumaPostCopyExactReplayBuffer);
+    _inumaPostCopyExactReplayBuffer = nil;
+    _inumaPostCopyExactReplayActive = false;
+    _inumaPostCopyExactReplayNotificationIssued = false;
+    _inumaPostCopyExactReplayFrameTimestampNs = 0;
+    _inumaPostCopyExactReplayRendererStateGeneration = 0;
+    _inumaPostCopyExactReplayOriginalCopyMonotonicNs = 0;
+    _inumaPostCopyExactReplayEventIndex = NSNotFound;
+    renotifyCurrentAfterExactReplay =
+        exactReplayConsumeDecision.renotify_current && _textureId != -1;
+    if (renotifyCurrentAfterExactReplay) {
+      exactReplayCurrentTextureId = _textureId;
+      exactReplayCurrentFrameTimestampNs = _inumaFrameTimestampNs;
+      exactReplayCurrentRendererStateGeneration = _inumaRendererStateGeneration;
+    }
+    if (_inumaTrace.enabled) {
+      _inumaTrace.copy_hits += 1;
+      _inumaTrace.post_copy_exact_replay_copies += 1;
+      _inumaTrace.post_copy_exact_replay_buffer_copy_releases += 1;
+      if (renotifyCurrentAfterExactReplay) {
+        _inumaTrace.post_copy_exact_replay_current_renotifications += 1;
+      }
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.post_copy_exact_replay_event_count) {
+        _inumaTrace.post_copy_exact_replay_copy_offset_samples[eventIndex] =
+            copiedAt - _inumaTraceStartedMonotonicNs;
+        _inumaTrace.post_copy_exact_replay_copy_age_samples[eventIndex] =
+            copiedAt >= originalCopyMonotonicNs
+                ? copiedAt - originalCopyMonotonicNs
+                : 0;
+        _inumaTrace.post_copy_exact_replay_outcome_samples[eventIndex] =
+            InumaPostCopyExactReplayOutcomeCopied;
+      }
+    }
+  }
   const uint64_t repeatCheckedAt = InumaMonotonicNanoseconds();
   // A rescue notification can reach Flutter's raster thread before Core
   // Animation has had one full minimum-tenure opportunity for the predecessor.
   // Return the retained predecessor once and leave the promoted frame pending;
   // the serialized platform-turn owner schedules its one permitted retry.
   const bool baseRepeatCandidate =
-      _inumaRasterRepeatGuardEnabled && _frameAvailable &&
+      buffer == nil && _inumaRasterRepeatGuardEnabled && _frameAvailable &&
       _inumaCurrentFrameWasRescuePromoted &&
       _inumaMinimumTextureHoldNs > 0 && _inumaLastCopyMonotonicNs > 0 &&
       repeatCheckedAt >= _inumaLastCopyMonotonicNs;
@@ -1129,6 +1284,9 @@ static void InumaRecordRenderQoSObservationLocked(
   }
 #endif
   if (buffer == nil && _pixelBufferRef != nil && _frameAvailable) {
+#if TARGET_OS_OSX
+    const int64_t copiedFrameTimestampNs = _inumaFrameTimestampNs;
+#endif
     buffer = CVBufferRetain(_pixelBufferRef);
 #if TARGET_OS_OSX
     [self inumaCancelDirectFrameDisplayRetryLocked];
@@ -1149,6 +1307,60 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
+    const InumaPostCopyExactReplayScheduleDecision exactReplayScheduleDecision =
+        InumaPostCopyExactReplayEvaluateSchedule(
+            (InumaPostCopyExactReplayScheduleInput){
+                .enabled = _inumaPostCopyExactReplayEnabled,
+                .new_source_copy = true,
+                .texture_registered = _textureId != -1,
+                .buffer_available = _pixelBufferRef != nil,
+                .frame_timestamp_valid = copiedFrameTimestampNs != 0,
+                .slot_occupied = _inumaPostCopyExactReplayBuffer != nil,
+            });
+    if (exactReplayScheduleDecision.schedule) {
+      _inumaPostCopyExactReplayBuffer = CVBufferRetain(_pixelBufferRef);
+      _inumaPostCopyExactReplayFrameTimestampNs = copiedFrameTimestampNs;
+      _inumaPostCopyExactReplayRendererStateGeneration =
+          _inumaRendererStateGeneration;
+      _inumaPostCopyExactReplayOriginalCopyMonotonicNs = copiedAt;
+      _inumaPostCopyExactReplayEventIndex = NSNotFound;
+      armPostCopyExactReplay = true;
+      exactReplayTextureId = _textureId;
+      exactReplayFrameTimestampNs = copiedFrameTimestampNs;
+      exactReplayRendererStateGeneration = _inumaRendererStateGeneration;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.post_copy_exact_replay_schedules += 1;
+        _inumaTrace.post_copy_exact_replay_buffer_retains += 1;
+        const NSUInteger eventIndex = InumaReserveTraceSample(
+            &_inumaTrace.post_copy_exact_replay_event_count,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (eventIndex != NSNotFound) {
+          _inumaTrace.post_copy_exact_replay_schedule_offset_samples
+              [eventIndex] = copiedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.post_copy_exact_replay_frame_timestamp_ns_samples
+              [eventIndex] = copiedFrameTimestampNs;
+          _inumaTrace.post_copy_exact_replay_outcome_samples[eventIndex] =
+              InumaPostCopyExactReplayOutcomePending;
+          _inumaPostCopyExactReplayEventIndex = eventIndex;
+        }
+      }
+    } else if (exactReplayScheduleDecision.evaluated &&
+               _inumaTrace.enabled) {
+      switch (exactReplayScheduleDecision.reason) {
+      case InumaPostCopyExactReplayScheduleReasonRecursiveCopy:
+        _inumaTrace.post_copy_exact_replay_recursive_copy_refusals += 1;
+        break;
+      case InumaPostCopyExactReplayScheduleReasonSlotOccupied:
+        _inumaTrace.post_copy_exact_replay_occupied_refusals += 1;
+        break;
+      case InumaPostCopyExactReplayScheduleReasonInvalidOwner:
+        _inumaTrace.post_copy_exact_replay_invalid_owner_refusals += 1;
+        break;
+      case InumaPostCopyExactReplayScheduleReasonNone:
+      case InumaPostCopyExactReplayScheduleReasonAccepted:
+        break;
+      }
+    }
     if (_inumaTrace.enabled) {
       _inumaTrace.copy_hits += 1;
       if (_inumaFrameReadyMonotonicNs > 0 &&
@@ -1224,6 +1436,14 @@ static void InumaRecordRenderQoSObservationLocked(
       promotedFrameTimestampNs = promoted.frame_timestamp_ns;
       promotedRendererStateGeneration = _inumaRendererStateGeneration;
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
+      if (notifyPromotedFrame &&
+          exactReplayScheduleDecision.defer_current_notification) {
+        notifyPromotedFrame = false;
+        if (_inumaTrace.enabled) {
+          _inumaTrace.post_copy_exact_replay_current_notification_deferrals +=
+              1;
+        }
+      }
       if (_inumaTrace.enabled) {
         _inumaTrace.queue_promotions += 1;
         if (InumaEmergencyGracePromotedFrameDrains(
@@ -1304,6 +1524,23 @@ static void InumaRecordRenderQoSObservationLocked(
                                         recordRescueBypass:false
                                   recordRasterRepeatRetry:true];
   }
+  if (armPostCopyExactReplay) {
+    [self inumaArmPostCopyExactReplayForTextureId:exactReplayTextureId
+                                frameTimestampNs:exactReplayFrameTimestampNs
+                         rendererStateGeneration:
+                             exactReplayRendererStateGeneration];
+  }
+  if (renotifyCurrentAfterExactReplay) {
+    [self inumaScheduleTextureNotificationForTextureId:
+              exactReplayCurrentTextureId
+                                          frameTimestampNs:
+                                              exactReplayCurrentFrameTimestampNs
+                                   rendererStateGeneration:
+                                       exactReplayCurrentRendererStateGeneration
+                                         bypassMinimumHold:false
+                                        recordRescueBypass:false
+                                  recordRasterRepeatRetry:false];
+  }
   if (notifyPromotedFrame) {
     if (_inumaRescueNotificationPhase ==
         InumaRescueNotificationPhasePlatformTurn) {
@@ -1348,6 +1585,8 @@ static void InumaRecordRenderQoSObservationLocked(
   [self inumaCancelRescueDisplayLinkLocked];
   [self inumaCancelDirectFrameDisplayRetryLocked];
   [self inumaInvalidateDirectFrameDisplayRetryLinkLocked];
+  [self inumaCancelPostCopyExactReplayLockedLifecycle:true];
+  [self inumaInvalidatePostCopyExactReplayLinkLocked];
 #endif
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
@@ -1388,6 +1627,7 @@ static void InumaRecordRenderQoSObservationLocked(
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaCancelDirectFrameDisplayRetryLocked];
+    [self inumaCancelPostCopyExactReplayLockedLifecycle:true];
     [self inumaClearPendingTextureFramesLocked];
     [self inumaReleaseAllCopiedBufferHoldsLockedAt:
               InumaMonotonicNanoseconds()];
@@ -1709,6 +1949,279 @@ static void InumaRecordRenderQoSObservationLocked(
   }
 }
 
+- (void)inumaArmPostCopyExactReplayForTextureId:(int64_t)textureId
+                              frameTimestampNs:(int64_t)frameTimestampNs
+                       rendererStateGeneration:
+                           (uint64_t)rendererStateGeneration {
+  __weak FlutterRTCVideoRenderer *weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    bool renotifyCurrent = false;
+    int64_t currentTextureId = -1;
+    int64_t currentFrameTimestampNs = 0;
+    uint64_t currentRendererStateGeneration = 0;
+    if (@available(macOS 14.0, *)) {
+      CADisplayLink *displayLink = nil;
+      bool createdDisplayLink = false;
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool replayMayStillBeCurrent =
+          strongSelf->_inumaPostCopyExactReplayEnabled &&
+          strongSelf->_inumaRendererStateGeneration ==
+              rendererStateGeneration &&
+          strongSelf->_textureId == textureId &&
+          strongSelf->_inumaPostCopyExactReplayBuffer != nil &&
+          strongSelf->_inumaPostCopyExactReplayFrameTimestampNs ==
+              frameTimestampNs &&
+          !strongSelf->_inumaPostCopyExactReplayActive &&
+          !strongSelf->_inumaPostCopyExactReplayNotificationIssued;
+      if (replayMayStillBeCurrent) {
+        displayLink = strongSelf->_inumaPostCopyExactReplayLink;
+      }
+      os_unfair_lock_unlock(&strongSelf->_lock);
+      if (!replayMayStillBeCurrent) {
+        return;
+      }
+
+      if (displayLink == nil) {
+        NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+        displayLink =
+            [screen displayLinkWithTarget:strongSelf
+                                selector:@selector(
+                                             inumaPostCopyExactReplayDidFire:)];
+        if (displayLink != nil) {
+          displayLink.paused = YES;
+          [displayLink addToRunLoop:NSRunLoop.mainRunLoop
+                           forMode:NSRunLoopCommonModes];
+          createdDisplayLink = true;
+        }
+      }
+
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool replayIsCurrent =
+          strongSelf->_inumaPostCopyExactReplayEnabled &&
+          displayLink != nil &&
+          strongSelf->_inumaRendererStateGeneration ==
+              rendererStateGeneration &&
+          strongSelf->_textureId == textureId &&
+          strongSelf->_inumaPostCopyExactReplayBuffer != nil &&
+          strongSelf->_inumaPostCopyExactReplayFrameTimestampNs ==
+              frameTimestampNs &&
+          !strongSelf->_inumaPostCopyExactReplayActive &&
+          !strongSelf->_inumaPostCopyExactReplayNotificationIssued &&
+          (strongSelf->_inumaPostCopyExactReplayLink == nil ||
+           strongSelf->_inumaPostCopyExactReplayLink == displayLink);
+      if (replayIsCurrent) {
+        if (strongSelf->_inumaPostCopyExactReplayLink == nil) {
+          strongSelf->_inumaPostCopyExactReplayLink = displayLink;
+          if (strongSelf->_inumaTrace.enabled) {
+            strongSelf->_inumaTrace.post_copy_exact_replay_link_creations += 1;
+          }
+        } else if (strongSelf->_inumaTrace.enabled) {
+          strongSelf->_inumaTrace.post_copy_exact_replay_link_reuses += 1;
+        }
+        strongSelf->_inumaPostCopyExactReplayActive = true;
+        if (strongSelf->_inumaTrace.enabled) {
+          strongSelf->_inumaTrace.post_copy_exact_replay_link_arms += 1;
+        }
+        displayLink.paused = NO;
+      } else {
+        const bool creationFailedForCurrentSlot =
+            displayLink == nil &&
+            strongSelf->_inumaPostCopyExactReplayEnabled &&
+            strongSelf->_inumaRendererStateGeneration ==
+                rendererStateGeneration &&
+            strongSelf->_textureId == textureId &&
+            strongSelf->_inumaPostCopyExactReplayBuffer != nil &&
+            strongSelf->_inumaPostCopyExactReplayFrameTimestampNs ==
+                frameTimestampNs;
+        if (creationFailedForCurrentSlot) {
+          if (strongSelf->_inumaTrace.enabled) {
+            strongSelf->_inumaTrace.post_copy_exact_replay_create_failures += 1;
+          }
+          [strongSelf inumaCancelPostCopyExactReplayLockedLifecycle:false];
+          renotifyCurrent = strongSelf->_frameAvailable &&
+                            strongSelf->_textureId != -1;
+          if (renotifyCurrent) {
+            currentTextureId = strongSelf->_textureId;
+            currentFrameTimestampNs = strongSelf->_inumaFrameTimestampNs;
+            currentRendererStateGeneration =
+                strongSelf->_inumaRendererStateGeneration;
+            if (strongSelf->_inumaTrace.enabled) {
+              strongSelf->_inumaTrace
+                  .post_copy_exact_replay_current_renotifications += 1;
+            }
+          }
+        }
+      }
+      os_unfair_lock_unlock(&strongSelf->_lock);
+      if (!replayIsCurrent && createdDisplayLink) {
+        [displayLink invalidate];
+      }
+    } else {
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool creationWasRequired =
+          strongSelf->_inumaPostCopyExactReplayEnabled &&
+          strongSelf->_inumaRendererStateGeneration ==
+              rendererStateGeneration &&
+          strongSelf->_textureId == textureId &&
+          strongSelf->_inumaPostCopyExactReplayBuffer != nil &&
+          strongSelf->_inumaPostCopyExactReplayFrameTimestampNs ==
+              frameTimestampNs;
+      if (creationWasRequired) {
+        if (strongSelf->_inumaTrace.enabled) {
+          strongSelf->_inumaTrace.post_copy_exact_replay_create_failures += 1;
+        }
+        [strongSelf inumaCancelPostCopyExactReplayLockedLifecycle:false];
+        renotifyCurrent = strongSelf->_frameAvailable &&
+                          strongSelf->_textureId != -1;
+        if (renotifyCurrent) {
+          currentTextureId = strongSelf->_textureId;
+          currentFrameTimestampNs = strongSelf->_inumaFrameTimestampNs;
+          currentRendererStateGeneration =
+              strongSelf->_inumaRendererStateGeneration;
+          if (strongSelf->_inumaTrace.enabled) {
+            strongSelf->_inumaTrace
+                .post_copy_exact_replay_current_renotifications += 1;
+          }
+        }
+      }
+      os_unfair_lock_unlock(&strongSelf->_lock);
+    }
+    if (renotifyCurrent) {
+      [strongSelf inumaScheduleTextureNotificationForTextureId:currentTextureId
+                                              frameTimestampNs:
+                                                  currentFrameTimestampNs
+                                       rendererStateGeneration:
+                                           currentRendererStateGeneration
+                                             bypassMinimumHold:false
+                                            recordRescueBypass:false
+                                      recordRasterRepeatRetry:false];
+    }
+  });
+}
+
+- (void)inumaPostCopyExactReplayDidFire:(CADisplayLink *)displayLink
+    API_AVAILABLE(macos(14.0)) {
+  const uint64_t checkedAt = InumaMonotonicNanoseconds();
+  int64_t textureId = -1;
+  int64_t frameTimestampNs = 0;
+  id<FlutterTextureRegistry> registry = nil;
+  bool ownsDisplayLink = false;
+  bool shouldFire = false;
+  bool renotifyCurrent = false;
+  int64_t currentTextureId = -1;
+  int64_t currentFrameTimestampNs = 0;
+  uint64_t currentRendererStateGeneration = 0;
+  os_unfair_lock_lock(&_lock);
+  ownsDisplayLink = _inumaPostCopyExactReplayLink == displayLink &&
+                    _inumaPostCopyExactReplayActive;
+  if (ownsDisplayLink) {
+    textureId = _textureId;
+    frameTimestampNs = _inumaPostCopyExactReplayFrameTimestampNs;
+    registry = _registry;
+    const NSUInteger eventIndex = _inumaPostCopyExactReplayEventIndex;
+    const InumaPostCopyExactReplayFireDecision decision =
+        InumaPostCopyExactReplayEvaluateFire(
+            (InumaPostCopyExactReplayFireInput){
+                .enabled = _inumaPostCopyExactReplayEnabled,
+                .owns_display_link = ownsDisplayLink,
+                .renderer_state_matches =
+                    _inumaRendererStateGeneration ==
+                    _inumaPostCopyExactReplayRendererStateGeneration,
+                .texture_registered = textureId != -1 && registry != nil,
+                .slot_occupied = _inumaPostCopyExactReplayBuffer != nil,
+                .buffer_available = _inumaPostCopyExactReplayBuffer != nil,
+                .notification_issued =
+                    _inumaPostCopyExactReplayNotificationIssued,
+            });
+    shouldFire = decision.fire;
+    _inumaPostCopyExactReplayActive = false;
+    [displayLink setPaused:YES];
+    if (_inumaTrace.enabled) {
+      _inumaTrace.post_copy_exact_replay_callbacks += 1;
+      _inumaTrace.post_copy_exact_replay_link_pauses += 1;
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.post_copy_exact_replay_event_count) {
+        _inumaTrace.post_copy_exact_replay_callback_offset_samples[eventIndex] =
+            checkedAt - _inumaTraceStartedMonotonicNs;
+      }
+    }
+    if (shouldFire) {
+      _inumaPostCopyExactReplayNotificationIssued = true;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.post_copy_exact_replay_fires += 1;
+        _inumaTrace.post_copy_exact_replay_notifications += 1;
+        if (eventIndex != NSNotFound &&
+            eventIndex < _inumaTrace.post_copy_exact_replay_event_count) {
+          _inumaTrace
+              .post_copy_exact_replay_notification_offset_samples[eventIndex] =
+              checkedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.post_copy_exact_replay_outcome_samples[eventIndex] =
+              InumaPostCopyExactReplayOutcomeNotified;
+        }
+        const NSUInteger notifyEventIndex = InumaReserveTraceSample(
+            &_inumaTrace.texture_notify_event_count,
+            &_inumaTrace.sample_capacity_exhaustions);
+        if (notifyEventIndex != NSNotFound) {
+          _inumaTrace.texture_notify_event_offset_samples[notifyEventIndex] =
+              checkedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.texture_notify_frame_timestamp_ns_samples
+              [notifyEventIndex] = frameTimestampNs;
+          _inumaTrace.texture_notify_scheduled_delay_samples[notifyEventIndex] =
+              0;
+          _inumaTrace.texture_notify_deadline_lateness_samples
+              [notifyEventIndex] = 0;
+        }
+      }
+    } else {
+      if (_inumaTrace.enabled) {
+        _inumaTrace.post_copy_exact_replay_stale_callbacks += 1;
+      }
+      [self inumaCancelPostCopyExactReplayLockedLifecycle:false];
+      if (_inumaTrace.enabled && eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.post_copy_exact_replay_event_count) {
+        _inumaTrace.post_copy_exact_replay_outcome_samples[eventIndex] =
+            InumaPostCopyExactReplayOutcomeStale;
+      }
+      renotifyCurrent = _frameAvailable && _textureId != -1;
+      if (renotifyCurrent) {
+        currentTextureId = _textureId;
+        currentFrameTimestampNs = _inumaFrameTimestampNs;
+        currentRendererStateGeneration = _inumaRendererStateGeneration;
+        if (_inumaTrace.enabled) {
+          _inumaTrace.post_copy_exact_replay_current_renotifications += 1;
+        }
+      }
+    }
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (shouldFire && registry != nil) {
+    const uint64_t notifyStarted = InumaMonotonicNanoseconds();
+    [registry textureFrameAvailable:textureId];
+    if (_inumaTrace.enabled) {
+      const uint64_t notifyEnded = InumaMonotonicNanoseconds();
+      os_unfair_lock_lock(&_lock);
+      InumaAppendTraceSample(
+          _inumaTrace.texture_notify_samples,
+          &_inumaTrace.texture_notify_count, notifyEnded - notifyStarted,
+          &_inumaTrace.sample_capacity_exhaustions);
+      os_unfair_lock_unlock(&_lock);
+    }
+  } else if (renotifyCurrent) {
+    [self inumaScheduleTextureNotificationForTextureId:currentTextureId
+                                      frameTimestampNs:
+                                          currentFrameTimestampNs
+                               rendererStateGeneration:
+                                   currentRendererStateGeneration
+                                     bypassMinimumHold:false
+                                    recordRescueBypass:false
+                              recordRasterRepeatRetry:false];
+  }
+}
+
 - (id<RTCI420Buffer>)correctRotation:(const id<RTCI420Buffer>)src
                         withRotation:(RTCVideoRotation)rotation {
   int rotated_width = src.width;
@@ -1946,11 +2459,19 @@ static void InumaRecordRenderQoSObservationLocked(
         CVBufferRelease(previousBuffer);
       }
       if (_textureId != -1) {
-        inumaShouldNotifyTexture = true;
-        inumaTextureIdToNotify = _textureId;
-        inumaFrameTimestampToNotify = frame.timeStampNs;
-        inumaRendererStateGenerationToNotify =
-            _inumaRendererStateGeneration;
+        if (_inumaPostCopyExactReplayEnabled &&
+            _inumaPostCopyExactReplayBuffer != nil) {
+          if (_inumaTrace.enabled) {
+            _inumaTrace
+                .post_copy_exact_replay_current_notification_deferrals += 1;
+          }
+        } else {
+          inumaShouldNotifyTexture = true;
+          inumaTextureIdToNotify = _textureId;
+          inumaFrameTimestampToNotify = frame.timeStampNs;
+          inumaRendererStateGenerationToNotify =
+              _inumaRendererStateGeneration;
+        }
       }
     } else if (framePrepared && queueHasCapacity) {
       const NSUInteger queueIndex =
@@ -2825,7 +3346,7 @@ static void InumaRecordRenderQoSObservationLocked(
   // Apple documents isPaused as thread-safe. Pause the reusable run-loop
   // object while ownership is locked so a later arm cannot be undone by a
   // delayed cancellation block. Invalidation is reserved for final dispose.
-  displayLink.paused = YES;
+  [displayLink setPaused:YES];
   if (_inumaTrace.enabled) {
     _inumaTrace.direct_frame_display_retry_cancellations += 1;
     _inumaTrace.direct_frame_display_retry_link_pauses += 1;
@@ -2847,6 +3368,61 @@ static void InumaRecordRenderQoSObservationLocked(
   displayLink.paused = YES;
   if (_inumaTrace.enabled) {
     _inumaTrace.direct_frame_display_retry_link_invalidations += 1;
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [displayLink invalidate];
+  });
+}
+
+- (void)inumaCancelPostCopyExactReplayLockedLifecycle:(bool)lifecycle {
+  id displayLink = _inumaPostCopyExactReplayLink;
+  const bool hadOwnedState = _inumaPostCopyExactReplayBuffer != nil ||
+                             _inumaPostCopyExactReplayActive ||
+                             _inumaPostCopyExactReplayNotificationIssued;
+  const NSUInteger eventIndex = _inumaPostCopyExactReplayEventIndex;
+  if (_inumaPostCopyExactReplayActive && displayLink != nil) {
+    [displayLink setPaused:YES];
+    if (_inumaTrace.enabled) {
+      _inumaTrace.post_copy_exact_replay_link_pauses += 1;
+    }
+  }
+  _inumaPostCopyExactReplayActive = false;
+  _inumaPostCopyExactReplayNotificationIssued = false;
+  if (_inumaPostCopyExactReplayBuffer != nil) {
+    CVBufferRelease(_inumaPostCopyExactReplayBuffer);
+    _inumaPostCopyExactReplayBuffer = nil;
+    if (_inumaTrace.enabled) {
+      if (lifecycle) {
+        _inumaTrace.post_copy_exact_replay_buffer_lifecycle_releases += 1;
+      } else {
+        _inumaTrace.post_copy_exact_replay_buffer_cancel_releases += 1;
+      }
+    }
+  }
+  _inumaPostCopyExactReplayFrameTimestampNs = 0;
+  _inumaPostCopyExactReplayRendererStateGeneration = 0;
+  _inumaPostCopyExactReplayOriginalCopyMonotonicNs = 0;
+  _inumaPostCopyExactReplayEventIndex = NSNotFound;
+  if (hadOwnedState && _inumaTrace.enabled) {
+    _inumaTrace.post_copy_exact_replay_cancellations += 1;
+    if (eventIndex != NSNotFound &&
+        eventIndex < _inumaTrace.post_copy_exact_replay_event_count) {
+      _inumaTrace.post_copy_exact_replay_outcome_samples[eventIndex] =
+          InumaPostCopyExactReplayOutcomeCancelled;
+    }
+  }
+}
+
+- (void)inumaInvalidatePostCopyExactReplayLinkLocked {
+  id displayLink = _inumaPostCopyExactReplayLink;
+  if (displayLink == nil) {
+    return;
+  }
+  _inumaPostCopyExactReplayActive = false;
+  _inumaPostCopyExactReplayLink = nil;
+  [displayLink setPaused:YES];
+  if (_inumaTrace.enabled) {
+    _inumaTrace.post_copy_exact_replay_link_invalidations += 1;
   }
   dispatch_async(dispatch_get_main_queue(), ^{
     [displayLink invalidate];
@@ -2983,6 +3559,9 @@ static void InumaRecordRenderQoSObservationLocked(
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
   bool directFrameDisplayRetryActive = false;
+  bool postCopyExactReplayActive = false;
+  bool postCopyExactReplaySlotOccupied = false;
+  bool postCopyExactReplayNotificationIssued = false;
   bool currentFrameRepeatDeferred = false;
   bool currentFrameRescuePromoted = false;
   bool currentRepeatRetryFired = false;
@@ -2992,9 +3571,11 @@ static void InumaRecordRenderQoSObservationLocked(
   int64_t currentFrameTimestampNs = 0;
   int64_t primaryFrameTimestampNs = 0;
   int64_t emergencyGraceFrameTimestampNs = 0;
+  int64_t postCopyExactReplayFrameTimestampNs = 0;
   uint64_t primaryFrameAgeNs = 0;
   uint64_t currentFrameAgeNs = 0;
   uint64_t emergencyGraceResidenceNs = 0;
+  uint64_t postCopyExactReplayAgeNs = 0;
   os_unfair_lock_lock(&_lock);
   const uint64_t traceSnapshotMonotonicNs = InumaMonotonicNanoseconds();
   InumaCopyTextureTraceLocked(snapshot, &_inumaTrace);
@@ -3003,6 +3584,20 @@ static void InumaRecordRenderQoSObservationLocked(
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
   directFrameDisplayRetryActive = _inumaDirectFrameDisplayRetryActive;
+  postCopyExactReplayActive = _inumaPostCopyExactReplayActive;
+  postCopyExactReplaySlotOccupied =
+      _inumaPostCopyExactReplayBuffer != nil;
+  postCopyExactReplayNotificationIssued =
+      _inumaPostCopyExactReplayNotificationIssued;
+  postCopyExactReplayFrameTimestampNs =
+      _inumaPostCopyExactReplayFrameTimestampNs;
+  if (_inumaPostCopyExactReplayOriginalCopyMonotonicNs > 0 &&
+      traceSnapshotMonotonicNs >=
+          _inumaPostCopyExactReplayOriginalCopyMonotonicNs) {
+    postCopyExactReplayAgeNs =
+        traceSnapshotMonotonicNs -
+        _inumaPostCopyExactReplayOriginalCopyMonotonicNs;
+  }
   currentFrameRepeatDeferred = _inumaCurrentFrameRepeatDeferred;
   currentFrameRescuePromoted = _inumaCurrentFrameWasRescuePromoted;
   currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
@@ -3057,7 +3652,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @38,
+    @"tail_diagnostics_version" : @41,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
@@ -3248,6 +3843,70 @@ static void InumaRecordRenderQoSObservationLocked(
          @"invalidate_only_at_dispose",
     @"direct_frame_display_retry_active_at_snapshot" :
         @(directFrameDisplayRetryActive),
+    @"post_copy_exact_replay_enabled" :
+        @(_inumaPostCopyExactReplayEnabled),
+    @"post_copy_exact_replay_default" : @"disabled",
+    @"post_copy_exact_replay_contract" :
+        @"one_retained_exact_buffer_slot_replayed_once_after_original_raster_"
+         @"copy_by_one_reusable_paused_display_link_without_current_buffer_"
+         @"substitution_or_recursive_replay",
+    @"post_copy_exact_replay_schedules" :
+        @(snapshot->post_copy_exact_replay_schedules),
+    @"post_copy_exact_replay_callbacks" :
+        @(snapshot->post_copy_exact_replay_callbacks),
+    @"post_copy_exact_replay_fires" :
+        @(snapshot->post_copy_exact_replay_fires),
+    @"post_copy_exact_replay_notifications" :
+        @(snapshot->post_copy_exact_replay_notifications),
+    @"post_copy_exact_replay_copies" :
+        @(snapshot->post_copy_exact_replay_copies),
+    @"post_copy_exact_replay_current_notification_deferrals" :
+        @(snapshot->post_copy_exact_replay_current_notification_deferrals),
+    @"post_copy_exact_replay_current_renotifications" :
+        @(snapshot->post_copy_exact_replay_current_renotifications),
+    @"post_copy_exact_replay_occupied_refusals" :
+        @(snapshot->post_copy_exact_replay_occupied_refusals),
+    @"post_copy_exact_replay_invalid_owner_refusals" :
+        @(snapshot->post_copy_exact_replay_invalid_owner_refusals),
+    @"post_copy_exact_replay_recursive_copy_refusals" :
+        @(snapshot->post_copy_exact_replay_recursive_copy_refusals),
+    @"post_copy_exact_replay_stale_callbacks" :
+        @(snapshot->post_copy_exact_replay_stale_callbacks),
+    @"post_copy_exact_replay_cancellations" :
+        @(snapshot->post_copy_exact_replay_cancellations),
+    @"post_copy_exact_replay_create_failures" :
+        @(snapshot->post_copy_exact_replay_create_failures),
+    @"post_copy_exact_replay_link_creations" :
+        @(snapshot->post_copy_exact_replay_link_creations),
+    @"post_copy_exact_replay_link_reuses" :
+        @(snapshot->post_copy_exact_replay_link_reuses),
+    @"post_copy_exact_replay_link_arms" :
+        @(snapshot->post_copy_exact_replay_link_arms),
+    @"post_copy_exact_replay_link_pauses" :
+        @(snapshot->post_copy_exact_replay_link_pauses),
+    @"post_copy_exact_replay_link_invalidations" :
+        @(snapshot->post_copy_exact_replay_link_invalidations),
+    @"post_copy_exact_replay_buffer_retains" :
+        @(snapshot->post_copy_exact_replay_buffer_retains),
+    @"post_copy_exact_replay_buffer_copy_releases" :
+        @(snapshot->post_copy_exact_replay_buffer_copy_releases),
+    @"post_copy_exact_replay_buffer_cancel_releases" :
+        @(snapshot->post_copy_exact_replay_buffer_cancel_releases),
+    @"post_copy_exact_replay_buffer_lifecycle_releases" :
+        @(snapshot->post_copy_exact_replay_buffer_lifecycle_releases),
+    @"post_copy_exact_replay_link_lifecycle" :
+        @"renderer_owned_create_once_add_once_pause_between_bounded_arms_"
+         @"invalidate_only_at_dispose",
+    @"post_copy_exact_replay_active_at_snapshot" :
+        @(postCopyExactReplayActive),
+    @"post_copy_exact_replay_slot_occupied_at_snapshot" :
+        @(postCopyExactReplaySlotOccupied),
+    @"post_copy_exact_replay_notification_issued_at_snapshot" :
+        @(postCopyExactReplayNotificationIssued),
+    @"post_copy_exact_replay_frame_timestamp_ns_at_snapshot" :
+        @(postCopyExactReplayFrameTimestampNs),
+    @"post_copy_exact_replay_age_ns_at_snapshot" :
+        @(postCopyExactReplayAgeNs),
     @"texture_notification_platform_turn_schedules" :
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
@@ -3408,6 +4067,35 @@ static void InumaRecordRenderQoSObservationLocked(
       @"1" : @"fired",
       @"2" : @"stale",
       @"3" : @"cancelled_after_first_copy",
+    },
+    @"post_copy_exact_replay_schedule_offset_ns" : InumaTraceSampleArray(
+        snapshot->post_copy_exact_replay_schedule_offset_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_callback_offset_ns" : InumaTraceSampleArray(
+        snapshot->post_copy_exact_replay_callback_offset_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_notification_offset_ns" : InumaTraceSampleArray(
+        snapshot->post_copy_exact_replay_notification_offset_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_copy_offset_ns" : InumaTraceSampleArray(
+        snapshot->post_copy_exact_replay_copy_offset_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_copy_age_ns" : InumaTraceSampleArray(
+        snapshot->post_copy_exact_replay_copy_age_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->post_copy_exact_replay_frame_timestamp_ns_samples,
+            snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_outcome" : InumaTraceByteSampleArray(
+        snapshot->post_copy_exact_replay_outcome_samples,
+        snapshot->post_copy_exact_replay_event_count),
+    @"post_copy_exact_replay_outcome_codes" : @{
+      @"0" : @"pending_at_snapshot",
+      @"1" : @"notification_issued",
+      @"2" : @"exact_buffer_copied",
+      @"3" : @"cancelled",
+      @"4" : @"stale_callback",
     },
     @"strict_hold_timer_deadline_offset_ns" : InumaTraceSampleArray(
         snapshot->strict_hold_timer_deadline_offset_samples,
@@ -3598,6 +4286,7 @@ static void InumaRecordRenderQoSObservationLocked(
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaCancelDirectFrameDisplayRetryLocked];
+    [self inumaCancelPostCopyExactReplayLockedLifecycle:true];
     [self inumaClearPendingTextureFramesLocked];
     [self inumaReleaseAllCopiedBufferHoldsLockedAt:
               InumaMonotonicNanoseconds()];

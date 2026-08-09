@@ -1,6 +1,7 @@
 // Exercises bounded renderer pressure, lifecycle, and cadence state scenarios.
 
 #include "InumaRendererQueueSimulation.h"
+#include "InumaPostCopyExactReplayPolicy.h"
 
 #include <assert.h>
 
@@ -776,6 +777,157 @@ static void TestThirtyHzSourceSixtyHzDisplayPhaseAndJitterSweep(void) {
   }
 }
 
+typedef struct {
+  uint64_t slot_frame;
+  uint64_t current_frame;
+  uint64_t replayed_frames[8];
+  size_t replayed_count;
+  bool notification_issued;
+  uint64_t schedules;
+  uint64_t fires;
+  uint64_t consumes;
+  uint64_t current_renotifications;
+  uint64_t recursive_refusals;
+  uint64_t occupied_refusals;
+  uint64_t lifecycle_releases;
+} ExactReplaySimulation;
+
+static void ExactReplayScheduleNewCopy(ExactReplaySimulation *simulation,
+                                       uint64_t copied_frame) {
+  const InumaPostCopyExactReplayScheduleDecision decision =
+      InumaPostCopyExactReplayEvaluateSchedule(
+          (InumaPostCopyExactReplayScheduleInput){
+              .enabled = true,
+              .new_source_copy = true,
+              .texture_registered = true,
+              .buffer_available = copied_frame > 0,
+              .frame_timestamp_valid = copied_frame > 0,
+              .slot_occupied = simulation->slot_frame != 0,
+          });
+  if (decision.reason ==
+      InumaPostCopyExactReplayScheduleReasonSlotOccupied) {
+    simulation->occupied_refusals += 1;
+  }
+  if (!decision.schedule) {
+    return;
+  }
+  assert(simulation->slot_frame == 0);
+  simulation->slot_frame = copied_frame;
+  simulation->notification_issued = false;
+  simulation->schedules += 1;
+}
+
+static void ExactReplayRejectRecursiveCopy(
+    ExactReplaySimulation *simulation) {
+  const InumaPostCopyExactReplayScheduleDecision decision =
+      InumaPostCopyExactReplayEvaluateSchedule(
+          (InumaPostCopyExactReplayScheduleInput){
+              .enabled = true,
+              .new_source_copy = false,
+              .texture_registered = true,
+              .buffer_available = true,
+              .frame_timestamp_valid = true,
+              .slot_occupied = simulation->slot_frame != 0,
+          });
+  assert(!decision.schedule);
+  assert(decision.reason ==
+         InumaPostCopyExactReplayScheduleReasonRecursiveCopy);
+  simulation->recursive_refusals += 1;
+}
+
+static void ExactReplayFire(ExactReplaySimulation *simulation) {
+  const InumaPostCopyExactReplayFireDecision decision =
+      InumaPostCopyExactReplayEvaluateFire(
+          (InumaPostCopyExactReplayFireInput){
+              .enabled = true,
+              .owns_display_link = true,
+              .renderer_state_matches = true,
+              .texture_registered = true,
+              .slot_occupied = simulation->slot_frame != 0,
+              .buffer_available = simulation->slot_frame != 0,
+              .notification_issued = simulation->notification_issued,
+          });
+  assert(decision.fire);
+  simulation->notification_issued = true;
+  simulation->fires += 1;
+}
+
+static void ExactReplayConsume(ExactReplaySimulation *simulation) {
+  const InumaPostCopyExactReplayConsumeDecision decision =
+      InumaPostCopyExactReplayEvaluateConsume(
+          (InumaPostCopyExactReplayConsumeInput){
+              .enabled = true,
+              .slot_occupied = simulation->slot_frame != 0,
+              .buffer_available = simulation->slot_frame != 0,
+              .notification_issued = simulation->notification_issued,
+              .current_frame_available = simulation->current_frame != 0,
+          });
+  assert(decision.consume);
+  assert(simulation->replayed_count < 8);
+  simulation->replayed_frames[simulation->replayed_count++] =
+      simulation->slot_frame;
+  simulation->slot_frame = 0;
+  simulation->notification_issued = false;
+  simulation->consumes += 1;
+  if (decision.renotify_current) {
+    simulation->current_renotifications += 1;
+  }
+  ExactReplayRejectRecursiveCopy(simulation);
+}
+
+static void ExactReplayLifecycleClear(ExactReplaySimulation *simulation) {
+  if (simulation->slot_frame != 0) {
+    simulation->slot_frame = 0;
+    simulation->notification_issued = false;
+    simulation->lifecycle_releases += 1;
+  }
+}
+
+static void TestPostCopyExactReplayM120DirectAndPromotedSequences(void) {
+  ExactReplaySimulation direct = {0};
+  ExactReplayScheduleNewCopy(&direct, 222);
+  direct.current_frame = 223;
+  ExactReplayFire(&direct);
+  ExactReplayConsume(&direct);
+  assert(direct.replayed_count == 1);
+  assert(direct.replayed_frames[0] == 222);
+  assert(direct.current_renotifications == 1);
+  assert(direct.recursive_refusals == 1);
+  assert(direct.schedules == direct.fires);
+  assert(direct.fires == direct.consumes);
+
+  ExactReplaySimulation promoted = {0};
+  ExactReplayScheduleNewCopy(&promoted, 4512);
+  promoted.current_frame = 4513;
+  // M120's promoted 4513 first requested a predecessor repeat. The exact slot
+  // remains owned by 4512 and cannot be overwritten by that extra raster
+  // request or by a second schedule attempt.
+  ExactReplayScheduleNewCopy(&promoted, 4513);
+  assert(promoted.slot_frame == 4512);
+  assert(promoted.occupied_refusals == 1);
+  ExactReplayFire(&promoted);
+  ExactReplayConsume(&promoted);
+  assert(promoted.replayed_frames[0] == 4512);
+  assert(promoted.current_renotifications == 1);
+
+  promoted.current_frame = 4514;
+  ExactReplayScheduleNewCopy(&promoted, 4513);
+  ExactReplayFire(&promoted);
+  ExactReplayConsume(&promoted);
+  assert(promoted.replayed_count == 2);
+  assert(promoted.replayed_frames[1] == 4513);
+  assert(promoted.schedules == promoted.fires);
+  assert(promoted.fires == promoted.consumes);
+
+  ExactReplaySimulation lifecycle = {0};
+  ExactReplayScheduleNewCopy(&lifecycle, 4985);
+  ExactReplayLifecycleClear(&lifecycle);
+  assert(lifecycle.slot_frame == 0);
+  assert(lifecycle.lifecycle_releases == 1);
+  assert(lifecycle.fires == 0);
+  assert(lifecycle.consumes == 0);
+}
+
 
 void InumaRunRendererQueueSimulationScenarios(void) {
   TestRetryUsesRasterCadenceAndPreservesGraceReadyTime();
@@ -793,4 +945,5 @@ void InumaRunRendererQueueSimulationScenarios(void) {
   TestTwoGenerationCopiedBufferHoldLifetime();
   TestSyntheticSchedulerStallStateProofThirtyHzSourceSixtyHzDisplay();
   TestThirtyHzSourceSixtyHzDisplayPhaseAndJitterSweep();
+  TestPostCopyExactReplayM120DirectAndPromotedSequences();
 }
