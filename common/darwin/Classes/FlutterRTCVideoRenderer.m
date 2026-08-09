@@ -83,6 +83,10 @@ typedef struct {
 typedef struct {
   bool enabled;
   uint64_t render_frames;
+  uint64_t render_qos_sync_handoffs;
+  uint64_t render_qos_work_item_creation_failures;
+  uint64_t render_qos_owned_queue_entries;
+  uint64_t render_qos_calling_thread_entries;
   uint64_t accepted_frames;
   uint64_t coalesced_frames;
   uint64_t copy_calls;
@@ -897,6 +901,9 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaWriteTextureTrace;
 @end
 
+static const void *kInumaRenderQoSQueueSpecificKey =
+    &kInumaRenderQoSQueueSpecificKey;
+
 static const void *InumaMainRunLoopNotificationRetainOwner(
     const void *info) {
   return (__bridge_retained const void *)((__bridge id)info);
@@ -961,6 +968,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   NSUInteger _inumaCopiedBufferHoldHead;
   NSUInteger _inumaCopiedBufferHoldCount;
   CVPixelBufferPoolRef _inumaStockBGRAPixelBufferPool;
+  dispatch_queue_t _inumaRenderQoSQueue;
   dispatch_queue_t _inumaTraceQueue;
   dispatch_source_t _inumaTraceTimer;
   dispatch_source_t _inumaTextureHoldTimer;
@@ -1018,6 +1026,17 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaPixelMode = InumaPixelModeFromEnvironment(environment);
     _inumaRenderQoSPolicy =
         InumaRenderQoSPolicyFromEnvironment(environment);
+    if (_inumaRenderQoSPolicy == InumaRenderQoSPolicyUserInteractive) {
+      dispatch_queue_attr_t renderQoSQueueAttributes =
+          dispatch_queue_attr_make_with_qos_class(
+              DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+      _inumaRenderQoSQueue = dispatch_queue_create(
+          "dev.inuma.flutter-webrtc.render-user-interactive",
+          renderQoSQueueAttributes);
+      dispatch_queue_set_specific(
+          _inumaRenderQoSQueue, kInumaRenderQoSQueueSpecificKey,
+          (__bridge void *)self, NULL);
+    }
     _inumaRescueNotificationPhase =
         InumaRescueNotificationPhaseFromEnvironment(environment);
     _inumaMinimumTextureHoldNs =
@@ -1932,6 +1951,37 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
 - (void)renderFrame:(RTCVideoFrame *)frame {
 
 #if TARGET_OS_OSX
+  const bool inumaExecutingOnOwnedRenderQoSQueue =
+      _inumaRenderQoSQueue != nil &&
+      dispatch_get_specific(kInumaRenderQoSQueueSpecificKey) ==
+          (__bridge void *)self;
+  if (_inumaRenderQoSPolicy == InumaRenderQoSPolicyUserInteractive &&
+      _inumaRenderQoSQueue != nil &&
+      !inumaExecutingOnOwnedRenderQoSQueue) {
+    if (_inumaTrace.enabled) {
+      os_unfair_lock_lock(&_lock);
+      _inumaTrace.render_qos_sync_handoffs += 1;
+      os_unfair_lock_unlock(&_lock);
+    }
+    // VideoToolbox owns its asynchronous decompression callback thread. Keep
+    // that system callback unmodified and synchronously hand the frame to one
+    // app-owned serial queue. The explicit work-item class is enforced even
+    // when dispatch_sync borrows the caller thread. A synchronous handoff
+    // admits exactly one frame and cannot accumulate a catch-up queue.
+    dispatch_block_t renderWork = dispatch_block_create_with_qos_class(
+        DISPATCH_BLOCK_ENFORCE_QOS_CLASS, QOS_CLASS_USER_INTERACTIVE, 0, ^{
+      [self renderFrame:frame];
+    });
+    if (renderWork != nil) {
+      dispatch_sync(_inumaRenderQoSQueue, renderWork);
+      return;
+    }
+    if (_inumaTrace.enabled) {
+      os_unfair_lock_lock(&_lock);
+      _inumaTrace.render_qos_work_item_creation_failures += 1;
+      os_unfair_lock_unlock(&_lock);
+    }
+  }
   const InumaRenderQoSObservation inumaRenderQoS =
       InumaObserveRenderQoS(_inumaRenderQoSPolicy);
   const uint64_t started =
@@ -1947,6 +1997,11 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
   if (_inumaTrace.enabled) {
     InumaRecordRenderQoSObservationLocked(&_inumaTrace, inumaRenderQoS);
+    if (inumaExecutingOnOwnedRenderQoSQueue) {
+      _inumaTrace.render_qos_owned_queue_entries += 1;
+    } else {
+      _inumaTrace.render_qos_calling_thread_entries += 1;
+    }
     _inumaTrace.render_frames += 1;
     if (_inumaTraceStartedMonotonicNs > 0 &&
         locked >= _inumaTraceStartedMonotonicNs) {
@@ -3537,7 +3592,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @43,
+    @"tail_diagnostics_version" : @44,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"prerenderer_smoothing_configuration_contract" :
         @"explicit_objc_to_native_peer_configuration",
@@ -3799,6 +3854,24 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               ->texture_notification_platform_turn_last_fire_offset_ns),
     @"render_qos_policy" :
         InumaRenderQoSPolicyName(_inumaRenderQoSPolicy),
+    @"render_qos_execution_owner" :
+        _inumaRenderQoSQueue != nil ? @"owned_serial_enforced_qos_sync"
+                                    : @"calling_thread",
+    @"render_qos_queue_configured" : @(_inumaRenderQoSQueue != nil),
+    @"render_qos_queue_class" :
+        _inumaRenderQoSQueue != nil &&
+                dispatch_queue_get_qos_class(_inumaRenderQoSQueue, NULL) ==
+                    QOS_CLASS_USER_INTERACTIVE
+            ? @"user_interactive"
+            : @"not_user_interactive",
+    @"render_qos_sync_handoffs" :
+        @(snapshot->render_qos_sync_handoffs),
+    @"render_qos_work_item_creation_failures" :
+        @(snapshot->render_qos_work_item_creation_failures),
+    @"render_qos_owned_queue_entries" :
+        @(snapshot->render_qos_owned_queue_entries),
+    @"render_qos_calling_thread_entries" :
+        @(snapshot->render_qos_calling_thread_entries),
     @"render_qos_observations" :
         @(snapshot->render_qos_observations),
     @"render_qos_apply_attempts" :
