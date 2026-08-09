@@ -59,6 +59,7 @@ static void TestDefaultOffIsQuiescent(void) {
 static void TestStrictRefusalReasons(void) {
   InumaEmergencyGracePolicyInput input = EligibleInput();
   input.current_frame_repeat_deferred = false;
+  input.current_frame_awaits_copy = false;
   assert(InumaEmergencyGraceEvaluate(input).refuse_reason ==
          InumaEmergencyGraceRefuseReasonNotRepeatDeferred);
 
@@ -78,7 +79,7 @@ static void TestStrictRefusalReasons(void) {
          InumaEmergencyGraceRefuseReasonQueueShape);
 }
 
-static void TestOverdueRescueCopyClosesPreRepeatArrivalRace(void) {
+static void TestAnyOverdueCurrentCopyClosesPreRepeatArrivalRace(void) {
   InumaEmergencyGracePolicyInput input = EligibleInput();
   input.current_frame_repeat_deferred = false;
   input.current_frame_rescue_promoted = true;
@@ -104,7 +105,10 @@ static void TestOverdueRescueCopyClosesPreRepeatArrivalRace(void) {
   assert(!InumaEmergencyGraceEvaluate(input).eligible);
   input.current_frame_awaits_copy = true;
   input.current_frame_rescue_promoted = false;
-  assert(!InumaEmergencyGraceEvaluate(input).eligible);
+  decision = InumaEmergencyGraceEvaluate(input);
+  assert(decision.current_overdue_copy);
+  assert(decision.eligible);
+  assert(decision.admitted_via_overdue_copy);
 }
 
 static void TestNoRefusalWithoutFullPrimaryQueue(void) {
@@ -216,7 +220,7 @@ int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
   TestStrictRefusalReasons();
-  TestOverdueRescueCopyClosesPreRepeatArrivalRace();
+  TestAnyOverdueCurrentCopyClosesPreRepeatArrivalRace();
   TestNoRefusalWithoutFullPrimaryQueue();
   TestBoundedFifoActions();
   TestThreeFrameQueueGraceSequence();

@@ -241,6 +241,14 @@ typedef struct {
   int64_t emergency_grace_refuse_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
   uint8_t emergency_grace_refuse_reason_samples[kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_refuse_current_age_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_refuse_primary_age_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t emergency_grace_refuse_current_rescue_promoted_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t emergency_grace_refuse_current_awaits_copy_samples
+      [kInumaTextureTraceCapacity];
   NSUInteger conversion_count;
   NSUInteger render_lock_wait_count;
   NSUInteger copy_lock_wait_count;
@@ -312,7 +320,9 @@ static NSUInteger InumaReserveTraceSample(NSUInteger *count,
 
 static void InumaRecordEmergencyGraceRefusalLocked(
     InumaTextureTrace *trace, uint64_t eventAt, uint64_t traceStartedAt,
-    int64_t frameTimestampNs, InumaEmergencyGraceRefuseReason reason) {
+    int64_t frameTimestampNs, InumaEmergencyGraceRefuseReason reason,
+    uint64_t currentAgeNs, uint64_t primaryAgeNs,
+    bool currentRescuePromoted, bool currentAwaitsCopy) {
   trace->emergency_grace_refuses += 1;
   switch (reason) {
   case InumaEmergencyGraceRefuseReasonNotRepeatDeferred:
@@ -346,6 +356,14 @@ static void InumaRecordEmergencyGraceRefusalLocked(
   trace->emergency_grace_refuse_frame_timestamp_ns_samples[refuseIndex] =
       frameTimestampNs;
   trace->emergency_grace_refuse_reason_samples[refuseIndex] = reason;
+  trace->emergency_grace_refuse_current_age_samples[refuseIndex] =
+      currentAgeNs;
+  trace->emergency_grace_refuse_primary_age_samples[refuseIndex] =
+      primaryAgeNs;
+  trace->emergency_grace_refuse_current_rescue_promoted_samples[refuseIndex] =
+      currentRescuePromoted ? 1 : 0;
+  trace->emergency_grace_refuse_current_awaits_copy_samples[refuseIndex] =
+      currentAwaitsCopy ? 1 : 0;
 }
 
 static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
@@ -479,6 +497,15 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
   INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_frame_timestamp_ns_samples,
                          emergency_grace_refuse_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_reason_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_current_age_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_primary_age_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      emergency_grace_refuse_current_rescue_promoted_samples,
+      emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_current_awaits_copy_samples,
                          emergency_grace_refuse_event_count);
 
 #undef INUMA_COPY_TRACE_ARRAY
@@ -1467,6 +1494,18 @@ static void InumaRecordRenderQoSObservationLocked(
   const bool emergencyGraceStateEligible = emergencyGraceDecision.eligible;
   const InumaEmergencyGraceRefuseReason emergencyGraceRefuseReason =
       emergencyGraceDecision.refuse_reason;
+  const uint64_t emergencyGraceCurrentAge =
+      _inumaFrameReadyMonotonicNs > 0 &&
+              emergencyGraceCheckedAt >= _inumaFrameReadyMonotonicNs
+          ? emergencyGraceCheckedAt - _inumaFrameReadyMonotonicNs
+          : 0;
+  const uint64_t emergencyGracePrimaryAge =
+      emergencyGracePrimary.ready_monotonic_ns > 0 &&
+              emergencyGraceCheckedAt >=
+                  emergencyGracePrimary.ready_monotonic_ns
+          ? emergencyGraceCheckedAt -
+                emergencyGracePrimary.ready_monotonic_ns
+          : 0;
   if (_inumaTrace.enabled && emergencyGraceStateEligible) {
     _inumaTrace.emergency_grace_eligible_frames += 1;
     _inumaTrace.emergency_grace_would_have_overflows += 1;
@@ -1594,7 +1633,9 @@ static void InumaRecordRenderQoSObservationLocked(
       InumaRecordEmergencyGraceRefusalLocked(
           &_inumaTrace, emergencyGraceCheckedAt,
           _inumaTraceStartedMonotonicNs, frame.timeStampNs,
-          InumaEmergencyGraceRefuseReasonConversionFailure);
+          InumaEmergencyGraceRefuseReasonConversionFailure,
+          emergencyGraceCurrentAge, emergencyGracePrimaryAge,
+          _inumaCurrentFrameWasRescuePromoted, _frameAvailable);
       if (inumaRenderEventIndex != NSNotFound) {
         _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 2;
       }
@@ -1621,7 +1662,9 @@ static void InumaRecordRenderQoSObservationLocked(
             emergencyGraceRefuseReason ==
                     InumaEmergencyGraceRefuseReasonNone
                 ? InumaEmergencyGraceRefuseReasonQueueShape
-                : emergencyGraceRefuseReason);
+                : emergencyGraceRefuseReason,
+            emergencyGraceCurrentAge, emergencyGracePrimaryAge,
+            _inumaCurrentFrameWasRescuePromoted, _frameAvailable);
       }
     }
     if (inumaRenderEventIndex != NSNotFound) {
@@ -2537,7 +2580,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @32,
+    @"tail_diagnostics_version" : @33,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -2603,8 +2646,8 @@ static void InumaRecordRenderQoSObservationLocked(
     @"emergency_grace_enabled" : @(_inumaEmergencyGraceEnabled),
     @"emergency_grace_default" : @"disabled",
     @"emergency_grace_contract" :
-        @"one_native_frame_only_when_current_repeat_deferred_or_rescue_"
-         @"promoted_copy_overdue_primary_full_primary_age_at_least_minimum_"
+        @"one_native_frame_only_when_current_repeat_deferred_or_current_"
+         @"copy_overdue_primary_full_primary_age_at_least_minimum_"
          @"hold_and_grace_empty_then_fifo_shift",
     @"emergency_grace_sustained_backlog_contract" :
         @"second_arrival_while_grace_occupied_is_refused",
@@ -2947,6 +2990,21 @@ static void InumaRecordRenderQoSObservationLocked(
     @"emergency_grace_refuse_reason" : InumaTraceByteSampleArray(
         snapshot->emergency_grace_refuse_reason_samples,
         snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_current_age_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_refuse_current_age_samples,
+        snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_primary_age_ns" : InumaTraceSampleArray(
+        snapshot->emergency_grace_refuse_primary_age_samples,
+        snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_current_rescue_promoted" :
+        InumaTraceByteSampleArray(
+            snapshot
+                ->emergency_grace_refuse_current_rescue_promoted_samples,
+            snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_current_awaits_copy" :
+        InumaTraceByteSampleArray(
+            snapshot->emergency_grace_refuse_current_awaits_copy_samples,
+            snapshot->emergency_grace_refuse_event_count),
     @"emergency_grace_refuse_reason_codes" : @{
       @"0" : @"none",
       @"1" : @"queue_shape",

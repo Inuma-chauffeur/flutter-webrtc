@@ -50,7 +50,7 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
       input.checked_monotonic_ns - input.primary_ready_monotonic_ns >=
           input.minimum_hold_ns;
   const bool current_overdue_copy =
-      input.current_frame_rescue_promoted && input.current_frame_awaits_copy &&
+      input.current_frame_awaits_copy &&
       input.current_ready_monotonic_ns > 0 && input.minimum_hold_ns > 0 &&
       input.checked_monotonic_ns >= input.current_ready_monotonic_ns &&
       input.checked_monotonic_ns - input.current_ready_monotonic_ns >=
