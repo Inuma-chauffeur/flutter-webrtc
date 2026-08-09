@@ -270,8 +270,8 @@ static InumaDirectFrameDisplayRetryPolicyInput DirectRetryInput(void) {
       .frame_timestamp_matches = true,
       .predecessor_hold_satisfied = true,
       .frame_ready_monotonic_ns = 100000000,
-      .checked_monotonic_ns = 116000000,
-      .minimum_retry_age_ns = 16000000,
+      .checked_monotonic_ns = 119000000,
+      .minimum_retry_age_ns = 19000000,
   };
 }
 

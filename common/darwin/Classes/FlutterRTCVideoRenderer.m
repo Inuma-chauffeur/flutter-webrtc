@@ -33,7 +33,11 @@ enum {
   kInumaStockBGRAPoolMinimumBufferCount = 4,
   kInumaPendingTextureFrameCapacity = 1,
   kInumaCopiedBufferHoldCapacity = 2,
-  kInumaDirectFrameDisplayRetryMinimumAgeNs = 16 * NSEC_PER_MSEC,
+  // Use the same lower bound as the retained predecessor.  The 16 ms v37
+  // boundary fired on ordinary one-refresh jitter and created a second raster
+  // feedback phase; 19 ms leaves that common path to the normal notification
+  // while preserving a bounded retry for the measured overdue tail.
+  kInumaDirectFrameDisplayRetryMinimumAgeNs = 19 * NSEC_PER_MSEC,
 };
 
 typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
@@ -138,6 +142,8 @@ typedef struct {
   uint64_t strict_hold_timer_fired;
   uint64_t strict_hold_timer_cancelled;
   uint64_t strict_hold_timer_create_failures;
+  uint64_t strict_hold_timer_coalesced_existing;
+  uint64_t strict_hold_timer_stale_before_ownership;
   uint64_t stock_bgra_pool_create_failures;
   uint64_t stock_bgra_pool_buffer_requests;
   uint64_t stock_bgra_pool_buffer_failures;
@@ -2499,11 +2505,12 @@ static void InumaRecordRenderQoSObservationLocked(
     __block NSUInteger timerEventIndex = NSNotFound;
     const uint64_t deadlineNs = enqueuedAt + scheduledDelayNs;
     os_unfair_lock_lock(&_lock);
-    const bool timerIsCurrent =
+    const bool timerFrameIsCurrent =
         _inumaRendererStateGeneration == rendererStateGeneration &&
         _textureId == textureId && _frameAvailable &&
-        _inumaFrameTimestampNs == frameTimestampNs &&
-        _inumaTextureHoldTimer == nil;
+        _inumaFrameTimestampNs == frameTimestampNs;
+    const bool timerSlotAvailable = _inumaTextureHoldTimer == nil;
+    const bool timerIsCurrent = timerFrameIsCurrent && timerSlotAvailable;
     if (timerIsCurrent) {
       _inumaTextureHoldTimer = timer;
       if (_inumaTrace.enabled) {
@@ -2521,6 +2528,12 @@ static void InumaRecordRenderQoSObservationLocked(
                 [timerEventIndex] = frameTimestampNs;
           }
         }
+      }
+    } else if (_inumaTrace.enabled) {
+      if (timerFrameIsCurrent && !timerSlotAvailable) {
+        _inumaTrace.strict_hold_timer_coalesced_existing += 1;
+      } else {
+        _inumaTrace.strict_hold_timer_stale_before_ownership += 1;
       }
     }
     os_unfair_lock_unlock(&_lock);
@@ -3043,7 +3056,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @36,
+    @"tail_diagnostics_version" : @37,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -3197,7 +3210,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"direct_frame_display_retry_default" : @"disabled",
     @"direct_frame_display_retry_contract" :
         @"one_reusable_paused_display_link_retry_only_while_same_direct_frame_"
-         @"awaits_first_copy_after_16ms_age_and_predecessor_minimum_hold",
+         @"awaits_first_copy_after_19ms_age_and_predecessor_minimum_hold",
     @"direct_frame_display_retry_minimum_age_ns" :
         @(kInumaDirectFrameDisplayRetryMinimumAgeNs),
     @"direct_frame_display_retry_schedules" :
@@ -3278,6 +3291,10 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->strict_hold_timer_cancelled),
     @"strict_hold_timer_create_failures" :
         @(snapshot->strict_hold_timer_create_failures),
+    @"strict_hold_timer_coalesced_existing" :
+        @(snapshot->strict_hold_timer_coalesced_existing),
+    @"strict_hold_timer_stale_before_ownership" :
+        @(snapshot->strict_hold_timer_stale_before_ownership),
     @"strict_hold_timer_active_at_snapshot" :
         @(textureHoldTimerActive),
     @"stock_bgra_pool_minimum_buffer_count" :
