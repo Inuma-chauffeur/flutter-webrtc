@@ -51,6 +51,7 @@ typedef struct {
   bool current_from_grace;
   bool current_repeat_retry_fired;
   bool primary_from_grace;
+  bool grace_burst_armed;
   bool retry_schedule_requested;
   bool retry_platform_turn_pending;
   bool retry_dispatched;
@@ -82,6 +83,8 @@ typedef struct {
   uint64_t grace_drains;
   uint64_t grace_clears;
   uint64_t grace_occupied_refusals;
+  uint64_t grace_burst_not_rearmed_refusals;
+  uint64_t grace_burst_rearms;
   uint64_t coalesced_frames;
   uint64_t overflows;
   uint64_t copied_buffer_holds;

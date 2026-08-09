@@ -225,6 +225,15 @@ void SimulateSourceArrivalWithIdentity(
   assert(renderer_identity > 0);
   assert(ready_ns > 0);
   RecordSourceFrame(simulation, frame);
+  const bool primary_queue_full =
+      simulation->current_available && simulation->primary_frame != 0;
+  if (!simulation->grace_burst_armed &&
+      InumaEmergencyGraceShouldRearm(
+          simulation->grace_frame != 0, primary_queue_full,
+          simulation->primary_frame != 0 ? 1 : 0)) {
+    simulation->grace_burst_armed = true;
+    simulation->grace_burst_rearms += 1;
+  }
   if (!simulation->current_available) {
     RecordAcceptedFrame(simulation, frame);
     simulation->current_frame = frame;
@@ -264,6 +273,7 @@ void SimulateSourceArrivalWithIdentity(
             .checked_monotonic_ns = ready_ns,
             .minimum_hold_ns = kMinimumHoldNs,
             .grace_occupied = simulation->grace_frame != 0,
+            .burst_armed = simulation->grace_burst_armed,
         });
     if (decision.eligible) {
       assert(simulation->grace_frame == 0);
@@ -271,12 +281,16 @@ void SimulateSourceArrivalWithIdentity(
       simulation->grace_frame = frame;
       simulation->grace_renderer_identity = renderer_identity;
       simulation->grace_ready_ns = ready_ns;
+      simulation->grace_burst_armed = false;
       simulation->grace_admits += 1;
       AssertUniqueOwnership(simulation);
       return;
     }
     if (decision.refuse_reason == InumaEmergencyGraceRefuseReasonOccupied) {
       simulation->grace_occupied_refusals += 1;
+    } else if (decision.refuse_reason ==
+               InumaEmergencyGraceRefuseReasonBurstNotRearmed) {
+      simulation->grace_burst_not_rearmed_refusals += 1;
     }
     simulation->overflows += 1;
   }
@@ -587,6 +601,7 @@ void SimulateLifecycleClear(RepeatBoundarySimulation *simulation,
   simulation->grace_renderer_identity = 0;
   simulation->grace_ready_ns = 0;
   simulation->renderer_state_generation += 1;
+  simulation->grace_burst_armed = true;
   switch (kind) {
   case InumaRendererLifecycleTrackChange:
     simulation->lifecycle_track_changes += 1;
@@ -657,4 +672,5 @@ void InitializeSimulation(RepeatBoundarySimulation *simulation) {
   *simulation = (RepeatBoundarySimulation){0};
   simulation->texture_registered = true;
   simulation->renderer_state_generation = 1;
+  simulation->grace_burst_armed = true;
 }

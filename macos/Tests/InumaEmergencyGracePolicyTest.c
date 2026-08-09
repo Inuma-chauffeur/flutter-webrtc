@@ -25,6 +25,7 @@ static InumaEmergencyGracePolicyInput EligibleInput(void) {
       .checked_monotonic_ns = 100000000 + kMinimumHoldNs,
       .minimum_hold_ns = kMinimumHoldNs,
       .grace_occupied = false,
+      .burst_armed = true,
   };
 }
 
@@ -77,6 +78,11 @@ static void TestStrictRefusalReasons(void) {
   input.maximum_queued_frames = 2;
   assert(InumaEmergencyGraceEvaluate(input).refuse_reason ==
          InumaEmergencyGraceRefuseReasonQueueShape);
+
+  input = EligibleInput();
+  input.burst_armed = false;
+  assert(InumaEmergencyGraceEvaluate(input).refuse_reason ==
+         InumaEmergencyGraceRefuseReasonBurstNotRearmed);
 }
 
 static void TestAnyOverdueCurrentCopyClosesPreRepeatArrivalRace(void) {
@@ -128,6 +134,10 @@ static void TestBoundedFifoActions(void) {
   assert(!InumaEmergencyGraceShouldShift(true, 2));
   assert(InumaEmergencyGracePromotedFrameDrains(true));
   assert(!InumaEmergencyGracePromotedFrameDrains(false));
+  assert(InumaEmergencyGraceShouldRearm(false, false, 0));
+  assert(!InumaEmergencyGraceShouldRearm(true, false, 0));
+  assert(!InumaEmergencyGraceShouldRearm(false, true, 1));
+  assert(!InumaEmergencyGraceShouldRearm(false, false, 1));
 }
 
 static void TestThreeFrameQueueGraceSequence(void) {
@@ -138,12 +148,45 @@ static void TestThreeFrameQueueGraceSequence(void) {
 
   InumaEmergencyGracePolicyInput second = EligibleInput();
   second.grace_occupied = true;
+  second.burst_armed = false;
   const InumaEmergencyGracePolicyDecision refused =
       InumaEmergencyGraceEvaluate(second);
   assert(!refused.eligible);
   assert(refused.refuse_reason == InumaEmergencyGraceRefuseReasonOccupied);
   assert(InumaEmergencyGraceShouldShift(true, 0));
   assert(InumaEmergencyGracePromotedFrameDrains(true));
+
+  second.grace_occupied = false;
+  const InumaEmergencyGracePolicyDecision burstRefused =
+      InumaEmergencyGraceEvaluate(second);
+  assert(!burstRefused.eligible);
+  assert(burstRefused.refuse_reason ==
+         InumaEmergencyGraceRefuseReasonBurstNotRearmed);
+
+  second.burst_armed = InumaEmergencyGraceShouldRearm(false, false, 0);
+  assert(InumaEmergencyGraceEvaluate(second).eligible);
+}
+
+static void TestSustainedBurstCannotReopenAfterDrain(void) {
+  InumaEmergencyGracePolicyInput input = EligibleInput();
+  assert(InumaEmergencyGraceEvaluate(input).eligible);
+
+  // Model a completed shift/drain while the primary queue is still full.
+  // Releasing physical occupancy alone must not rearm the burst latch.
+  input.grace_occupied = false;
+  input.burst_armed = false;
+  for (size_t arrival = 0; arrival < 100; arrival++) {
+    const InumaEmergencyGracePolicyDecision decision =
+        InumaEmergencyGraceEvaluate(input);
+    assert(!decision.eligible);
+    assert(decision.refuse_reason ==
+           InumaEmergencyGraceRefuseReasonBurstNotRearmed);
+  }
+
+  assert(!InumaEmergencyGraceShouldRearm(false, true, 1));
+  input.burst_armed = InumaEmergencyGraceShouldRearm(false, false, 0);
+  assert(input.burst_armed);
+  assert(InumaEmergencyGraceEvaluate(input).eligible);
 }
 
 static InumaRepeatBoundaryPolicyDecision RepeatBoundaryAt(uint64_t tenure_ns) {
@@ -224,6 +267,7 @@ int main(void) {
   TestNoRefusalWithoutFullPrimaryQueue();
   TestBoundedFifoActions();
   TestThreeFrameQueueGraceSequence();
+  TestSustainedBurstCannotReopenAfterDrain();
   TestRepeatOnlyBoundary();
   TestRepeatBoundaryDefaultOffAndBaseGuard();
   InumaRunRendererQueueSimulationScenarios();

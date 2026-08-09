@@ -147,6 +147,8 @@ typedef struct {
   uint64_t emergency_grace_refuse_occupied;
   uint64_t emergency_grace_refuse_queue_shape;
   uint64_t emergency_grace_refuse_conversion_failure;
+  uint64_t emergency_grace_refuse_burst_not_rearmed;
+  uint64_t emergency_grace_burst_rearms;
   uint64_t sample_capacity_exhaustions;
   uint64_t conversion_samples[kInumaTextureTraceCapacity];
   uint64_t render_lock_wait_samples[kInumaTextureTraceCapacity];
@@ -336,6 +338,9 @@ static void InumaRecordEmergencyGraceRefusalLocked(
     break;
   case InumaEmergencyGraceRefuseReasonConversionFailure:
     trace->emergency_grace_refuse_conversion_failure += 1;
+    break;
+  case InumaEmergencyGraceRefuseReasonBurstNotRearmed:
+    trace->emergency_grace_refuse_burst_not_rearmed += 1;
     break;
   case InumaEmergencyGraceRefuseReasonQueueShape:
   case InumaEmergencyGraceRefuseReasonNone:
@@ -779,6 +784,7 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaRasterRepeatBoundaryNs;
   bool _inumaCurrentFrameWasRescuePromoted;
   bool _inumaEmergencyGraceEnabled;
+  bool _inumaEmergencyGraceBurstArmed;
   bool _inumaCurrentFrameRepeatDeferred;
   bool _inumaCurrentRepeatRetryFired;
   NSUInteger _inumaMaxQueuedTextureFrames;
@@ -863,6 +869,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
     _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
+    _inumaEmergencyGraceBurstArmed = true;
     _inumaFrameTimestampNs = 0;
     _inumaCopiedBufferHoldHead = 0;
     _inumaCopiedBufferHoldCount = 0;
@@ -1464,6 +1471,17 @@ static void InumaRecordRenderQoSObservationLocked(
   const bool primaryQueueFull =
       _frameAvailable && _inumaMaxQueuedTextureFrames > 0 &&
       _inumaPendingTextureFrameCount >= _inumaMaxQueuedTextureFrames;
+  const bool emergencyGraceOccupied =
+      _inumaEmergencyGraceTextureFrame.pixel_buffer != nil;
+  if (!_inumaEmergencyGraceBurstArmed &&
+      InumaEmergencyGraceShouldRearm(
+          emergencyGraceOccupied, primaryQueueFull,
+          _inumaPendingTextureFrameCount)) {
+    _inumaEmergencyGraceBurstArmed = true;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.emergency_grace_burst_rearms += 1;
+    }
+  }
   const uint64_t emergencyGraceCheckedAt =
       _inumaEmergencyGraceEnabled ? InumaMonotonicNanoseconds() : 0;
   const bool emergencyGraceQueueShape =
@@ -1488,8 +1506,8 @@ static void InumaRecordRenderQoSObservationLocked(
               emergencyGracePrimary.ready_monotonic_ns,
           .checked_monotonic_ns = emergencyGraceCheckedAt,
           .minimum_hold_ns = _inumaMinimumTextureHoldNs,
-          .grace_occupied =
-              _inumaEmergencyGraceTextureFrame.pixel_buffer != nil,
+          .grace_occupied = emergencyGraceOccupied,
+          .burst_armed = _inumaEmergencyGraceBurstArmed,
       });
   const bool emergencyGraceStateEligible = emergencyGraceDecision.eligible;
   const InumaEmergencyGraceRefuseReason emergencyGraceRefuseReason =
@@ -1575,6 +1593,7 @@ static void InumaRecordRenderQoSObservationLocked(
         }
       }
     } else if (framePrepared && emergencyGraceStateEligible) {
+      _inumaEmergencyGraceBurstArmed = false;
       _inumaEmergencyGraceTextureFrame =
           (InumaPendingTextureFrame){
               .pixel_buffer = preparedBuffer,
@@ -2468,6 +2487,7 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaTrace.emergency_grace_clears += 1;
     }
   }
+  _inumaEmergencyGraceBurstArmed = true;
 }
 
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size {
@@ -2513,6 +2533,7 @@ static void InumaRecordRenderQoSObservationLocked(
   bool currentFrameRescuePromoted = false;
   bool currentRepeatRetryFired = false;
   bool emergencyGraceOccupied = false;
+  bool emergencyGraceBurstArmed = false;
   bool primaryFromEmergencyGrace = false;
   int64_t currentFrameTimestampNs = 0;
   int64_t primaryFrameTimestampNs = 0;
@@ -2549,6 +2570,7 @@ static void InumaRecordRenderQoSObservationLocked(
   }
   emergencyGraceOccupied =
       _inumaEmergencyGraceTextureFrame.pixel_buffer != nil;
+  emergencyGraceBurstArmed = _inumaEmergencyGraceBurstArmed;
   if (emergencyGraceOccupied) {
     emergencyGraceFrameTimestampNs =
         _inumaEmergencyGraceTextureFrame.frame_timestamp_ns;
@@ -2580,7 +2602,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @33,
+    @"tail_diagnostics_version" : @34,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -2648,9 +2670,10 @@ static void InumaRecordRenderQoSObservationLocked(
     @"emergency_grace_contract" :
         @"one_native_frame_only_when_current_repeat_deferred_or_current_"
          @"copy_overdue_primary_full_primary_age_at_least_minimum_"
-         @"hold_and_grace_empty_then_fifo_shift",
+         @"hold_grace_empty_and_burst_armed_then_fifo_shift",
     @"emergency_grace_sustained_backlog_contract" :
-        @"second_arrival_while_grace_occupied_is_refused",
+        @"one_admission_per_overload_burst_rearm_only_after_normal_empty_"
+         @"primary_queue_shape",
     @"emergency_grace_eligible_frames" :
         @(snapshot->emergency_grace_eligible_frames),
     @"emergency_grace_admits" : @(snapshot->emergency_grace_admits),
@@ -2676,7 +2699,13 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->emergency_grace_refuse_queue_shape),
     @"emergency_grace_refuse_conversion_failure" :
         @(snapshot->emergency_grace_refuse_conversion_failure),
+    @"emergency_grace_refuse_burst_not_rearmed" :
+        @(snapshot->emergency_grace_refuse_burst_not_rearmed),
+    @"emergency_grace_burst_rearms" :
+        @(snapshot->emergency_grace_burst_rearms),
     @"emergency_grace_occupied_at_snapshot" : @(emergencyGraceOccupied),
+    @"emergency_grace_burst_armed_at_snapshot" :
+        @(emergencyGraceBurstArmed),
     @"current_frame_repeat_deferred_at_snapshot" :
         @(currentFrameRepeatDeferred),
     @"current_frame_rescue_promoted_at_snapshot" :
@@ -3012,6 +3041,7 @@ static void InumaRecordRenderQoSObservationLocked(
       @"3" : @"primary_below_minimum_age",
       @"4" : @"occupied",
       @"5" : @"conversion_failure",
+      @"6" : @"burst_not_rearmed",
     },
   };
   NSError *error = nil;

@@ -154,7 +154,7 @@ static void TestOverdueNormalCopyAdmitsArrivalBeforeRepeatCallback(void) {
   DrainSimulation(&simulation, &raster_ns, kDisplaySixtyHzNs);
   AssertCopiedSequence(&simulation, 4);
 }
-static void TestChainedEmergencyGraceSequence(void) {
+static void TestSustainedBurstCannotChainEmergencyGrace(void) {
   RepeatBoundarySimulation simulation;
   InitializeSimulation(&simulation);
   const uint64_t repeat_ns = BuildThroughGraceAdmission(&simulation);
@@ -166,23 +166,39 @@ static void TestChainedEmergencyGraceSequence(void) {
   ScheduleAndDispatchRetry(&simulation, raster_ns + 1);
   const uint64_t chained_ready_ns = raster_ns + 100000;
   SimulateSourceArrival(&simulation, 6, chained_ready_ns);
-  AssertSlots(&simulation, 4, 5, 6);
-  assert(simulation.grace_admits == 2);
+  AssertSlots(&simulation, 4, 5, 0);
+  assert(simulation.grace_admits == 1);
+  assert(simulation.grace_burst_not_rearmed_refusals == 1);
+  assert(simulation.overflows == 1);
 
   SimulatePlatformTurnFire(&simulation, raster_ns + 1000000);
   raster_ns += kDisplaySixtyHzNs;
   assert(!SimulateRasterCopy(&simulation, raster_ns));
-  AssertSlots(&simulation, 5, 6, 0);
-  assert(simulation.primary_from_grace);
-  assert(simulation.primary_ready_ns == chained_ready_ns);
-  assert(simulation.grace_shifts == 2);
+  AssertSlots(&simulation, 5, 0, 0);
+  assert(simulation.current_from_grace);
+  assert(simulation.grace_shifts == 1);
   assert(simulation.grace_drains == 1);
 
   DrainSimulation(&simulation, &raster_ns, kDisplaySixtyHzNs);
-  AssertCopiedSequence(&simulation, 6);
-  assert(simulation.grace_admits == 2);
-  assert(simulation.grace_shifts == 2);
-  assert(simulation.grace_drains == 2);
+  AssertTerminal(&simulation);
+  assert(simulation.copied_count == 5);
+  for (size_t index = 0; index < simulation.copied_count; index++) {
+    assert(simulation.copied_frames[index] == index + 1);
+  }
+  assert(!ContainsFrame(simulation.copied_frames, simulation.copied_count, 6));
+  assert(simulation.grace_admits == 1);
+  assert(simulation.grace_shifts == 1);
+  assert(simulation.grace_drains == 1);
+
+  // A later ordinary empty-primary arrival explicitly rearms the next burst.
+  const uint64_t recovered_ready_ns = raster_ns + kSourceThirtyHzNs;
+  SimulateSourceArrival(&simulation, 7, recovered_ready_ns);
+  assert(simulation.grace_burst_armed);
+  assert(simulation.grace_burst_rearms == 1);
+  assert(!SimulateRasterCopy(
+      &simulation, recovered_ready_ns + kDisplaySixtyHzNs));
+  AssertTerminal(&simulation);
+  assert(ContainsFrame(simulation.copied_frames, simulation.copied_count, 7));
 }
 static void TestGraceOccupiedRefusesWithoutOverwrite(void) {
   RepeatBoundarySimulation simulation;
@@ -765,7 +781,7 @@ void InumaRunRendererQueueSimulationScenarios(void) {
   TestRetryUsesRasterCadenceAndPreservesGraceReadyTime();
   TestOverduePromotedCopyAdmitsArrivalBeforeRepeatCallback();
   TestOverdueNormalCopyAdmitsArrivalBeforeRepeatCallback();
-  TestChainedEmergencyGraceSequence();
+  TestSustainedBurstCannotChainEmergencyGrace();
   TestGraceOccupiedRefusesWithoutOverwrite();
   TestLifecycleClearClassifications();
   TestSameIdentityABAPredispatchInvalidations();

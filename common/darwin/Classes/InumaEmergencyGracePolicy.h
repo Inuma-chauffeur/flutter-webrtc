@@ -12,6 +12,7 @@ typedef enum {
   InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge = 3,
   InumaEmergencyGraceRefuseReasonOccupied = 4,
   InumaEmergencyGraceRefuseReasonConversionFailure = 5,
+  InumaEmergencyGraceRefuseReasonBurstNotRearmed = 6,
 } InumaEmergencyGraceRefuseReason;
 
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
   uint64_t checked_monotonic_ns;
   uint64_t minimum_hold_ns;
   bool grace_occupied;
+  bool burst_armed;
 } InumaEmergencyGracePolicyInput;
 
 typedef struct {
@@ -57,7 +59,8 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
           input.minimum_hold_ns;
   const bool current_protection_valid =
       input.current_frame_repeat_deferred || current_overdue_copy;
-  const bool eligible = input.enabled && queue_shape_valid &&
+  const bool eligible = input.enabled && input.burst_armed &&
+                        queue_shape_valid &&
                         current_protection_valid &&
                         primary_old_enough && !input.grace_occupied;
   InumaEmergencyGraceRefuseReason refuse_reason =
@@ -65,6 +68,8 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
   if (input.enabled && input.primary_queue_full && !eligible) {
     if (input.grace_occupied) {
       refuse_reason = InumaEmergencyGraceRefuseReasonOccupied;
+    } else if (!input.burst_armed) {
+      refuse_reason = InumaEmergencyGraceRefuseReasonBurstNotRearmed;
     } else if (!queue_shape_valid) {
       refuse_reason = InumaEmergencyGraceRefuseReasonQueueShape;
     } else if (!current_protection_valid) {
@@ -83,6 +88,17 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
                                   !input.current_frame_repeat_deferred,
       .refuse_reason = refuse_reason,
   };
+}
+
+static inline bool InumaEmergencyGraceShouldRearm(
+    bool grace_occupied, bool primary_queue_full,
+    size_t pending_frame_count) {
+  // One grace frame may be admitted per overload burst.  The burst cannot
+  // rearm merely because a copy shifted or drained that frame: the renderer
+  // must first observe the ordinary queue shape again.  This prevents the
+  // emergency slot from turning a transient depth-one queue into a sustained
+  // depth-two pipeline.
+  return !grace_occupied && !primary_queue_full && pending_frame_count == 0;
 }
 
 static inline bool InumaEmergencyGraceShouldShift(bool grace_occupied,
