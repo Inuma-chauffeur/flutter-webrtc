@@ -20,6 +20,9 @@ typedef struct {
   size_t maximum_queued_frames;
   size_t pending_frame_count;
   bool current_frame_repeat_deferred;
+  bool current_frame_rescue_promoted;
+  bool current_frame_awaits_copy;
+  uint64_t current_ready_monotonic_ns;
   uint64_t primary_ready_monotonic_ns;
   uint64_t checked_monotonic_ns;
   uint64_t minimum_hold_ns;
@@ -28,8 +31,11 @@ typedef struct {
 
 typedef struct {
   bool queue_shape_valid;
+  bool current_overdue_copy;
+  bool current_protection_valid;
   bool primary_old_enough;
   bool eligible;
+  bool admitted_via_overdue_copy;
   InumaEmergencyGraceRefuseReason refuse_reason;
 } InumaEmergencyGracePolicyDecision;
 
@@ -43,8 +49,16 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
       input.checked_monotonic_ns >= input.primary_ready_monotonic_ns &&
       input.checked_monotonic_ns - input.primary_ready_monotonic_ns >=
           input.minimum_hold_ns;
+  const bool current_overdue_copy =
+      input.current_frame_rescue_promoted && input.current_frame_awaits_copy &&
+      input.current_ready_monotonic_ns > 0 && input.minimum_hold_ns > 0 &&
+      input.checked_monotonic_ns >= input.current_ready_monotonic_ns &&
+      input.checked_monotonic_ns - input.current_ready_monotonic_ns >=
+          input.minimum_hold_ns;
+  const bool current_protection_valid =
+      input.current_frame_repeat_deferred || current_overdue_copy;
   const bool eligible = input.enabled && queue_shape_valid &&
-                        input.current_frame_repeat_deferred &&
+                        current_protection_valid &&
                         primary_old_enough && !input.grace_occupied;
   InumaEmergencyGraceRefuseReason refuse_reason =
       InumaEmergencyGraceRefuseReasonNone;
@@ -53,7 +67,7 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
       refuse_reason = InumaEmergencyGraceRefuseReasonOccupied;
     } else if (!queue_shape_valid) {
       refuse_reason = InumaEmergencyGraceRefuseReasonQueueShape;
-    } else if (!input.current_frame_repeat_deferred) {
+    } else if (!current_protection_valid) {
       refuse_reason = InumaEmergencyGraceRefuseReasonNotRepeatDeferred;
     } else {
       refuse_reason = InumaEmergencyGraceRefuseReasonPrimaryBelowMinimumAge;
@@ -61,8 +75,12 @@ InumaEmergencyGraceEvaluate(InumaEmergencyGracePolicyInput input) {
   }
   return (InumaEmergencyGracePolicyDecision){
       .queue_shape_valid = queue_shape_valid,
+      .current_overdue_copy = current_overdue_copy,
+      .current_protection_valid = current_protection_valid,
       .primary_old_enough = primary_old_enough,
       .eligible = eligible,
+      .admitted_via_overdue_copy = eligible && current_overdue_copy &&
+                                  !input.current_frame_repeat_deferred,
       .refuse_reason = refuse_reason,
   };
 }

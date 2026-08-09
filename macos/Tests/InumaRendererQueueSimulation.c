@@ -256,6 +256,10 @@ void SimulateSourceArrivalWithIdentity(
             .pending_frame_count = 1,
             .current_frame_repeat_deferred =
                 simulation->current_repeat_deferred,
+            .current_frame_rescue_promoted =
+                simulation->current_rescue_promoted,
+            .current_frame_awaits_copy = simulation->current_available,
+            .current_ready_monotonic_ns = simulation->current_ready_ns,
             .primary_ready_monotonic_ns = simulation->primary_ready_ns,
             .checked_monotonic_ns = ready_ns,
             .minimum_hold_ns = kMinimumHoldNs,

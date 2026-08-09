@@ -18,6 +18,9 @@ static InumaEmergencyGracePolicyInput EligibleInput(void) {
       .maximum_queued_frames = 1,
       .pending_frame_count = 1,
       .current_frame_repeat_deferred = true,
+      .current_frame_rescue_promoted = false,
+      .current_frame_awaits_copy = true,
+      .current_ready_monotonic_ns = 90000000,
       .primary_ready_monotonic_ns = 100000000,
       .checked_monotonic_ns = 100000000 + kMinimumHoldNs,
       .minimum_hold_ns = kMinimumHoldNs,
@@ -31,6 +34,8 @@ static void TestExactEligibilityBoundary(void) {
       InumaEmergencyGraceEvaluate(input);
   assert(decision.queue_shape_valid);
   assert(decision.primary_old_enough);
+  assert(decision.current_protection_valid);
+  assert(!decision.admitted_via_overdue_copy);
   assert(decision.eligible);
   assert(decision.refuse_reason == InumaEmergencyGraceRefuseReasonNone);
 
@@ -71,6 +76,35 @@ static void TestStrictRefusalReasons(void) {
   input.maximum_queued_frames = 2;
   assert(InumaEmergencyGraceEvaluate(input).refuse_reason ==
          InumaEmergencyGraceRefuseReasonQueueShape);
+}
+
+static void TestOverdueRescueCopyClosesPreRepeatArrivalRace(void) {
+  InumaEmergencyGracePolicyInput input = EligibleInput();
+  input.current_frame_repeat_deferred = false;
+  input.current_frame_rescue_promoted = true;
+  input.current_frame_awaits_copy = true;
+  input.current_ready_monotonic_ns =
+      input.checked_monotonic_ns - kMinimumHoldNs;
+  InumaEmergencyGracePolicyDecision decision =
+      InumaEmergencyGraceEvaluate(input);
+  assert(decision.current_overdue_copy);
+  assert(decision.current_protection_valid);
+  assert(decision.eligible);
+  assert(decision.admitted_via_overdue_copy);
+
+  input.current_ready_monotonic_ns += 1;
+  decision = InumaEmergencyGraceEvaluate(input);
+  assert(!decision.current_overdue_copy);
+  assert(!decision.eligible);
+  assert(decision.refuse_reason ==
+         InumaEmergencyGraceRefuseReasonNotRepeatDeferred);
+
+  input.current_ready_monotonic_ns -= 1;
+  input.current_frame_awaits_copy = false;
+  assert(!InumaEmergencyGraceEvaluate(input).eligible);
+  input.current_frame_awaits_copy = true;
+  input.current_frame_rescue_promoted = false;
+  assert(!InumaEmergencyGraceEvaluate(input).eligible);
 }
 
 static void TestNoRefusalWithoutFullPrimaryQueue(void) {
@@ -182,6 +216,7 @@ int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
   TestStrictRefusalReasons();
+  TestOverdueRescueCopyClosesPreRepeatArrivalRace();
   TestNoRefusalWithoutFullPrimaryQueue();
   TestBoundedFifoActions();
   TestThreeFrameQueueGraceSequence();

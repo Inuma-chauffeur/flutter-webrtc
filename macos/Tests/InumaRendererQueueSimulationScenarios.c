@@ -101,6 +101,35 @@ static void TestRetryUsesRasterCadenceAndPreservesGraceReadyTime(void) {
   DrainSimulation(&simulation, &raster_ns, kDisplaySixtyHzNs);
   AssertCopiedSequence(&simulation, 5);
 }
+
+static void TestOverduePromotedCopyAdmitsArrivalBeforeRepeatCallback(void) {
+  const uint64_t origin_ns = 1500000000;
+  const uint64_t minimum_hold_ns = 19000000;
+  RepeatBoundarySimulation simulation;
+  InitializeSimulation(&simulation);
+  SimulateSourceArrival(&simulation, 1, origin_ns);
+  uint64_t raster_ns = origin_ns + kDisplaySixtyHzNs;
+  assert(!SimulateRasterCopy(&simulation, raster_ns));
+
+  SimulateSourceArrival(&simulation, 2, raster_ns + 1000000);
+  SimulateSourceArrival(&simulation, 3, raster_ns + 2000000);
+  raster_ns += kDisplaySixtyHzNs;
+  assert(!SimulateRasterCopy(&simulation, raster_ns));
+  AssertSlots(&simulation, 3, 0, 0);
+  assert(simulation.current_rescue_promoted);
+  assert(!simulation.current_repeat_deferred);
+
+  const uint64_t primary_ready_ns = raster_ns + 1;
+  SimulateSourceArrival(&simulation, 4, primary_ready_ns);
+  SimulateSourceArrival(
+      &simulation, 5, primary_ready_ns + minimum_hold_ns);
+  AssertSlots(&simulation, 3, 4, 5);
+  assert(simulation.grace_admits == 1);
+  assert(simulation.overflows == 0);
+
+  DrainSimulation(&simulation, &raster_ns, kDisplaySixtyHzNs);
+  AssertCopiedSequence(&simulation, 5);
+}
 static void TestChainedEmergencyGraceSequence(void) {
   RepeatBoundarySimulation simulation;
   InitializeSimulation(&simulation);
@@ -710,6 +739,7 @@ static void TestThirtyHzSourceSixtyHzDisplayPhaseAndJitterSweep(void) {
 
 void InumaRunRendererQueueSimulationScenarios(void) {
   TestRetryUsesRasterCadenceAndPreservesGraceReadyTime();
+  TestOverduePromotedCopyAdmitsArrivalBeforeRepeatCallback();
   TestChainedEmergencyGraceSequence();
   TestGraceOccupiedRefusesWithoutOverwrite();
   TestLifecycleClearClassifications();
