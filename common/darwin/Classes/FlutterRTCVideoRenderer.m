@@ -116,6 +116,7 @@ typedef struct {
   uint64_t direct_frame_display_retry_link_arms;
   uint64_t direct_frame_display_retry_link_pauses;
   uint64_t direct_frame_display_retry_link_invalidations;
+  uint64_t direct_frame_display_retry_link_abandoned_creations;
   uint64_t direct_frame_display_retry_notifications;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
@@ -1529,6 +1530,11 @@ static void InumaRecordRenderQoSObservationLocked(
                  strongSelf->_inumaTrace.enabled) {
         strongSelf->_inumaTrace.direct_frame_display_retry_create_failures +=
             1;
+      }
+      if (!retryIsCurrent && createdDisplayLink &&
+          strongSelf->_inumaTrace.enabled) {
+        strongSelf->_inumaTrace
+            .direct_frame_display_retry_link_abandoned_creations += 1;
       }
       os_unfair_lock_unlock(&strongSelf->_lock);
       if (!retryIsCurrent && createdDisplayLink) {
@@ -3218,6 +3224,8 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->direct_frame_display_retry_link_pauses),
     @"direct_frame_display_retry_link_invalidations" :
         @(snapshot->direct_frame_display_retry_link_invalidations),
+    @"direct_frame_display_retry_link_abandoned_creations" :
+        @(snapshot->direct_frame_display_retry_link_abandoned_creations),
     @"direct_frame_display_retry_notifications" :
         @(snapshot->direct_frame_display_retry_notifications),
     @"direct_frame_display_retry_link_lifecycle" :
