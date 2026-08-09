@@ -19,6 +19,7 @@
 #import <os/lock.h>
 
 #if TARGET_OS_OSX
+#include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
@@ -32,6 +33,7 @@ enum {
   kInumaStockBGRAPoolMinimumBufferCount = 4,
   kInumaPendingTextureFrameCapacity = 1,
   kInumaCopiedBufferHoldCapacity = 2,
+  kInumaDirectFrameDisplayRetryMinimumAgeNs = 16 * NSEC_PER_MSEC,
 };
 
 typedef NS_ENUM(NSUInteger, InumaMacOSPixelMode) {
@@ -47,6 +49,13 @@ typedef NS_ENUM(NSUInteger, InumaRenderQoSPolicy) {
 typedef NS_ENUM(NSUInteger, InumaRescueNotificationPhase) {
   InumaRescueNotificationPhaseDisplayLink = 0,
   InumaRescueNotificationPhasePlatformTurn = 1,
+};
+
+typedef NS_ENUM(uint8_t, InumaDirectFrameDisplayRetryOutcome) {
+  InumaDirectFrameDisplayRetryOutcomePending = 0,
+  InumaDirectFrameDisplayRetryOutcomeFired = 1,
+  InumaDirectFrameDisplayRetryOutcomeStale = 2,
+  InumaDirectFrameDisplayRetryOutcomeCancelled = 3,
 };
 
 typedef struct {
@@ -95,6 +104,13 @@ typedef struct {
   uint64_t rescue_display_link_stale_fires;
   uint64_t rescue_display_link_callbacks;
   uint64_t rescue_display_link_deferrals;
+  uint64_t direct_frame_display_retry_schedules;
+  uint64_t direct_frame_display_retry_callbacks;
+  uint64_t direct_frame_display_retry_deferrals;
+  uint64_t direct_frame_display_retry_fires;
+  uint64_t direct_frame_display_retry_cancellations;
+  uint64_t direct_frame_display_retry_stale_fires;
+  uint64_t direct_frame_display_retry_create_failures;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
   uint64_t texture_notification_platform_turn_last_schedule_offset_ns;
@@ -179,6 +195,16 @@ typedef struct {
   uint64_t rescue_display_link_callback_count_samples
       [kInumaTextureTraceCapacity];
   int64_t rescue_display_link_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t direct_frame_display_retry_schedule_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t direct_frame_display_retry_callback_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t direct_frame_display_retry_callback_count_samples
+      [kInumaTextureTraceCapacity];
+  int64_t direct_frame_display_retry_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t direct_frame_display_retry_outcome_samples
       [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_deadline_offset_samples
       [kInumaTextureTraceCapacity];
@@ -265,6 +291,7 @@ typedef struct {
   NSUInteger rescue_hold_bypass_count;
   NSUInteger rescue_hold_preservation_count;
   NSUInteger rescue_display_link_event_count;
+  NSUInteger direct_frame_display_retry_event_count;
   NSUInteger strict_hold_timer_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
@@ -426,6 +453,16 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_frame_timestamp_ns_samples,
                          rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_schedule_offset_samples,
+                         direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_callback_offset_samples,
+                         direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_callback_count_samples,
+                         direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_frame_timestamp_ns_samples,
+                         direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_outcome_samples,
+                         direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_deadline_offset_samples,
                          strict_hold_timer_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_fire_offset_samples,
@@ -611,6 +648,15 @@ static bool InumaEmergencyGraceEnabledFromEnvironment(
   return [value isEqualToString:@"enabled"];
 }
 
+static bool InumaDirectFrameDisplayRetryEnabledFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_DIRECT_FRAME_DISPLAY_RETRY"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  return [value isEqualToString:@"enabled"];
+}
+
 static InumaRenderQoSPolicy InumaRenderQoSPolicyFromEnvironment(
     NSDictionary<NSString *, NSString *> *env) {
   NSString *value =
@@ -746,8 +792,16 @@ static void InumaRecordRenderQoSObservationLocked(
                                 (uint64_t)predecessorCopyUptimeNs;
 - (void)inumaRescueDisplayLinkDidFire:(CADisplayLink *)displayLink
     API_AVAILABLE(macos(14.0));
+- (void)inumaScheduleDirectFrameDisplayRetryForTextureId:(int64_t)textureId
+                                        frameTimestampNs:
+                                            (int64_t)frameTimestampNs
+                                 rendererStateGeneration:
+                                     (uint64_t)rendererStateGeneration;
+- (void)inumaDirectFrameDisplayRetryDidFire:(CADisplayLink *)displayLink
+    API_AVAILABLE(macos(14.0));
 - (void)inumaCancelTextureHoldTimerLocked;
 - (void)inumaCancelRescueDisplayLinkLocked;
+- (void)inumaCancelDirectFrameDisplayRetryLocked;
 - (void)inumaRetainCopiedBufferHoldLocked:(CVPixelBufferRef)pixelBuffer
                                  copiedAt:(uint64_t)copiedAt;
 - (void)inumaReleaseOldestCopiedBufferHoldLockedAt:(uint64_t)releasedAt
@@ -784,6 +838,7 @@ static void InumaRecordRenderQoSObservationLocked(
   uint64_t _inumaRasterRepeatBoundaryNs;
   bool _inumaCurrentFrameWasRescuePromoted;
   bool _inumaEmergencyGraceEnabled;
+  bool _inumaDirectFrameDisplayRetryEnabled;
   bool _inumaEmergencyGraceBurstArmed;
   bool _inumaCurrentFrameRepeatDeferred;
   bool _inumaCurrentRepeatRetryFired;
@@ -806,12 +861,17 @@ static void InumaRecordRenderQoSObservationLocked(
   dispatch_source_t _inumaTraceTimer;
   dispatch_source_t _inumaTextureHoldTimer;
   CADisplayLink *_inumaRescueDisplayLink;
+  CADisplayLink *_inumaDirectFrameDisplayRetryLink;
   uint64_t _inumaTraceSnapshotCount;
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
   uint64_t _inumaRescueDisplayLinkRendererStateGeneration;
   uint64_t _inumaRescuePredecessorCopyUptimeNs;
   NSUInteger _inumaRescueDisplayLinkEventIndex;
+  int64_t _inumaDirectFrameDisplayRetryFrameTimestampNs;
+  uint64_t _inumaDirectFrameDisplayRetryRendererStateGeneration;
+  uint64_t _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs;
+  NSUInteger _inumaDirectFrameDisplayRetryEventIndex;
 #endif
 }
 
@@ -855,6 +915,8 @@ static void InumaRecordRenderQoSObservationLocked(
         InumaRasterRepeatBoundaryNanosecondsFromEnvironment(environment);
     _inumaEmergencyGraceEnabled =
         InumaEmergencyGraceEnabledFromEnvironment(environment);
+    _inumaDirectFrameDisplayRetryEnabled =
+        InumaDirectFrameDisplayRetryEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
         InumaMaxQueuedTextureFramesFromEnvironment(environment);
     _inumaPendingTextureFrameHead = 0;
@@ -875,12 +937,17 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCopiedBufferHoldCount = 0;
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
+    _inumaDirectFrameDisplayRetryLink = nil;
     _inumaTraceSnapshotCount = 0;
     _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
     _inumaRescueDisplayLinkRendererStateGeneration = 0;
     _inumaRescuePredecessorCopyUptimeNs = 0;
     _inumaRescueDisplayLinkEventIndex = NSNotFound;
+    _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+    _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
+    _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
+    _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
     _inumaStockBGRAPixelBufferPool = nil;
     if (_inumaTrace.enabled) {
       _inumaTraceQueue = dispatch_queue_create(
@@ -1039,6 +1106,9 @@ static void InumaRecordRenderQoSObservationLocked(
 #endif
   if (buffer == nil && _pixelBufferRef != nil && _frameAvailable) {
     buffer = CVBufferRetain(_pixelBufferRef);
+#if TARGET_OS_OSX
+    [self inumaCancelDirectFrameDisplayRetryLocked];
+#endif
     _frameAvailable = false;
 #if TARGET_OS_OSX
     const uint64_t copiedAt = InumaMonotonicNanoseconds();
@@ -1252,6 +1322,7 @@ static void InumaRecordRenderQoSObservationLocked(
   _inumaRendererStateGeneration += 1;
   [self inumaCancelTextureHoldTimerLocked];
   [self inumaCancelRescueDisplayLinkLocked];
+  [self inumaCancelDirectFrameDisplayRetryLocked];
 #endif
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
@@ -1291,6 +1362,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaRendererStateGeneration += 1;
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
+    [self inumaCancelDirectFrameDisplayRetryLocked];
     [self inumaClearPendingTextureFramesLocked];
     [self inumaReleaseAllCopiedBufferHoldsLockedAt:
               InumaMonotonicNanoseconds()];
@@ -1314,6 +1386,196 @@ static void InumaRecordRenderQoSObservationLocked(
     if (videoTrack) {
       [videoTrack addRenderer:self];
     }
+  }
+}
+
+- (void)inumaScheduleDirectFrameDisplayRetryForTextureId:(int64_t)textureId
+                                        frameTimestampNs:
+                                            (int64_t)frameTimestampNs
+                                 rendererStateGeneration:
+                                     (uint64_t)rendererStateGeneration {
+  const uint64_t scheduledAt = InumaMonotonicNanoseconds();
+  __weak FlutterRTCVideoRenderer *weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    if (@available(macOS 14.0, *)) {
+      NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+      CADisplayLink *displayLink =
+          [screen displayLinkWithTarget:strongSelf
+                              selector:@selector(
+                                           inumaDirectFrameDisplayRetryDidFire:)];
+      os_unfair_lock_lock(&strongSelf->_lock);
+      const bool retryIsCurrent =
+          strongSelf->_inumaDirectFrameDisplayRetryEnabled && screen != nil &&
+          displayLink != nil &&
+          strongSelf->_inumaRendererStateGeneration ==
+              rendererStateGeneration &&
+          strongSelf->_textureId == textureId &&
+          strongSelf->_frameAvailable &&
+          !strongSelf->_inumaCurrentFrameWasRescuePromoted &&
+          strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+          strongSelf->_inumaFrameReadyMonotonicNs > 0 &&
+          strongSelf->_inumaDirectFrameDisplayRetryLink == nil;
+      if (retryIsCurrent) {
+        strongSelf->_inumaDirectFrameDisplayRetryLink = displayLink;
+        strongSelf->_inumaDirectFrameDisplayRetryFrameTimestampNs =
+            frameTimestampNs;
+        strongSelf->_inumaDirectFrameDisplayRetryRendererStateGeneration =
+            rendererStateGeneration;
+        strongSelf->_inumaDirectFrameDisplayRetryFrameReadyMonotonicNs =
+            strongSelf->_inumaFrameReadyMonotonicNs;
+        strongSelf->_inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
+        if (strongSelf->_inumaTrace.enabled) {
+          strongSelf->_inumaTrace.direct_frame_display_retry_schedules += 1;
+          if (strongSelf->_inumaTraceStartedMonotonicNs > 0 &&
+              scheduledAt >= strongSelf->_inumaTraceStartedMonotonicNs) {
+            const NSUInteger eventIndex = InumaReserveTraceSample(
+                &strongSelf->_inumaTrace
+                     .direct_frame_display_retry_event_count,
+                &strongSelf->_inumaTrace.sample_capacity_exhaustions);
+            if (eventIndex != NSNotFound) {
+              strongSelf->_inumaTrace
+                  .direct_frame_display_retry_schedule_offset_samples
+                      [eventIndex] =
+                  scheduledAt - strongSelf->_inumaTraceStartedMonotonicNs;
+              strongSelf->_inumaTrace
+                  .direct_frame_display_retry_frame_timestamp_ns_samples
+                      [eventIndex] = frameTimestampNs;
+              strongSelf->_inumaTrace
+                  .direct_frame_display_retry_outcome_samples[eventIndex] =
+                  InumaDirectFrameDisplayRetryOutcomePending;
+              strongSelf->_inumaDirectFrameDisplayRetryEventIndex =
+                  eventIndex;
+            }
+          }
+        }
+      } else if (strongSelf->_inumaDirectFrameDisplayRetryEnabled &&
+                 strongSelf->_inumaRendererStateGeneration ==
+                     rendererStateGeneration &&
+                 strongSelf->_textureId == textureId &&
+                 strongSelf->_frameAvailable &&
+                 strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+                 (screen == nil || displayLink == nil) &&
+                 strongSelf->_inumaTrace.enabled) {
+        strongSelf->_inumaTrace.direct_frame_display_retry_create_failures +=
+            1;
+      }
+      os_unfair_lock_unlock(&strongSelf->_lock);
+      if (retryIsCurrent) {
+        [displayLink addToRunLoop:NSRunLoop.mainRunLoop
+                         forMode:NSRunLoopCommonModes];
+        return;
+      }
+      [displayLink invalidate];
+      return;
+    }
+
+    os_unfair_lock_lock(&strongSelf->_lock);
+    const bool creationWasRequired =
+        strongSelf->_inumaDirectFrameDisplayRetryEnabled &&
+        strongSelf->_inumaRendererStateGeneration ==
+            rendererStateGeneration &&
+        strongSelf->_textureId == textureId && strongSelf->_frameAvailable &&
+        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+    if (creationWasRequired && strongSelf->_inumaTrace.enabled) {
+      strongSelf->_inumaTrace.direct_frame_display_retry_create_failures += 1;
+    }
+    os_unfair_lock_unlock(&strongSelf->_lock);
+  });
+}
+
+- (void)inumaDirectFrameDisplayRetryDidFire:(CADisplayLink *)displayLink
+    API_AVAILABLE(macos(14.0)) {
+  const uint64_t checkedAt = InumaMonotonicNanoseconds();
+  int64_t textureId = -1;
+  int64_t frameTimestampNs = 0;
+  id<FlutterTextureRegistry> registry = nil;
+  bool shouldDefer = false;
+  bool shouldFire = false;
+  bool ownsDisplayLink = false;
+  os_unfair_lock_lock(&_lock);
+  ownsDisplayLink = _inumaDirectFrameDisplayRetryLink == displayLink;
+  if (ownsDisplayLink) {
+    textureId = _textureId;
+    frameTimestampNs = _inumaDirectFrameDisplayRetryFrameTimestampNs;
+    const bool predecessorHoldSatisfied =
+        _inumaLastCopyMonotonicNs == 0 ||
+        (checkedAt >= _inumaLastCopyMonotonicNs &&
+         checkedAt - _inumaLastCopyMonotonicNs >=
+             _inumaMinimumTextureHoldNs);
+    const InumaDirectFrameDisplayRetryPolicyDecision decision =
+        InumaDirectFrameDisplayRetryEvaluate(
+            (InumaDirectFrameDisplayRetryPolicyInput){
+                .enabled = _inumaDirectFrameDisplayRetryEnabled,
+                .owns_display_link = ownsDisplayLink,
+                .renderer_state_matches =
+                    _inumaRendererStateGeneration ==
+                    _inumaDirectFrameDisplayRetryRendererStateGeneration,
+                .texture_matches = textureId != -1,
+                .frame_available = _frameAvailable,
+                .frame_timestamp_matches =
+                    _inumaFrameTimestampNs == frameTimestampNs,
+                .predecessor_hold_satisfied = predecessorHoldSatisfied,
+                .frame_ready_monotonic_ns =
+                    _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs,
+                .checked_monotonic_ns = checkedAt,
+                .minimum_retry_age_ns =
+                    kInumaDirectFrameDisplayRetryMinimumAgeNs,
+            });
+    shouldDefer = decision.defer;
+    shouldFire = decision.fire;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.direct_frame_display_retry_callbacks += 1;
+      const NSUInteger eventIndex =
+          _inumaDirectFrameDisplayRetryEventIndex;
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.direct_frame_display_retry_event_count) {
+        _inumaTrace
+            .direct_frame_display_retry_callback_count_samples[eventIndex] +=
+            1;
+      }
+      if (shouldDefer) {
+        _inumaTrace.direct_frame_display_retry_deferrals += 1;
+      } else {
+        if (eventIndex != NSNotFound &&
+            eventIndex < _inumaTrace.direct_frame_display_retry_event_count &&
+            _inumaTraceStartedMonotonicNs > 0 &&
+            checkedAt >= _inumaTraceStartedMonotonicNs) {
+          _inumaTrace.direct_frame_display_retry_callback_offset_samples
+              [eventIndex] = checkedAt - _inumaTraceStartedMonotonicNs;
+          _inumaTrace.direct_frame_display_retry_outcome_samples[eventIndex] =
+              shouldFire ? InumaDirectFrameDisplayRetryOutcomeFired
+                         : InumaDirectFrameDisplayRetryOutcomeStale;
+        }
+        if (shouldFire) {
+          _inumaTrace.direct_frame_display_retry_fires += 1;
+        } else {
+          _inumaTrace.direct_frame_display_retry_stale_fires += 1;
+        }
+      }
+    }
+    if (!shouldDefer) {
+      registry = _registry;
+      _inumaDirectFrameDisplayRetryLink = nil;
+      _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+      _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
+      _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
+      _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
+    }
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (!ownsDisplayLink || shouldDefer) {
+    return;
+  }
+  [displayLink invalidate];
+  if (shouldFire && registry != nil) {
+    // This is the only retry call. It runs at the display callback after both
+    // direct-frame age and predecessor-tenure guards pass, and it never owns
+    // pixels or mutates the latest-only queue.
+    [registry textureFrameAvailable:textureId];
   }
 }
 
@@ -1713,6 +1975,17 @@ static void InumaRecordRenderQoSObservationLocked(
                                          bypassMinimumHold:false
                                         recordRescueBypass:false
                                   recordRasterRepeatRetry:false];
+    if (_inumaDirectFrameDisplayRetryEnabled) {
+      // The normal notification remains authoritative. Arm one independent
+      // display-linked retry only while this direct frame is still awaiting
+      // its first raster copy; copyPixelBuffer cancels it on the common path.
+      [self inumaScheduleDirectFrameDisplayRetryForTextureId:
+                inumaTextureIdToNotify
+                                            frameTimestampNs:
+                                                inumaFrameTimestampToNotify
+                                     rendererStateGeneration:
+                                         inumaRendererStateGenerationToNotify];
+    }
   }
 #endif
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
@@ -2400,6 +2673,28 @@ static void InumaRecordRenderQoSObservationLocked(
   }
 }
 
+- (void)inumaCancelDirectFrameDisplayRetryLocked {
+  CADisplayLink *displayLink = _inumaDirectFrameDisplayRetryLink;
+  if (displayLink == nil) {
+    return;
+  }
+  const NSUInteger eventIndex = _inumaDirectFrameDisplayRetryEventIndex;
+  _inumaDirectFrameDisplayRetryLink = nil;
+  _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+  _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
+  _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
+  _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
+  [displayLink invalidate];
+  if (_inumaTrace.enabled) {
+    _inumaTrace.direct_frame_display_retry_cancellations += 1;
+    if (eventIndex != NSNotFound &&
+        eventIndex < _inumaTrace.direct_frame_display_retry_event_count) {
+      _inumaTrace.direct_frame_display_retry_outcome_samples[eventIndex] =
+          InumaDirectFrameDisplayRetryOutcomeCancelled;
+    }
+  }
+}
+
 - (void)inumaRetainCopiedBufferHoldLocked:(CVPixelBufferRef)pixelBuffer
                                  copiedAt:(uint64_t)copiedAt {
   if (_inumaCopiedBufferHoldCount == kInumaCopiedBufferHoldCapacity) {
@@ -2529,6 +2824,7 @@ static void InumaRecordRenderQoSObservationLocked(
   NSUInteger copiedBufferHoldCount = 0;
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
+  bool directFrameDisplayRetryActive = false;
   bool currentFrameRepeatDeferred = false;
   bool currentFrameRescuePromoted = false;
   bool currentRepeatRetryFired = false;
@@ -2548,6 +2844,8 @@ static void InumaRecordRenderQoSObservationLocked(
   copiedBufferHoldCount = _inumaCopiedBufferHoldCount;
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
+  directFrameDisplayRetryActive =
+      _inumaDirectFrameDisplayRetryLink != nil;
   currentFrameRepeatDeferred = _inumaCurrentFrameRepeatDeferred;
   currentFrameRescuePromoted = _inumaCurrentFrameWasRescuePromoted;
   currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
@@ -2602,7 +2900,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @34,
+    @"tail_diagnostics_version" : @35,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
@@ -2751,6 +3049,30 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->rescue_display_link_callbacks),
     @"rescue_display_link_deferrals" :
         @(snapshot->rescue_display_link_deferrals),
+    @"direct_frame_display_retry_enabled" :
+        @(_inumaDirectFrameDisplayRetryEnabled),
+    @"direct_frame_display_retry_default" : @"disabled",
+    @"direct_frame_display_retry_contract" :
+        @"one_display_linked_retry_only_while_same_direct_frame_awaits_first_"
+         @"copy_after_16ms_age_and_predecessor_minimum_hold",
+    @"direct_frame_display_retry_minimum_age_ns" :
+        @(kInumaDirectFrameDisplayRetryMinimumAgeNs),
+    @"direct_frame_display_retry_schedules" :
+        @(snapshot->direct_frame_display_retry_schedules),
+    @"direct_frame_display_retry_callbacks" :
+        @(snapshot->direct_frame_display_retry_callbacks),
+    @"direct_frame_display_retry_deferrals" :
+        @(snapshot->direct_frame_display_retry_deferrals),
+    @"direct_frame_display_retry_fires" :
+        @(snapshot->direct_frame_display_retry_fires),
+    @"direct_frame_display_retry_cancellations" :
+        @(snapshot->direct_frame_display_retry_cancellations),
+    @"direct_frame_display_retry_stale_fires" :
+        @(snapshot->direct_frame_display_retry_stale_fires),
+    @"direct_frame_display_retry_create_failures" :
+        @(snapshot->direct_frame_display_retry_create_failures),
+    @"direct_frame_display_retry_active_at_snapshot" :
+        @(directFrameDisplayRetryActive),
     @"texture_notification_platform_turn_schedules" :
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
@@ -2881,6 +3203,28 @@ static void InumaRecordRenderQoSObservationLocked(
     @"rescue_display_link_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->rescue_display_link_frame_timestamp_ns_samples,
         snapshot->rescue_display_link_event_count),
+    @"direct_frame_display_retry_schedule_offset_ns" : InumaTraceSampleArray(
+        snapshot->direct_frame_display_retry_schedule_offset_samples,
+        snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_callback_offset_ns" : InumaTraceSampleArray(
+        snapshot->direct_frame_display_retry_callback_offset_samples,
+        snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_callback_count" : InumaTraceSampleArray(
+        snapshot->direct_frame_display_retry_callback_count_samples,
+        snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot->direct_frame_display_retry_frame_timestamp_ns_samples,
+            snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_outcome" : InumaTraceByteSampleArray(
+        snapshot->direct_frame_display_retry_outcome_samples,
+        snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_outcome_codes" : @{
+      @"0" : @"pending_at_snapshot",
+      @"1" : @"fired",
+      @"2" : @"stale",
+      @"3" : @"cancelled_after_first_copy",
+    },
     @"strict_hold_timer_deadline_offset_ns" : InumaTraceSampleArray(
         snapshot->strict_hold_timer_deadline_offset_samples,
         snapshot->strict_hold_timer_event_count),
@@ -3069,6 +3413,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaRendererStateGeneration += 1;
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
+    [self inumaCancelDirectFrameDisplayRetryLocked];
     [self inumaClearPendingTextureFramesLocked];
     [self inumaReleaseAllCopiedBufferHoldsLockedAt:
               InumaMonotonicNanoseconds()];

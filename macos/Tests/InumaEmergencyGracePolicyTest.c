@@ -1,6 +1,7 @@
 // Entry point for the pure-C renderer policy and deterministic state suite.
 
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #include "InumaRendererQueueSimulation.h"
 
@@ -259,6 +260,72 @@ static void TestRepeatBoundaryDefaultOffAndBaseGuard(void) {
   assert(!decision.extends_normal_hold);
 }
 
+static InumaDirectFrameDisplayRetryPolicyInput DirectRetryInput(void) {
+  return (InumaDirectFrameDisplayRetryPolicyInput){
+      .enabled = true,
+      .owns_display_link = true,
+      .renderer_state_matches = true,
+      .texture_matches = true,
+      .frame_available = true,
+      .frame_timestamp_matches = true,
+      .predecessor_hold_satisfied = true,
+      .frame_ready_monotonic_ns = 100000000,
+      .checked_monotonic_ns = 116000000,
+      .minimum_retry_age_ns = 16000000,
+  };
+}
+
+static void TestDirectRetryExactAgeBoundary(void) {
+  InumaDirectFrameDisplayRetryPolicyInput input = DirectRetryInput();
+  InumaDirectFrameDisplayRetryPolicyDecision decision =
+      InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(decision.evaluated);
+  assert(decision.state_current);
+  assert(decision.timing_valid);
+  assert(decision.fire);
+  assert(!decision.defer);
+  assert(!decision.stale);
+
+  input.checked_monotonic_ns -= 1;
+  decision = InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(decision.defer);
+  assert(!decision.fire);
+  assert(!decision.stale);
+
+  input = DirectRetryInput();
+  input.predecessor_hold_satisfied = false;
+  decision = InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(decision.defer);
+  assert(!decision.fire);
+}
+
+static void TestDirectRetryDefaultOffAndStrictOwnership(void) {
+  InumaDirectFrameDisplayRetryPolicyInput input = DirectRetryInput();
+  input.enabled = false;
+  InumaDirectFrameDisplayRetryPolicyDecision decision =
+      InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(!decision.evaluated);
+  assert(!decision.fire);
+
+  input = DirectRetryInput();
+  input.frame_available = false;
+  decision = InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(decision.evaluated);
+  assert(decision.stale);
+  assert(!decision.fire);
+
+  input = DirectRetryInput();
+  input.frame_timestamp_matches = false;
+  decision = InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(decision.stale);
+
+  input = DirectRetryInput();
+  input.checked_monotonic_ns = input.frame_ready_monotonic_ns - 1;
+  decision = InumaDirectFrameDisplayRetryEvaluate(input);
+  assert(!decision.timing_valid);
+  assert(decision.stale);
+}
+
 int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
@@ -270,6 +337,8 @@ int main(void) {
   TestSustainedBurstCannotReopenAfterDrain();
   TestRepeatOnlyBoundary();
   TestRepeatBoundaryDefaultOffAndBaseGuard();
+  TestDirectRetryExactAgeBoundary();
+  TestDirectRetryDefaultOffAndStrictOwnership();
   InumaRunRendererQueueSimulationScenarios();
   return 0;
 }
