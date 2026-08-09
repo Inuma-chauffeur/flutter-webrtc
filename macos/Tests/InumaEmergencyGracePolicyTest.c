@@ -2,6 +2,7 @@
 
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
+#include "InumaMainRunLoopNotificationPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #include "InumaRendererQueueSimulation.h"
 
@@ -326,6 +327,206 @@ static void TestDirectRetryDefaultOffAndStrictOwnership(void) {
   assert(decision.stale);
 }
 
+static InumaMainRunLoopNotificationArmInput MainRunLoopArmInput(void) {
+  return (InumaMainRunLoopNotificationArmInput){
+      .enabled = true,
+      .ordinary_normal_path = true,
+      .source_registered = true,
+      .texture_registered = true,
+      .frame_available = true,
+      .frame_timestamp_valid = true,
+      .token_occupied = false,
+  };
+}
+
+static void TestMainRunLoopNotificationArmContract(void) {
+  InumaMainRunLoopNotificationArmInput input = MainRunLoopArmInput();
+  InumaMainRunLoopNotificationArmDecision decision =
+      InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(decision.evaluated);
+  assert(decision.arm);
+  assert(decision.signal);
+  assert(decision.wake);
+  assert(decision.reason == InumaMainRunLoopNotificationArmReasonAccepted);
+
+  input.enabled = false;
+  decision = InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(!decision.evaluated);
+  assert(!decision.arm);
+
+  input = MainRunLoopArmInput();
+  input.ordinary_normal_path = false;
+  decision = InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(!decision.arm);
+  assert(decision.reason ==
+         InumaMainRunLoopNotificationArmReasonNonOrdinaryPath);
+
+  input = MainRunLoopArmInput();
+  input.source_registered = false;
+  decision = InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(!decision.arm);
+  assert(decision.reason ==
+         InumaMainRunLoopNotificationArmReasonSourceUnavailable);
+
+  input = MainRunLoopArmInput();
+  input.frame_available = false;
+  decision = InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(!decision.arm);
+  assert(decision.reason ==
+         InumaMainRunLoopNotificationArmReasonInvalidOwner);
+
+  input = MainRunLoopArmInput();
+  input.token_occupied = true;
+  decision = InumaMainRunLoopNotificationEvaluateArm(input);
+  assert(!decision.arm);
+  assert(!decision.signal);
+  assert(!decision.wake);
+  assert(decision.reason ==
+         InumaMainRunLoopNotificationArmReasonTokenOccupied);
+}
+
+static InumaMainRunLoopNotificationFireInput MainRunLoopFireInput(void) {
+  return (InumaMainRunLoopNotificationFireInput){
+      .enabled = true,
+      .platform_thread = true,
+      .owns_source = true,
+      .token_occupied = true,
+      .renderer_state_matches = true,
+      .texture_registered = true,
+      .registry_available = true,
+      .texture_matches = true,
+      .frame_available = true,
+      .frame_timestamp_matches = true,
+  };
+}
+
+static void TestMainRunLoopNotificationFireAndLifecycleContract(void) {
+  InumaMainRunLoopNotificationFireInput input = MainRunLoopFireInput();
+  InumaMainRunLoopNotificationFireDecision decision =
+      InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(decision.evaluated);
+  assert(decision.state_current);
+  assert(decision.fire);
+  assert(!decision.close_stale);
+
+  input.frame_timestamp_matches = false;
+  decision = InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(!decision.state_current);
+  assert(!decision.fire);
+  assert(decision.close_stale);
+
+  input = MainRunLoopFireInput();
+  input.platform_thread = false;
+  decision = InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(!decision.fire);
+  assert(decision.close_stale);
+
+  input = MainRunLoopFireInput();
+  input.registry_available = false;
+  decision = InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(!decision.fire);
+  assert(decision.close_stale);
+
+  input = MainRunLoopFireInput();
+  input.token_occupied = false;
+  decision = InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(!decision.fire);
+  assert(!decision.close_stale);
+
+  input = MainRunLoopFireInput();
+  input.enabled = false;
+  decision = InumaMainRunLoopNotificationEvaluateFire(input);
+  assert(!decision.evaluated);
+  assert(!decision.fire);
+
+  assert(InumaMainRunLoopNotificationShouldCloseForLifecycle(true, true));
+  assert(!InumaMainRunLoopNotificationShouldCloseForLifecycle(false, true));
+  assert(!InumaMainRunLoopNotificationShouldCloseForLifecycle(true, false));
+}
+
+static void TestMainRunLoopNotificationDeterministicSequences(void) {
+  size_t arms = 0;
+  size_t signals = 0;
+  size_t wakes = 0;
+  size_t callbacks = 0;
+  size_t fires = 0;
+  size_t stale_closes = 0;
+  size_t lifecycle_closes = 0;
+  bool token_occupied = false;
+
+  // Ordinary source: one token, signal, wake, callback, and fire.
+  InumaMainRunLoopNotificationArmInput arm = MainRunLoopArmInput();
+  arm.token_occupied = token_occupied;
+  InumaMainRunLoopNotificationArmDecision arm_decision =
+      InumaMainRunLoopNotificationEvaluateArm(arm);
+  assert(arm_decision.arm);
+  token_occupied = true;
+  arms += 1;
+  signals += arm_decision.signal ? 1u : 0u;
+  wakes += arm_decision.wake ? 1u : 0u;
+  InumaMainRunLoopNotificationFireInput fire = MainRunLoopFireInput();
+  fire.token_occupied = token_occupied;
+  InumaMainRunLoopNotificationFireDecision fire_decision =
+      InumaMainRunLoopNotificationEvaluateFire(fire);
+  callbacks += 1;
+  fires += fire_decision.fire ? 1u : 0u;
+  token_occupied = false;
+
+  // A second arm cannot overwrite the outstanding exact token. The single
+  // signaled callback later closes stale after a foreign raster acquisition.
+  arm = MainRunLoopArmInput();
+  arm.token_occupied = token_occupied;
+  arm_decision = InumaMainRunLoopNotificationEvaluateArm(arm);
+  assert(arm_decision.arm);
+  token_occupied = true;
+  arms += 1;
+  signals += 1;
+  wakes += 1;
+  arm.token_occupied = token_occupied;
+  assert(InumaMainRunLoopNotificationEvaluateArm(arm).reason ==
+         InumaMainRunLoopNotificationArmReasonTokenOccupied);
+  fire = MainRunLoopFireInput();
+  fire.token_occupied = token_occupied;
+  fire.frame_available = false;
+  fire_decision = InumaMainRunLoopNotificationEvaluateFire(fire);
+  assert(fire_decision.close_stale);
+  callbacks += 1;
+  stale_closes += 1;
+  token_occupied = false;
+
+  // Promoted and raster-repeat paths are deliberately outside this first
+  // candidate and keep their established platform-turn owner.
+  arm = MainRunLoopArmInput();
+  arm.ordinary_normal_path = false;
+  assert(InumaMainRunLoopNotificationEvaluateArm(arm).reason ==
+         InumaMainRunLoopNotificationArmReasonNonOrdinaryPath);
+  assert(!InumaMainRunLoopNotificationEvaluateArm(arm).arm);
+
+  // Lifecycle closes an armed token without a registrar fire.
+  arm = MainRunLoopArmInput();
+  arm_decision = InumaMainRunLoopNotificationEvaluateArm(arm);
+  assert(arm_decision.arm);
+  token_occupied = true;
+  arms += 1;
+  signals += 1;
+  wakes += 1;
+  if (InumaMainRunLoopNotificationShouldCloseForLifecycle(true,
+                                                          token_occupied)) {
+    lifecycle_closes += 1;
+    token_occupied = false;
+  }
+
+  assert(!token_occupied);
+  assert(arms == 3);
+  assert(signals == arms);
+  assert(wakes == arms);
+  assert(callbacks == 2);
+  assert(fires == 1);
+  assert(stale_closes == 1);
+  assert(lifecycle_closes == 1);
+  assert(arms == fires + stale_closes + lifecycle_closes);
+}
+
 int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
@@ -339,6 +540,9 @@ int main(void) {
   TestRepeatBoundaryDefaultOffAndBaseGuard();
   TestDirectRetryExactAgeBoundary();
   TestDirectRetryDefaultOffAndStrictOwnership();
+  TestMainRunLoopNotificationArmContract();
+  TestMainRunLoopNotificationFireAndLifecycleContract();
+  TestMainRunLoopNotificationDeterministicSequences();
   InumaRunRendererQueueSimulationScenarios();
   return 0;
 }

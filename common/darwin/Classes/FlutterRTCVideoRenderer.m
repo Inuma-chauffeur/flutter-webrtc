@@ -22,6 +22,7 @@
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaMainRunLoopNotificationPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
@@ -123,6 +124,25 @@ typedef struct {
   uint64_t direct_frame_display_retry_link_invalidations;
   uint64_t direct_frame_display_retry_link_abandoned_creations;
   uint64_t direct_frame_display_retry_notifications;
+  uint64_t main_run_loop_notification_source_create_attempts;
+  uint64_t main_run_loop_notification_source_creations;
+  uint64_t main_run_loop_notification_source_create_failures;
+  uint64_t main_run_loop_notification_source_registrations;
+  uint64_t main_run_loop_notification_source_registration_failures;
+  uint64_t main_run_loop_notification_source_signals;
+  uint64_t main_run_loop_notification_run_loop_wakes;
+  uint64_t main_run_loop_notification_callbacks;
+  uint64_t main_run_loop_notification_current_fires;
+  uint64_t main_run_loop_notification_stale_closes;
+  uint64_t main_run_loop_notification_empty_callbacks;
+  uint64_t main_run_loop_notification_occupied_refusals;
+  uint64_t main_run_loop_notification_invalid_owner_refusals;
+  uint64_t main_run_loop_notification_source_unavailable_fallbacks;
+  uint64_t main_run_loop_notification_successor_rearms;
+  uint64_t main_run_loop_notification_lifecycle_closes;
+  uint64_t main_run_loop_notification_source_removals;
+  uint64_t main_run_loop_notification_source_invalidations;
+  uint64_t main_run_loop_notification_off_main_callbacks;
   uint64_t texture_notification_platform_turn_schedules;
   uint64_t texture_notification_platform_turn_fires;
   uint64_t texture_notification_platform_turn_last_schedule_offset_ns;
@@ -222,6 +242,16 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   uint8_t direct_frame_display_retry_outcome_samples
       [kInumaTextureTraceCapacity];
+  uint64_t main_run_loop_notification_arm_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t main_run_loop_notification_callback_offset_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t main_run_loop_notification_callback_duration_samples
+      [kInumaTextureTraceCapacity];
+  int64_t main_run_loop_notification_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t main_run_loop_notification_outcome_samples
+      [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_deadline_offset_samples
       [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_fire_offset_samples[kInumaTextureTraceCapacity];
@@ -308,6 +338,7 @@ typedef struct {
   NSUInteger rescue_hold_preservation_count;
   NSUInteger rescue_display_link_event_count;
   NSUInteger direct_frame_display_retry_event_count;
+  NSUInteger main_run_loop_notification_event_count;
   NSUInteger strict_hold_timer_event_count;
   NSUInteger render_event_count;
   NSUInteger coalesced_pending_age_count;
@@ -482,6 +513,18 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_outcome_samples,
                          direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(main_run_loop_notification_arm_offset_samples,
+                         main_run_loop_notification_event_count);
+  INUMA_COPY_TRACE_ARRAY(main_run_loop_notification_callback_offset_samples,
+                         main_run_loop_notification_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      main_run_loop_notification_callback_duration_samples,
+      main_run_loop_notification_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      main_run_loop_notification_frame_timestamp_ns_samples,
+      main_run_loop_notification_event_count);
+  INUMA_COPY_TRACE_ARRAY(main_run_loop_notification_outcome_samples,
+                         main_run_loop_notification_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_deadline_offset_samples,
                          strict_hold_timer_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_fire_offset_samples,
@@ -676,6 +719,15 @@ static bool InumaDirectFrameDisplayRetryEnabledFromEnvironment(
   return [value isEqualToString:@"enabled"];
 }
 
+static bool InumaMainRunLoopNotificationEnabledFromEnvironment(
+    NSDictionary<NSString *, NSString *> *env) {
+  NSString *value =
+      [env[@"INUMA_FLUTTER_WEBRTC_MACOS_MAIN_RUN_LOOP_NOTIFICATION_SOURCE"]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  return [value isEqualToString:@"enabled"];
+}
+
 static InumaRenderQoSPolicy InumaRenderQoSPolicyFromEnvironment(
     NSDictionary<NSString *, NSString *> *env) {
   NSString *value =
@@ -818,6 +870,18 @@ static void InumaRecordRenderQoSObservationLocked(
                                      (uint64_t)rendererStateGeneration;
 - (void)inumaDirectFrameDisplayRetryDidFire:(CADisplayLink *)displayLink
     API_AVAILABLE(macos(14.0));
+- (void)inumaCreateMainRunLoopNotificationSource;
+- (BOOL)inumaArmMainRunLoopNotificationForTextureId:(int64_t)textureId
+                                    frameTimestampNs:
+                                        (int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
+                                      successorRearm:(bool)successorRearm;
+- (void)inumaMainRunLoopNotificationSourceDidFire;
+- (void)inumaCloseMainRunLoopNotificationTokenLockedForLifecycle;
+- (CFRunLoopSourceRef)inumaDetachMainRunLoopNotificationSourceLocked;
+- (void)inumaInvalidateMainRunLoopNotificationSource:
+    (CFRunLoopSourceRef)source;
 - (void)inumaCancelTextureHoldTimerLocked;
 - (void)inumaCancelRescueDisplayLinkLocked;
 - (void)inumaCancelDirectFrameDisplayRetryLocked;
@@ -831,6 +895,23 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaResetStockBGRAPixelBufferPoolForSize:(CGSize)size;
 - (void)inumaWriteTextureTrace;
 @end
+
+static const void *InumaMainRunLoopNotificationRetainOwner(
+    const void *info) {
+  return (__bridge_retained const void *)((__bridge id)info);
+}
+
+static void InumaMainRunLoopNotificationReleaseOwner(const void *info) {
+  __unused id owner = (__bridge_transfer id)info;
+}
+
+static void InumaMainRunLoopNotificationPerform(void *info) {
+  @autoreleasepool {
+    FlutterRTCVideoRenderer *renderer =
+        (__bridge FlutterRTCVideoRenderer *)info;
+    [renderer inumaMainRunLoopNotificationSourceDidFire];
+  }
+}
 #endif
 
 @implementation FlutterRTCVideoRenderer {
@@ -859,6 +940,8 @@ static void InumaRecordRenderQoSObservationLocked(
   bool _inumaCurrentFrameWasRescuePromoted;
   bool _inumaEmergencyGraceEnabled;
   bool _inumaDirectFrameDisplayRetryEnabled;
+  bool _inumaMainRunLoopNotificationEnabled;
+  bool _inumaCurrentNormalNotificationRequired;
   bool _inumaEmergencyGraceBurstArmed;
   bool _inumaCurrentFrameRepeatDeferred;
   bool _inumaCurrentRepeatRetryFired;
@@ -882,6 +965,13 @@ static void InumaRecordRenderQoSObservationLocked(
   dispatch_source_t _inumaTextureHoldTimer;
   CADisplayLink *_inumaRescueDisplayLink;
   CADisplayLink *_inumaDirectFrameDisplayRetryLink;
+  CFRunLoopSourceRef _inumaMainRunLoopNotificationSource;
+  bool _inumaMainRunLoopNotificationTokenOccupied;
+  int64_t _inumaMainRunLoopNotificationTextureId;
+  int64_t _inumaMainRunLoopNotificationFrameTimestampNs;
+  uint64_t _inumaMainRunLoopNotificationRendererStateGeneration;
+  uint64_t _inumaMainRunLoopNotificationArmedMonotonicNs;
+  NSUInteger _inumaMainRunLoopNotificationEventIndex;
   bool _inumaDirectFrameDisplayRetryActive;
   uint64_t _inumaTraceSnapshotCount;
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
@@ -939,6 +1029,8 @@ static void InumaRecordRenderQoSObservationLocked(
         InumaEmergencyGraceEnabledFromEnvironment(environment);
     _inumaDirectFrameDisplayRetryEnabled =
         InumaDirectFrameDisplayRetryEnabledFromEnvironment(environment);
+    _inumaMainRunLoopNotificationEnabled =
+        InumaMainRunLoopNotificationEnabledFromEnvironment(environment);
     _inumaMaxQueuedTextureFrames =
         InumaMaxQueuedTextureFramesFromEnvironment(environment);
     _inumaPendingTextureFrameHead = 0;
@@ -952,6 +1044,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
+    _inumaCurrentNormalNotificationRequired = false;
     _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
     _inumaEmergencyGraceBurstArmed = true;
     _inumaFrameTimestampNs = 0;
@@ -960,6 +1053,13 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaTextureHoldTimer = nil;
     _inumaRescueDisplayLink = nil;
     _inumaDirectFrameDisplayRetryLink = nil;
+    _inumaMainRunLoopNotificationSource = NULL;
+    _inumaMainRunLoopNotificationTokenOccupied = false;
+    _inumaMainRunLoopNotificationTextureId = -1;
+    _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+    _inumaMainRunLoopNotificationRendererStateGeneration = 0;
+    _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
+    _inumaMainRunLoopNotificationEventIndex = NSNotFound;
     _inumaDirectFrameDisplayRetryActive = false;
     _inumaTraceSnapshotCount = 0;
     _inumaTraceSnapshotLockHoldMaxNs = 0;
@@ -986,6 +1086,15 @@ static void InumaRecordRenderQoSObservationLocked(
         [weakSelf inumaWriteTextureTrace];
       });
       dispatch_resume(_inumaTraceTimer);
+    }
+    if (_inumaMainRunLoopNotificationEnabled) {
+      if (NSThread.isMainThread) {
+        [self inumaCreateMainRunLoopNotificationSource];
+      } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          [self inumaCreateMainRunLoopNotificationSource];
+        });
+      }
     }
 #endif
     /*Create Event Channel.*/
@@ -1135,6 +1244,7 @@ static void InumaRecordRenderQoSObservationLocked(
 #endif
     _frameAvailable = false;
 #if TARGET_OS_OSX
+    _inumaCurrentNormalNotificationRequired = false;
     const uint64_t copiedAt = InumaMonotonicNanoseconds();
     const uint64_t copiedAtUptimeNs = InumaUptimeNanoseconds();
     // A display-acknowledged rescue may request the next raster copy after
@@ -1216,6 +1326,7 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
       _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
       _inumaCurrentFrameWasRescuePromoted = true;
+      _inumaCurrentNormalNotificationRequired = false;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -1336,6 +1447,7 @@ static void InumaRecordRenderQoSObservationLocked(
 
 - (void)dispose {
 #if TARGET_OS_OSX
+  CFRunLoopSourceRef mainRunLoopNotificationSource = NULL;
   if (_inumaTraceTimer != nil) {
     dispatch_source_cancel(_inumaTraceTimer);
     _inumaTraceTimer = nil;
@@ -1348,6 +1460,8 @@ static void InumaRecordRenderQoSObservationLocked(
   [self inumaCancelRescueDisplayLinkLocked];
   [self inumaCancelDirectFrameDisplayRetryLocked];
   [self inumaInvalidateDirectFrameDisplayRetryLinkLocked];
+  mainRunLoopNotificationSource =
+      [self inumaDetachMainRunLoopNotificationSourceLocked];
 #endif
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
@@ -1366,6 +1480,7 @@ static void InumaRecordRenderQoSObservationLocked(
   _inumaCurrentFrameWasRescuePromoted = false;
   _inumaCurrentFrameRepeatDeferred = false;
   _inumaCurrentRepeatRetryFired = false;
+  _inumaCurrentNormalNotificationRequired = false;
   if (_inumaStockBGRAPixelBufferPool) {
     CVPixelBufferPoolRelease(_inumaStockBGRAPixelBufferPool);
     _inumaStockBGRAPixelBufferPool = nil;
@@ -1374,6 +1489,8 @@ static void InumaRecordRenderQoSObservationLocked(
   _frameAvailable = false;
   os_unfair_lock_unlock(&_lock);
 #if TARGET_OS_OSX
+  [self inumaInvalidateMainRunLoopNotificationSource:
+            mainRunLoopNotificationSource];
   [self inumaWriteTextureTrace];
 #endif
 }
@@ -1385,6 +1502,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _videoTrack = videoTrack;
 #if TARGET_OS_OSX
     _inumaRendererStateGeneration += 1;
+    [self inumaCloseMainRunLoopNotificationTokenLockedForLifecycle];
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaCancelDirectFrameDisplayRetryLocked];
@@ -1398,6 +1516,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
+    _inumaCurrentNormalNotificationRequired = false;
 #endif
     _frameAvailable = false;
     os_unfair_lock_unlock(&_lock);
@@ -1942,6 +2061,7 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaCurrentFrameWasRescuePromoted = false;
       _inumaCurrentFrameRepeatDeferred = false;
       _inumaCurrentRepeatRetryFired = false;
+      _inumaCurrentNormalNotificationRequired = true;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -2246,6 +2366,323 @@ static void InumaRecordRenderQoSObservationLocked(
   return freshBuffer;
 }
 
+- (void)inumaCreateMainRunLoopNotificationSource {
+  os_unfair_lock_lock(&_lock);
+  if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_source_create_attempts += 1;
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (!NSThread.isMainThread) {
+    os_unfair_lock_lock(&_lock);
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_source_registration_failures +=
+          1;
+    }
+    os_unfair_lock_unlock(&_lock);
+    return;
+  }
+
+  CFRunLoopSourceContext context = {0};
+  context.info = (__bridge void *)self;
+  context.retain = InumaMainRunLoopNotificationRetainOwner;
+  context.release = InumaMainRunLoopNotificationReleaseOwner;
+  context.perform = InumaMainRunLoopNotificationPerform;
+  CFRunLoopSourceRef source =
+      CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context);
+  if (source == NULL) {
+    os_unfair_lock_lock(&_lock);
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_source_create_failures += 1;
+    }
+    os_unfair_lock_unlock(&_lock);
+    return;
+  }
+
+  CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
+  CFRunLoopAddSource(mainRunLoop, source, kCFRunLoopCommonModes);
+  const bool registered =
+      CFRunLoopContainsSource(mainRunLoop, source, kCFRunLoopCommonModes);
+  bool accepted = false;
+  os_unfair_lock_lock(&_lock);
+  if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_source_creations += 1;
+  }
+  accepted = registered && _inumaMainRunLoopNotificationEnabled &&
+             _inumaMainRunLoopNotificationSource == NULL;
+  if (accepted) {
+    _inumaMainRunLoopNotificationSource = source;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_source_registrations += 1;
+    }
+  } else if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_source_registration_failures += 1;
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (accepted) {
+    return;
+  }
+  if (registered) {
+    CFRunLoopRemoveSource(mainRunLoop, source, kCFRunLoopCommonModes);
+  }
+  CFRunLoopSourceInvalidate(source);
+  CFRelease(source);
+}
+
+- (BOOL)inumaArmMainRunLoopNotificationForTextureId:(int64_t)textureId
+                                    frameTimestampNs:
+                                        (int64_t)frameTimestampNs
+                             rendererStateGeneration:
+                                 (uint64_t)rendererStateGeneration
+                                      successorRearm:(bool)successorRearm {
+  const uint64_t armedAt = InumaMonotonicNanoseconds();
+  CFRunLoopSourceRef source = NULL;
+  InumaMainRunLoopNotificationArmDecision decision;
+  os_unfair_lock_lock(&_lock);
+  decision = InumaMainRunLoopNotificationEvaluateArm(
+      (InumaMainRunLoopNotificationArmInput){
+          .enabled = _inumaMainRunLoopNotificationEnabled,
+          .ordinary_normal_path = true,
+          .source_registered =
+              _inumaMainRunLoopNotificationSource != NULL,
+          .texture_registered = _textureId == textureId && textureId != -1 &&
+                                _registry != nil,
+          .frame_available = _frameAvailable,
+          .frame_timestamp_valid =
+              frameTimestampNs != 0 &&
+              _inumaFrameTimestampNs == frameTimestampNs &&
+              _inumaRendererStateGeneration == rendererStateGeneration,
+          .token_occupied =
+              _inumaMainRunLoopNotificationTokenOccupied,
+      });
+  if (decision.arm) {
+    _inumaMainRunLoopNotificationTokenOccupied = true;
+    _inumaMainRunLoopNotificationTextureId = textureId;
+    _inumaMainRunLoopNotificationFrameTimestampNs = frameTimestampNs;
+    _inumaMainRunLoopNotificationRendererStateGeneration =
+        rendererStateGeneration;
+    _inumaMainRunLoopNotificationArmedMonotonicNs = armedAt;
+    _inumaMainRunLoopNotificationEventIndex = NSNotFound;
+    source = _inumaMainRunLoopNotificationSource;
+    CFRetain(source);
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_source_signals += 1;
+      _inumaTrace.main_run_loop_notification_run_loop_wakes += 1;
+      if (successorRearm) {
+        _inumaTrace.main_run_loop_notification_successor_rearms += 1;
+      }
+      const NSUInteger eventIndex = InumaReserveTraceSample(
+          &_inumaTrace.main_run_loop_notification_event_count,
+          &_inumaTrace.sample_capacity_exhaustions);
+      if (eventIndex != NSNotFound) {
+        _inumaTrace.main_run_loop_notification_arm_offset_samples[eventIndex] =
+            armedAt - _inumaTraceStartedMonotonicNs;
+        _inumaTrace
+            .main_run_loop_notification_frame_timestamp_ns_samples
+                [eventIndex] = frameTimestampNs;
+        _inumaTrace.main_run_loop_notification_outcome_samples[eventIndex] = 0;
+        _inumaMainRunLoopNotificationEventIndex = eventIndex;
+      }
+    }
+  } else if (_inumaTrace.enabled) {
+    switch (decision.reason) {
+    case InumaMainRunLoopNotificationArmReasonTokenOccupied:
+      _inumaTrace.main_run_loop_notification_occupied_refusals += 1;
+      break;
+    case InumaMainRunLoopNotificationArmReasonSourceUnavailable:
+      _inumaTrace.main_run_loop_notification_source_unavailable_fallbacks +=
+          1;
+      break;
+    case InumaMainRunLoopNotificationArmReasonInvalidOwner:
+      _inumaTrace.main_run_loop_notification_invalid_owner_refusals += 1;
+      break;
+    case InumaMainRunLoopNotificationArmReasonNone:
+    case InumaMainRunLoopNotificationArmReasonAccepted:
+    case InumaMainRunLoopNotificationArmReasonNonOrdinaryPath:
+    default:
+      break;
+    }
+  }
+  os_unfair_lock_unlock(&_lock);
+
+  if (source != NULL) {
+    CFRunLoopSourceSignal(source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    CFRelease(source);
+    return YES;
+  }
+  // An occupied or stale owner is deliberately not converted into a second
+  // GCD notification. Only source unavailability falls back to V39.
+  return decision.reason !=
+         InumaMainRunLoopNotificationArmReasonSourceUnavailable;
+}
+
+- (void)inumaMainRunLoopNotificationSourceDidFire {
+  const uint64_t callbackStarted = InumaMonotonicNanoseconds();
+  id<FlutterTextureRegistry> registry = nil;
+  int64_t textureId = -1;
+  NSUInteger eventIndex = NSNotFound;
+  bool shouldFire = false;
+  bool shouldRearmSuccessor = false;
+  int64_t successorTextureId = -1;
+  int64_t successorFrameTimestampNs = 0;
+  uint64_t successorRendererStateGeneration = 0;
+  os_unfair_lock_lock(&_lock);
+  if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_callbacks += 1;
+    if (!NSThread.isMainThread) {
+      _inumaTrace.main_run_loop_notification_off_main_callbacks += 1;
+    }
+  }
+  const InumaMainRunLoopNotificationFireDecision decision =
+      InumaMainRunLoopNotificationEvaluateFire(
+          (InumaMainRunLoopNotificationFireInput){
+              .enabled = _inumaMainRunLoopNotificationEnabled,
+              .platform_thread = NSThread.isMainThread,
+              .owns_source = _inumaMainRunLoopNotificationSource != NULL,
+              .token_occupied =
+                  _inumaMainRunLoopNotificationTokenOccupied,
+              .renderer_state_matches =
+                  _inumaRendererStateGeneration ==
+                  _inumaMainRunLoopNotificationRendererStateGeneration,
+              .texture_registered = _textureId != -1,
+              .registry_available = _registry != nil,
+              .texture_matches =
+                  _textureId == _inumaMainRunLoopNotificationTextureId,
+              .frame_available = _frameAvailable,
+              .frame_timestamp_matches =
+                  _inumaFrameTimestampNs ==
+                  _inumaMainRunLoopNotificationFrameTimestampNs,
+          });
+  eventIndex = _inumaMainRunLoopNotificationEventIndex;
+  if (decision.fire) {
+    shouldFire = true;
+    textureId = _inumaMainRunLoopNotificationTextureId;
+    registry = _registry;
+    _inumaCurrentNormalNotificationRequired = false;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_current_fires += 1;
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.main_run_loop_notification_event_count) {
+        _inumaTrace.main_run_loop_notification_outcome_samples[eventIndex] = 1;
+      }
+    }
+  } else if (decision.close_stale) {
+    if (_inumaTrace.enabled) {
+      _inumaTrace.main_run_loop_notification_stale_closes += 1;
+      if (eventIndex != NSNotFound &&
+          eventIndex < _inumaTrace.main_run_loop_notification_event_count) {
+        _inumaTrace.main_run_loop_notification_outcome_samples[eventIndex] = 2;
+      }
+    }
+  } else if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_empty_callbacks += 1;
+  }
+  if (eventIndex != NSNotFound &&
+      eventIndex < _inumaTrace.main_run_loop_notification_event_count &&
+      _inumaTraceStartedMonotonicNs > 0 &&
+      callbackStarted >= _inumaTraceStartedMonotonicNs) {
+    _inumaTrace.main_run_loop_notification_callback_offset_samples[eventIndex] =
+        callbackStarted - _inumaTraceStartedMonotonicNs;
+  }
+  _inumaMainRunLoopNotificationTokenOccupied = false;
+  _inumaMainRunLoopNotificationTextureId = -1;
+  _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+  _inumaMainRunLoopNotificationRendererStateGeneration = 0;
+  _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
+  _inumaMainRunLoopNotificationEventIndex = NSNotFound;
+  shouldRearmSuccessor = !shouldFire &&
+                         _inumaCurrentNormalNotificationRequired &&
+                         _frameAvailable && _textureId != -1 &&
+                         _inumaFrameTimestampNs != 0;
+  if (shouldRearmSuccessor) {
+    successorTextureId = _textureId;
+    successorFrameTimestampNs = _inumaFrameTimestampNs;
+    successorRendererStateGeneration = _inumaRendererStateGeneration;
+  }
+  os_unfair_lock_unlock(&_lock);
+
+  if (shouldFire && registry != nil) {
+    [registry textureFrameAvailable:textureId];
+  }
+  const uint64_t callbackEnded = InumaMonotonicNanoseconds();
+  if (eventIndex != NSNotFound) {
+    os_unfair_lock_lock(&_lock);
+    if (_inumaTrace.enabled &&
+        eventIndex < _inumaTrace.main_run_loop_notification_event_count) {
+      _inumaTrace
+          .main_run_loop_notification_callback_duration_samples[eventIndex] =
+          callbackEnded - callbackStarted;
+    }
+    os_unfair_lock_unlock(&_lock);
+  }
+  if (shouldRearmSuccessor) {
+    [self inumaArmMainRunLoopNotificationForTextureId:successorTextureId
+                                     frameTimestampNs:
+                                         successorFrameTimestampNs
+                              rendererStateGeneration:
+                                  successorRendererStateGeneration
+                                       successorRearm:true];
+  }
+}
+
+- (void)inumaCloseMainRunLoopNotificationTokenLockedForLifecycle {
+  if (!InumaMainRunLoopNotificationShouldCloseForLifecycle(
+          _inumaMainRunLoopNotificationEnabled,
+          _inumaMainRunLoopNotificationTokenOccupied)) {
+    return;
+  }
+  if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_lifecycle_closes += 1;
+    const NSUInteger eventIndex = _inumaMainRunLoopNotificationEventIndex;
+    if (eventIndex != NSNotFound &&
+        eventIndex < _inumaTrace.main_run_loop_notification_event_count) {
+      _inumaTrace.main_run_loop_notification_outcome_samples[eventIndex] = 3;
+    }
+  }
+  _inumaMainRunLoopNotificationTokenOccupied = false;
+  _inumaMainRunLoopNotificationTextureId = -1;
+  _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+  _inumaMainRunLoopNotificationRendererStateGeneration = 0;
+  _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
+  _inumaMainRunLoopNotificationEventIndex = NSNotFound;
+}
+
+- (CFRunLoopSourceRef)inumaDetachMainRunLoopNotificationSourceLocked {
+  [self inumaCloseMainRunLoopNotificationTokenLockedForLifecycle];
+  CFRunLoopSourceRef source = _inumaMainRunLoopNotificationSource;
+  _inumaMainRunLoopNotificationSource = NULL;
+  return source;
+}
+
+- (void)inumaInvalidateMainRunLoopNotificationSource:
+    (CFRunLoopSourceRef)source {
+  if (source == NULL) {
+    return;
+  }
+  __block bool removed = false;
+  void (^invalidateSource)(void) = ^{
+    CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
+    removed = CFRunLoopContainsSource(mainRunLoop, source,
+                                      kCFRunLoopCommonModes);
+    if (removed) {
+      CFRunLoopRemoveSource(mainRunLoop, source, kCFRunLoopCommonModes);
+    }
+    CFRunLoopSourceInvalidate(source);
+  };
+  if (NSThread.isMainThread) {
+    invalidateSource();
+  } else {
+    dispatch_sync(dispatch_get_main_queue(), invalidateSource);
+  }
+  os_unfair_lock_lock(&_lock);
+  if (_inumaTrace.enabled) {
+    _inumaTrace.main_run_loop_notification_source_removals += removed ? 1 : 0;
+    _inumaTrace.main_run_loop_notification_source_invalidations += 1;
+  }
+  os_unfair_lock_unlock(&_lock);
+  CFRelease(source);
+}
+
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
@@ -2256,6 +2693,9 @@ static void InumaRecordRenderQoSObservationLocked(
                             recordRasterRepeatRetry:
                                 (bool)recordRasterRepeatRetry {
   const uint64_t enqueuedAt = InumaMonotonicNanoseconds();
+  const bool ordinaryNormalPath = !bypassMinimumHold &&
+                                  !recordRescueBypass &&
+                                  !recordRasterRepeatRetry;
   __block uint64_t scheduledDelayNs = 0;
   __block NSUInteger rasterRepeatRetryEventIndex = NSNotFound;
   os_unfair_lock_lock(&_lock);
@@ -2353,6 +2793,9 @@ static void InumaRecordRenderQoSObservationLocked(
     if (recordRasterRepeatRetry && notificationIsCurrent &&
         registry != nil && strongSelf->_inumaCurrentFrameRepeatDeferred) {
       strongSelf->_inumaCurrentRepeatRetryFired = true;
+    }
+    if (ordinaryNormalPath && notificationIsCurrent && registry != nil) {
+      strongSelf->_inumaCurrentNormalNotificationRequired = false;
     }
     if (traceEnabled && recordRasterRepeatRetry) {
       if (notificationIsCurrent && registry != nil) {
@@ -2485,8 +2928,25 @@ static void InumaRecordRenderQoSObservationLocked(
       notifyTextureFrameAvailable();
     });
   };
-  if (scheduledDelayNs == 0) {
+  void (^notifyOnSelectedPlatformOwner)(void) = ^{
+    FlutterRTCVideoRenderer *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      return;
+    }
+    if (ordinaryNormalPath &&
+        strongSelf->_inumaMainRunLoopNotificationEnabled &&
+        [strongSelf
+            inumaArmMainRunLoopNotificationForTextureId:textureId
+                                         frameTimestampNs:frameTimestampNs
+                                  rendererStateGeneration:
+                                      rendererStateGeneration
+                                           successorRearm:false]) {
+      return;
+    }
     notifyOnNextPlatformTurn();
+  };
+  if (scheduledDelayNs == 0) {
+    notifyOnSelectedPlatformOwner();
   } else {
     dispatch_source_t timer = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
@@ -2499,7 +2959,7 @@ static void InumaRecordRenderQoSObservationLocked(
       os_unfair_lock_unlock(&_lock);
       dispatch_after(
           dispatch_time(DISPATCH_TIME_NOW, (int64_t)scheduledDelayNs),
-          dispatch_get_main_queue(), notifyOnNextPlatformTurn);
+          dispatch_get_main_queue(), notifyOnSelectedPlatformOwner);
       return;
     }
 
@@ -2583,7 +3043,7 @@ static void InumaRecordRenderQoSObservationLocked(
       os_unfair_lock_unlock(&strongSelf->_lock);
       dispatch_source_cancel(strongTimer);
       if (timerStateIsCurrent) {
-        notifyOnNextPlatformTurn();
+        notifyOnSelectedPlatformOwner();
       }
     });
     dispatch_source_set_timer(
@@ -2983,6 +3443,8 @@ static void InumaRecordRenderQoSObservationLocked(
   bool textureHoldTimerActive = false;
   bool rescueDisplayLinkActive = false;
   bool directFrameDisplayRetryActive = false;
+  bool mainRunLoopNotificationSourceRegistered = false;
+  bool mainRunLoopNotificationTokenOccupied = false;
   bool currentFrameRepeatDeferred = false;
   bool currentFrameRescuePromoted = false;
   bool currentRepeatRetryFired = false;
@@ -2992,9 +3454,11 @@ static void InumaRecordRenderQoSObservationLocked(
   int64_t currentFrameTimestampNs = 0;
   int64_t primaryFrameTimestampNs = 0;
   int64_t emergencyGraceFrameTimestampNs = 0;
+  int64_t mainRunLoopNotificationFrameTimestampNs = 0;
   uint64_t primaryFrameAgeNs = 0;
   uint64_t currentFrameAgeNs = 0;
   uint64_t emergencyGraceResidenceNs = 0;
+  uint64_t mainRunLoopNotificationTokenAgeNs = 0;
   os_unfair_lock_lock(&_lock);
   const uint64_t traceSnapshotMonotonicNs = InumaMonotonicNanoseconds();
   InumaCopyTextureTraceLocked(snapshot, &_inumaTrace);
@@ -3003,6 +3467,19 @@ static void InumaRecordRenderQoSObservationLocked(
   textureHoldTimerActive = _inumaTextureHoldTimer != nil;
   rescueDisplayLinkActive = _inumaRescueDisplayLink != nil;
   directFrameDisplayRetryActive = _inumaDirectFrameDisplayRetryActive;
+  mainRunLoopNotificationSourceRegistered =
+      _inumaMainRunLoopNotificationSource != NULL;
+  mainRunLoopNotificationTokenOccupied =
+      _inumaMainRunLoopNotificationTokenOccupied;
+  mainRunLoopNotificationFrameTimestampNs =
+      _inumaMainRunLoopNotificationFrameTimestampNs;
+  if (_inumaMainRunLoopNotificationArmedMonotonicNs > 0 &&
+      traceSnapshotMonotonicNs >=
+          _inumaMainRunLoopNotificationArmedMonotonicNs) {
+    mainRunLoopNotificationTokenAgeNs =
+        traceSnapshotMonotonicNs -
+        _inumaMainRunLoopNotificationArmedMonotonicNs;
+  }
   currentFrameRepeatDeferred = _inumaCurrentFrameRepeatDeferred;
   currentFrameRescuePromoted = _inumaCurrentFrameWasRescuePromoted;
   currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
@@ -3057,7 +3534,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @38,
+    @"tail_diagnostics_version" : @42,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
@@ -3248,6 +3725,59 @@ static void InumaRecordRenderQoSObservationLocked(
          @"invalidate_only_at_dispose",
     @"direct_frame_display_retry_active_at_snapshot" :
         @(directFrameDisplayRetryActive),
+    @"main_run_loop_notification_enabled" :
+        @(_inumaMainRunLoopNotificationEnabled),
+    @"main_run_loop_notification_default" : @"disabled",
+    @"main_run_loop_notification_contract" :
+        @"one_persistent_main_common_modes_version0_source_one_exact_"
+         @"ordinary_current_token_one_mark_no_replay",
+    @"main_run_loop_notification_source_create_attempts" :
+        @(snapshot->main_run_loop_notification_source_create_attempts),
+    @"main_run_loop_notification_source_creations" :
+        @(snapshot->main_run_loop_notification_source_creations),
+    @"main_run_loop_notification_source_create_failures" :
+        @(snapshot->main_run_loop_notification_source_create_failures),
+    @"main_run_loop_notification_source_registrations" :
+        @(snapshot->main_run_loop_notification_source_registrations),
+    @"main_run_loop_notification_source_registration_failures" :
+        @(snapshot->main_run_loop_notification_source_registration_failures),
+    @"main_run_loop_notification_source_signals" :
+        @(snapshot->main_run_loop_notification_source_signals),
+    @"main_run_loop_notification_run_loop_wakes" :
+        @(snapshot->main_run_loop_notification_run_loop_wakes),
+    @"main_run_loop_notification_callbacks" :
+        @(snapshot->main_run_loop_notification_callbacks),
+    @"main_run_loop_notification_current_fires" :
+        @(snapshot->main_run_loop_notification_current_fires),
+    @"main_run_loop_notification_stale_closes" :
+        @(snapshot->main_run_loop_notification_stale_closes),
+    @"main_run_loop_notification_empty_callbacks" :
+        @(snapshot->main_run_loop_notification_empty_callbacks),
+    @"main_run_loop_notification_occupied_refusals" :
+        @(snapshot->main_run_loop_notification_occupied_refusals),
+    @"main_run_loop_notification_invalid_owner_refusals" :
+        @(snapshot->main_run_loop_notification_invalid_owner_refusals),
+    @"main_run_loop_notification_source_unavailable_fallbacks" :
+        @(snapshot
+              ->main_run_loop_notification_source_unavailable_fallbacks),
+    @"main_run_loop_notification_successor_rearms" :
+        @(snapshot->main_run_loop_notification_successor_rearms),
+    @"main_run_loop_notification_lifecycle_closes" :
+        @(snapshot->main_run_loop_notification_lifecycle_closes),
+    @"main_run_loop_notification_source_removals" :
+        @(snapshot->main_run_loop_notification_source_removals),
+    @"main_run_loop_notification_source_invalidations" :
+        @(snapshot->main_run_loop_notification_source_invalidations),
+    @"main_run_loop_notification_off_main_callbacks" :
+        @(snapshot->main_run_loop_notification_off_main_callbacks),
+    @"main_run_loop_notification_source_registered_at_snapshot" :
+        @(mainRunLoopNotificationSourceRegistered),
+    @"main_run_loop_notification_token_occupied_at_snapshot" :
+        @(mainRunLoopNotificationTokenOccupied),
+    @"main_run_loop_notification_frame_timestamp_ns_at_snapshot" :
+        @(mainRunLoopNotificationFrameTimestampNs),
+    @"main_run_loop_notification_token_age_ns_at_snapshot" :
+        @(mainRunLoopNotificationTokenAgeNs),
     @"texture_notification_platform_turn_schedules" :
         @(snapshot->texture_notification_platform_turn_schedules),
     @"texture_notification_platform_turn_fires" :
@@ -3408,6 +3938,30 @@ static void InumaRecordRenderQoSObservationLocked(
       @"1" : @"fired",
       @"2" : @"stale",
       @"3" : @"cancelled_after_first_copy",
+    },
+    @"main_run_loop_notification_arm_offset_ns" : InumaTraceSampleArray(
+        snapshot->main_run_loop_notification_arm_offset_samples,
+        snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_callback_offset_ns" : InumaTraceSampleArray(
+        snapshot->main_run_loop_notification_callback_offset_samples,
+        snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_callback_duration_ns" :
+        InumaTraceSampleArray(
+            snapshot->main_run_loop_notification_callback_duration_samples,
+            snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->main_run_loop_notification_frame_timestamp_ns_samples,
+            snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_outcome" : InumaTraceByteSampleArray(
+        snapshot->main_run_loop_notification_outcome_samples,
+        snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_outcome_codes" : @{
+      @"0" : @"pending_at_snapshot",
+      @"1" : @"current_fire",
+      @"2" : @"stale_close",
+      @"3" : @"lifecycle_close",
     },
     @"strict_hold_timer_deadline_offset_ns" : InumaTraceSampleArray(
         snapshot->strict_hold_timer_deadline_offset_samples,
@@ -3595,6 +4149,7 @@ static void InumaRecordRenderQoSObservationLocked(
   if (size.width != _frameSize.width || size.height != _frameSize.height) {
 #if TARGET_OS_OSX
     _inumaRendererStateGeneration += 1;
+    [self inumaCloseMainRunLoopNotificationTokenLockedForLifecycle];
     [self inumaCancelTextureHoldTimerLocked];
     [self inumaCancelRescueDisplayLinkLocked];
     [self inumaCancelDirectFrameDisplayRetryLocked];
@@ -3615,6 +4170,7 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
+    _inumaCurrentNormalNotificationRequired = false;
 #else
     NSDictionary *pixelAttributes =
         @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
