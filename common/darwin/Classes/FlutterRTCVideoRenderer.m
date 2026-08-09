@@ -2684,7 +2684,14 @@ static void InumaRecordRenderQoSObservationLocked(
   _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
   _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
   _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
-  [displayLink invalidate];
+  // The display link is owned by the main run loop, while this cancellation
+  // path normally runs under the renderer lock on Flutter's raster thread.
+  // Detach all renderer state first and defer run-loop invalidation until
+  // after the caller releases the lock. Otherwise invalidate can wait for a
+  // main-run-loop callback that is itself waiting for the renderer lock.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [displayLink invalidate];
+  });
   if (_inumaTrace.enabled) {
     _inumaTrace.direct_frame_display_retry_cancellations += 1;
     if (eventIndex != NSNotFound &&
