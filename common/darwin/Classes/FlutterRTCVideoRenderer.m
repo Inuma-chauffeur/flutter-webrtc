@@ -3544,7 +3544,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"prerenderer_smoothing_disabled_configuration_count" :
         @(prerendererSmoothingDisabledConfigurationCount),
     @"prerenderer_smoothing_disabled_applied" :
-        @(prerendererSmoothingDisabledConfigurationCount > 0),
+        prerendererSmoothingDisabledConfigurationCount > 0 ? @YES : @NO,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
