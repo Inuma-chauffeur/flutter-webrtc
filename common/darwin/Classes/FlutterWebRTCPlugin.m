@@ -20,6 +20,7 @@
 
 #if TARGET_OS_OSX
 #import "InumaDecoderBoundaryTrace.h"
+#import "InumaPrerendererSmoothingConfiguration.h"
 #import <os/lock.h>
 #include <pthread/qos.h>
 #include <stdlib.h>
@@ -802,8 +803,15 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     NSDictionary* configuration = argsMap[@"configuration"];
     NSDictionary* constraints = argsMap[@"constraints"];
 
+    RTCConfiguration* rtcConfiguration = [self RTCConfiguration:configuration];
+    if (rtcConfiguration == nil) {
+      result([FlutterError errorWithCode:@"invalid-configuration"
+                                 message:@"prerendererSmoothing must be a Boolean"
+                                 details:nil]);
+      return;
+    }
     RTCPeerConnection* peerConnection = [self.peerConnectionFactory
-        peerConnectionWithConfiguration:[self RTCConfiguration:configuration]
+        peerConnectionWithConfiguration:rtcConfiguration
                             constraints:[self parseMediaConstraints:constraints]
                                delegate:self];
 
@@ -1607,7 +1615,14 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     NSDictionary* configuration = argsMap[@"configuration"];
     RTCPeerConnection* peerConnection = self.peerConnections[peerConnectionId];
     if (peerConnection) {
-      [self peerConnectionSetConfiguration:[self RTCConfiguration:configuration]
+      RTCConfiguration* rtcConfiguration = [self RTCConfiguration:configuration];
+      if (rtcConfiguration == nil) {
+        result([FlutterError errorWithCode:@"invalid-configuration"
+                                   message:@"prerendererSmoothing must be a Boolean"
+                                   details:nil]);
+        return;
+      }
+      [self peerConnectionSetConfiguration:rtcConfiguration
                             peerConnection:peerConnection];
       result(nil);
     } else {
@@ -2342,7 +2357,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
   return [[RTCIceServer alloc] initWithURLStrings:urls];
 }
 
-- (nonnull RTCConfiguration*)RTCConfiguration:(id)json {
+- (nullable RTCConfiguration*)RTCConfiguration:(id)json {
   RTCConfiguration* config = [[RTCConfiguration alloc] init];
 
   if (!json) {
@@ -2353,6 +2368,22 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     NSLog(@"must be an object");
     return config;
   }
+
+#if TARGET_OS_OSX
+  BOOL prerendererSmoothing = YES;
+  InumaPrerendererSmoothingParseResult prerendererSmoothingResult =
+      InumaParsePrerendererSmoothingConfiguration(json,
+                                                   &prerendererSmoothing);
+  if (prerendererSmoothingResult ==
+      InumaPrerendererSmoothingParseResultInvalid) {
+    return nil;
+  }
+  if (prerendererSmoothingResult ==
+      InumaPrerendererSmoothingParseResultValid) {
+    config.prerendererSmoothing = prerendererSmoothing;
+    InumaRecordPrerendererSmoothingConfiguration(prerendererSmoothing);
+  }
+#endif
 
   if (json[@"audioJitterBufferMaxPackets"] != nil &&
       [json[@"audioJitterBufferMaxPackets"] isKindOfClass:[NSNumber class]]) {

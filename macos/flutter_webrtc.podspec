@@ -21,6 +21,7 @@ A new flutter plugin project.
     'Classes/InumaDirectFrameDisplayRetryPolicy.h',
     'Classes/InumaEmergencyGracePolicy.h',
     'Classes/InumaMainRunLoopNotificationPolicy.h',
+    'Classes/InumaPrerendererSmoothingConfiguration.h',
     'Classes/InumaRepeatBoundaryPolicy.h',
   ]
 

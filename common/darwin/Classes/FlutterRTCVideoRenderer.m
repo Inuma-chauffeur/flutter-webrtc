@@ -23,6 +23,7 @@
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaMainRunLoopNotificationPolicy.h"
+#include "InumaPrerendererSmoothingConfiguration.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
@@ -3526,6 +3527,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   NSString *mode = _inumaPixelMode == InumaMacOSPixelModeNativeNV12
                        ? @"native_nv12"
                        : @"stock_bgra";
+  const uint64_t prerendererSmoothingDisabledConfigurationCount =
+      InumaPrerendererSmoothingDisabledConfigurationCount();
   NSDictionary *report = @{
     @"schema" : @"inuma.flutter_webrtc.macos_texture_trace.v1",
     @"status" : @"pass",
@@ -3534,8 +3537,14 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @42,
+    @"tail_diagnostics_version" : @43,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
+    @"prerenderer_smoothing_configuration_contract" :
+        @"explicit_objc_to_native_peer_configuration",
+    @"prerenderer_smoothing_disabled_configuration_count" :
+        @(prerendererSmoothingDisabledConfigurationCount),
+    @"prerenderer_smoothing_disabled_applied" :
+        @(prerendererSmoothingDisabledConfigurationCount > 0),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
