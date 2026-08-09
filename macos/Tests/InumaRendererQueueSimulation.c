@@ -3,6 +3,7 @@
 #include "InumaRendererQueueSimulation.h"
 
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaPreNotificationCopyPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 
 #include <assert.h>
@@ -123,6 +124,12 @@ void AssertUniqueOwnership(
          simulation->primary_frame != simulation->grace_frame);
   assert(!simulation->primary_from_grace || simulation->primary_frame != 0);
   assert(!simulation->current_from_grace || simulation->current_available);
+  assert(!simulation->current_normal_notification_pending ||
+         simulation->current_available);
+  assert(!simulation->current_normal_notification_pending ||
+         !simulation->current_own_notification_issued);
+  assert(!simulation->current_pre_notification_repeat_applied ||
+         simulation->current_available);
   const bool retry_request_still_current =
       simulation->retry_schedule_requested &&
       simulation->texture_registered &&
@@ -241,6 +248,9 @@ void SimulateSourceArrivalWithIdentity(
     simulation->current_ready_ns = ready_ns;
     simulation->current_available = true;
     simulation->current_rescue_promoted = false;
+    simulation->current_normal_notification_pending = false;
+    simulation->current_own_notification_issued = true;
+    simulation->current_pre_notification_repeat_applied = false;
     simulation->current_from_grace = false;
     AssertUniqueOwnership(simulation);
     return;
@@ -301,6 +311,29 @@ void SimulateSourceArrivalWithIdentity(
 void SimulateSourceArrival(RepeatBoundarySimulation *simulation,
                            uint64_t frame, uint64_t ready_ns) {
   SimulateSourceArrivalWithIdentity(simulation, frame, frame, ready_ns);
+}
+
+void SimulateDirectNormalSourceArrivalAwaitingOwnNotification(
+    RepeatBoundarySimulation *simulation, uint64_t frame,
+    uint64_t ready_ns) {
+  assert(!simulation->current_available);
+  SimulateSourceArrival(simulation, frame, ready_ns);
+  assert(simulation->current_frame == frame);
+  simulation->current_normal_notification_pending = true;
+  simulation->current_own_notification_issued = false;
+  simulation->current_pre_notification_repeat_applied = false;
+  AssertUniqueOwnership(simulation);
+}
+
+void SimulateNormalOwnNotification(RepeatBoundarySimulation *simulation,
+                                   uint64_t frame) {
+  assert(simulation->current_available);
+  assert(simulation->current_frame == frame);
+  assert(simulation->current_normal_notification_pending);
+  assert(!simulation->current_own_notification_issued);
+  simulation->current_normal_notification_pending = false;
+  simulation->current_own_notification_issued = true;
+  AssertUniqueOwnership(simulation);
 }
 
 bool SimulateScheduleRetry(RepeatBoundarySimulation *simulation,
@@ -403,6 +436,46 @@ bool SimulateRasterCopy(RepeatBoundarySimulation *simulation,
   if (!simulation->current_available) {
     return false;
   }
+  const InumaPreNotificationCopyPolicyDecision pre_notification_decision =
+      InumaPreNotificationCopyEvaluate(
+          (InumaPreNotificationCopyPolicyInput){
+              .enabled = simulation->current_normal_notification_pending &&
+                         !simulation->current_own_notification_issued,
+              .frame_available = simulation->current_available,
+              .current_frame_rescue_promoted =
+                  simulation->current_rescue_promoted,
+              .normal_notification_pending =
+                  simulation->current_normal_notification_pending,
+              .own_notification_issued =
+                  simulation->current_own_notification_issued,
+              .predecessor_available =
+                  simulation->held_buffer_count > 0 &&
+                  simulation->last_copied_frame > 0,
+              .predecessor_already_repeated =
+                  simulation->current_pre_notification_repeat_applied,
+              .last_copy_monotonic_ns = simulation->last_copy_ns,
+              .checked_monotonic_ns = raster_ns,
+              .minimum_hold_ns = kMinimumHoldNs,
+          });
+  if (pre_notification_decision.evaluated) {
+    simulation->pre_notification_guard_evaluations += 1;
+    if (pre_notification_decision.repeat_predecessor) {
+      assert(NewestHeldBufferFrame(simulation) ==
+             simulation->last_copied_frame);
+      simulation->current_pre_notification_repeat_applied = true;
+      simulation->pre_notification_guard_repeats += 1;
+      AssertUniqueOwnership(simulation);
+      return true;
+    }
+    if (pre_notification_decision.reason ==
+        InumaPreNotificationCopyReasonSuppressDuplicate) {
+      simulation->pre_notification_guard_duplicate_suppressions += 1;
+    }
+    if (pre_notification_decision.suppress_current_copy) {
+      AssertUniqueOwnership(simulation);
+      return false;
+    }
+  }
   const bool base_repeat_candidate =
       simulation->current_rescue_promoted && simulation->last_copy_ns > 0 &&
       raster_ns >= simulation->last_copy_ns;
@@ -473,6 +546,9 @@ bool SimulateRasterCopy(RepeatBoundarySimulation *simulation,
   simulation->current_ready_ns = 0;
   simulation->current_available = false;
   simulation->current_rescue_promoted = false;
+  simulation->current_normal_notification_pending = false;
+  simulation->current_own_notification_issued = false;
+  simulation->current_pre_notification_repeat_applied = false;
   simulation->current_repeat_deferred = false;
   simulation->current_repeat_retry_fired = false;
   simulation->current_from_grace = false;
@@ -513,6 +589,9 @@ bool SimulateRasterCopy(RepeatBoundarySimulation *simulation,
     simulation->current_ready_ns = promoted_ready_ns;
     simulation->current_available = true;
     simulation->current_rescue_promoted = true;
+    simulation->current_normal_notification_pending = false;
+    simulation->current_own_notification_issued = false;
+    simulation->current_pre_notification_repeat_applied = false;
     simulation->current_from_grace = promoted_from_grace;
     if (InumaEmergencyGracePromotedFrameDrains(promoted_from_grace)) {
       simulation->grace_drains += 1;
@@ -581,6 +660,9 @@ void SimulateLifecycleClear(RepeatBoundarySimulation *simulation,
   simulation->current_ready_ns = 0;
   simulation->current_available = false;
   simulation->current_rescue_promoted = false;
+  simulation->current_normal_notification_pending = false;
+  simulation->current_own_notification_issued = false;
+  simulation->current_pre_notification_repeat_applied = false;
   simulation->current_repeat_deferred = false;
   // A grace-origin frame is counted as drained once it reaches current. The
   // production lifecycle clear metric counts only grace-owned queue slots.

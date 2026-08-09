@@ -22,6 +22,7 @@
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaPreNotificationCopyPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CADisplayLink.h>
@@ -162,6 +163,11 @@ typedef struct {
   uint64_t raster_repeat_boundary_applies;
   uint64_t raster_repeat_boundary_extended_applies;
   uint64_t raster_repeat_boundary_bypasses;
+  uint64_t pre_notification_copy_guard_evaluations;
+  uint64_t pre_notification_copy_guard_repeats;
+  uint64_t pre_notification_copy_guard_duplicate_suppressions;
+  uint64_t pre_notification_copy_guard_bypasses;
+  uint64_t pre_notification_copy_guard_missing_predecessor;
   uint64_t emergency_grace_eligible_frames;
   uint64_t emergency_grace_admits;
   uint64_t emergency_grace_admit_repeat_deferred;
@@ -249,6 +255,18 @@ typedef struct {
   uint64_t raster_repeat_boundary_predecessor_tenure_samples
       [kInumaTextureTraceCapacity];
   uint8_t raster_repeat_boundary_outcome_samples[kInumaTextureTraceCapacity];
+  uint64_t pre_notification_copy_guard_event_offset_samples
+      [kInumaTextureTraceCapacity];
+  int64_t pre_notification_copy_guard_predecessor_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  int64_t pre_notification_copy_guard_current_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t pre_notification_copy_guard_predecessor_tenure_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t pre_notification_copy_guard_reason_samples
+      [kInumaTextureTraceCapacity];
+  uint8_t pre_notification_copy_guard_hold_timer_owned_samples
+      [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_platform_retry_schedule_offset_samples
       [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_platform_retry_fire_offset_samples
@@ -314,6 +332,7 @@ typedef struct {
   NSUInteger copy_event_count;
   NSUInteger raster_repeat_event_count;
   NSUInteger raster_repeat_boundary_event_count;
+  NSUInteger pre_notification_copy_guard_event_count;
   NSUInteger raster_repeat_platform_retry_event_count;
   NSUInteger copied_buffer_second_next_copy_hold_count;
   NSUInteger emergency_grace_admit_event_count;
@@ -517,6 +536,21 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          raster_repeat_boundary_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_boundary_outcome_samples,
                          raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(pre_notification_copy_guard_event_offset_samples,
+                         pre_notification_copy_guard_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      pre_notification_copy_guard_predecessor_frame_timestamp_ns_samples,
+      pre_notification_copy_guard_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      pre_notification_copy_guard_current_frame_timestamp_ns_samples,
+      pre_notification_copy_guard_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      pre_notification_copy_guard_predecessor_tenure_samples,
+      pre_notification_copy_guard_event_count);
+  INUMA_COPY_TRACE_ARRAY(pre_notification_copy_guard_reason_samples,
+                         pre_notification_copy_guard_event_count);
+  INUMA_COPY_TRACE_ARRAY(pre_notification_copy_guard_hold_timer_owned_samples,
+                         pre_notification_copy_guard_event_count);
   INUMA_COPY_TRACE_ARRAY(
       raster_repeat_platform_retry_schedule_offset_samples,
       raster_repeat_platform_retry_event_count);
@@ -857,6 +891,9 @@ static void InumaRecordRenderQoSObservationLocked(
   bool _inumaRasterRepeatGuardEnabled;
   uint64_t _inumaRasterRepeatBoundaryNs;
   bool _inumaCurrentFrameWasRescuePromoted;
+  bool _inumaCurrentFrameNormalNotificationPending;
+  bool _inumaCurrentFrameOwnNotificationIssued;
+  bool _inumaCurrentFramePreNotificationRepeatApplied;
   bool _inumaEmergencyGraceEnabled;
   bool _inumaDirectFrameDisplayRetryEnabled;
   bool _inumaEmergencyGraceBurstArmed;
@@ -950,6 +987,9 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaRendererStateGeneration = 1;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameNormalNotificationPending = false;
+    _inumaCurrentFrameOwnNotificationIssued = false;
+    _inumaCurrentFramePreNotificationRepeatApplied = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
     _inumaEmergencyGraceTextureFrame = (InumaPendingTextureFrame){0};
@@ -1013,6 +1053,7 @@ static void InumaRecordRenderQoSObservationLocked(
   int64_t repeatedFrameTextureId = -1;
   int64_t repeatedDeferredFrameTimestampNs = 0;
   uint64_t repeatedRendererStateGeneration = 0;
+  bool suppressCurrentCopyForPreNotificationGuard = false;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
@@ -1025,6 +1066,97 @@ static void InumaRecordRenderQoSObservationLocked(
         &_inumaTrace.sample_capacity_exhaustions);
   }
   const uint64_t repeatCheckedAt = InumaMonotonicNanoseconds();
+  // A direct-frame retry can mark the texture dirty for frame N, but Flutter
+  // acquires the current renderer buffer asynchronously. If normal frame N+1
+  // arrives before that acquisition, the older invalidation must not consume
+  // N+1 before N+1's own strict-hold notification. Preserve the already-held
+  // predecessor once and otherwise suppress an early duplicate acquisition;
+  // the existing normal notification remains the sole future owner.
+  const bool preNotificationCandidate =
+      _inumaDirectFrameDisplayRetryEnabled && _frameAvailable &&
+      !_inumaCurrentFrameWasRescuePromoted &&
+      _inumaCurrentFrameNormalNotificationPending &&
+      !_inumaCurrentFrameOwnNotificationIssued;
+  const bool predecessorAvailable =
+      _inumaCopiedBufferHoldCount > 0 &&
+      _inumaLastCopiedFrameTimestampNs != 0;
+  const InumaPreNotificationCopyPolicyDecision preNotificationDecision =
+      InumaPreNotificationCopyEvaluate((InumaPreNotificationCopyPolicyInput){
+          .enabled = preNotificationCandidate,
+          .frame_available = _frameAvailable,
+          .current_frame_rescue_promoted =
+              _inumaCurrentFrameWasRescuePromoted,
+          .normal_notification_pending =
+              _inumaCurrentFrameNormalNotificationPending,
+          .own_notification_issued =
+              _inumaCurrentFrameOwnNotificationIssued,
+          .predecessor_available = predecessorAvailable,
+          .predecessor_already_repeated =
+              _inumaCurrentFramePreNotificationRepeatApplied,
+          .last_copy_monotonic_ns = _inumaLastCopyMonotonicNs,
+          .checked_monotonic_ns = repeatCheckedAt,
+          .minimum_hold_ns = _inumaMinimumTextureHoldNs,
+      });
+  if (preNotificationDecision.evaluated) {
+    suppressCurrentCopyForPreNotificationGuard =
+        preNotificationDecision.suppress_current_copy;
+    if (_inumaTrace.enabled) {
+      _inumaTrace.pre_notification_copy_guard_evaluations += 1;
+      if (preNotificationDecision.repeat_predecessor) {
+        _inumaTrace.pre_notification_copy_guard_repeats += 1;
+      } else if (preNotificationDecision.reason ==
+                 InumaPreNotificationCopyReasonSuppressDuplicate) {
+        _inumaTrace.pre_notification_copy_guard_duplicate_suppressions += 1;
+      } else {
+        _inumaTrace.pre_notification_copy_guard_bypasses += 1;
+      }
+      if (preNotificationDecision.reason ==
+          InumaPreNotificationCopyReasonMissingPredecessor) {
+        _inumaTrace.pre_notification_copy_guard_missing_predecessor += 1;
+      }
+      const NSUInteger guardIndex = InumaReserveTraceSample(
+          &_inumaTrace.pre_notification_copy_guard_event_count,
+          &_inumaTrace.sample_capacity_exhaustions);
+      if (guardIndex != NSNotFound) {
+        _inumaTrace.pre_notification_copy_guard_event_offset_samples
+            [guardIndex] =
+            repeatCheckedAt - _inumaTraceStartedMonotonicNs;
+        _inumaTrace
+            .pre_notification_copy_guard_predecessor_frame_timestamp_ns_samples
+                [guardIndex] = _inumaLastCopiedFrameTimestampNs;
+        _inumaTrace
+            .pre_notification_copy_guard_current_frame_timestamp_ns_samples
+                [guardIndex] = _inumaFrameTimestampNs;
+        _inumaTrace.pre_notification_copy_guard_predecessor_tenure_samples
+            [guardIndex] = preNotificationDecision.predecessor_tenure_ns;
+        _inumaTrace.pre_notification_copy_guard_reason_samples[guardIndex] =
+            (uint8_t)preNotificationDecision.reason;
+        _inumaTrace.pre_notification_copy_guard_hold_timer_owned_samples
+            [guardIndex] = _inumaTextureHoldTimer != nil ? 1 : 0;
+      }
+    }
+    if (preNotificationDecision.repeat_predecessor) {
+      const NSUInteger newestHoldIndex =
+          (_inumaCopiedBufferHoldHead + _inumaCopiedBufferHoldCount - 1) %
+          kInumaCopiedBufferHoldCapacity;
+      CVPixelBufferRef predecessor =
+          _inumaCopiedBufferHoldRefs[newestHoldIndex];
+      if (predecessor != nil) {
+        buffer = CVBufferRetain(predecessor);
+        _inumaCurrentFramePreNotificationRepeatApplied = true;
+        if (_inumaTrace.enabled) {
+          _inumaTrace.copy_hits += 1;
+        }
+      } else {
+        // The scalar policy used the locked hold count, but keep a nil-safe
+        // fail-closed path if the slot itself is unexpectedly empty.
+        suppressCurrentCopyForPreNotificationGuard = true;
+        if (_inumaTrace.enabled) {
+          _inumaTrace.pre_notification_copy_guard_missing_predecessor += 1;
+        }
+      }
+    }
+  }
   // A rescue notification can reach Flutter's raster thread before Core
   // Animation has had one full minimum-tenure opportunity for the predecessor.
   // Return the retained predecessor once and leave the promoted frame pending;
@@ -1128,7 +1260,8 @@ static void InumaRecordRenderQoSObservationLocked(
     }
   }
 #endif
-  if (buffer == nil && _pixelBufferRef != nil && _frameAvailable) {
+  if (buffer == nil && !suppressCurrentCopyForPreNotificationGuard &&
+      _pixelBufferRef != nil && _frameAvailable) {
     buffer = CVBufferRetain(_pixelBufferRef);
 #if TARGET_OS_OSX
     [self inumaCancelDirectFrameDisplayRetryLocked];
@@ -1147,6 +1280,9 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopyMonotonicNs = copiedAt;
     _inumaLastCopiedFrameTimestampNs = _inumaFrameTimestampNs;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameNormalNotificationPending = false;
+    _inumaCurrentFrameOwnNotificationIssued = false;
+    _inumaCurrentFramePreNotificationRepeatApplied = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
     if (_inumaTrace.enabled) {
@@ -1216,6 +1352,9 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
       _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
       _inumaCurrentFrameWasRescuePromoted = true;
+      _inumaCurrentFrameNormalNotificationPending = false;
+      _inumaCurrentFrameOwnNotificationIssued = false;
+      _inumaCurrentFramePreNotificationRepeatApplied = false;
       if (previousBuffer != nil) {
         CVBufferRelease(previousBuffer);
       }
@@ -1364,6 +1503,9 @@ static void InumaRecordRenderQoSObservationLocked(
   _inumaLastCopiedFrameTimestampNs = 0;
   _inumaFrameTimestampNs = 0;
   _inumaCurrentFrameWasRescuePromoted = false;
+  _inumaCurrentFrameNormalNotificationPending = false;
+  _inumaCurrentFrameOwnNotificationIssued = false;
+  _inumaCurrentFramePreNotificationRepeatApplied = false;
   _inumaCurrentFrameRepeatDeferred = false;
   _inumaCurrentRepeatRetryFired = false;
   if (_inumaStockBGRAPixelBufferPool) {
@@ -1396,6 +1538,9 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameNormalNotificationPending = false;
+    _inumaCurrentFrameOwnNotificationIssued = false;
+    _inumaCurrentFramePreNotificationRepeatApplied = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
 #endif
@@ -1940,6 +2085,9 @@ static void InumaRecordRenderQoSObservationLocked(
       _inumaFrameReadyMonotonicNs = frameReadyNs;
       _inumaFrameTimestampNs = frame.timeStampNs;
       _inumaCurrentFrameWasRescuePromoted = false;
+      _inumaCurrentFrameNormalNotificationPending = _textureId != -1;
+      _inumaCurrentFrameOwnNotificationIssued = false;
+      _inumaCurrentFramePreNotificationRepeatApplied = false;
       _inumaCurrentFrameRepeatDeferred = false;
       _inumaCurrentRepeatRetryFired = false;
       if (previousBuffer != nil) {
@@ -2347,6 +2495,14 @@ static void InumaRecordRenderQoSObservationLocked(
         strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
     const bool traceEnabled = strongSelf->_inumaTrace.enabled;
     id<FlutterTextureRegistry> registry = strongSelf->_registry;
+    if (notificationIsCurrent && registry != nil &&
+        strongSelf->_inumaCurrentFrameNormalNotificationPending) {
+      // Publish ownership before Flutter can synchronously or asynchronously
+      // acquire the texture. copyPixelBuffer can now distinguish this frame's
+      // own invalidation from an older direct-retry invalidation.
+      strongSelf->_inumaCurrentFrameNormalNotificationPending = false;
+      strongSelf->_inumaCurrentFrameOwnNotificationIssued = true;
+    }
     if (traceEnabled && !notificationIsCurrent) {
       strongSelf->_inumaTrace.stale_texture_notifications += 1;
     }
@@ -2985,6 +3141,9 @@ static void InumaRecordRenderQoSObservationLocked(
   bool directFrameDisplayRetryActive = false;
   bool currentFrameRepeatDeferred = false;
   bool currentFrameRescuePromoted = false;
+  bool currentFrameNormalNotificationPending = false;
+  bool currentFrameOwnNotificationIssued = false;
+  bool currentFramePreNotificationRepeatApplied = false;
   bool currentRepeatRetryFired = false;
   bool emergencyGraceOccupied = false;
   bool emergencyGraceBurstArmed = false;
@@ -3005,6 +3164,12 @@ static void InumaRecordRenderQoSObservationLocked(
   directFrameDisplayRetryActive = _inumaDirectFrameDisplayRetryActive;
   currentFrameRepeatDeferred = _inumaCurrentFrameRepeatDeferred;
   currentFrameRescuePromoted = _inumaCurrentFrameWasRescuePromoted;
+  currentFrameNormalNotificationPending =
+      _inumaCurrentFrameNormalNotificationPending;
+  currentFrameOwnNotificationIssued =
+      _inumaCurrentFrameOwnNotificationIssued;
+  currentFramePreNotificationRepeatApplied =
+      _inumaCurrentFramePreNotificationRepeatApplied;
   currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
   currentFrameTimestampNs = _inumaFrameTimestampNs;
   if (_inumaFrameReadyMonotonicNs > 0 &&
@@ -3057,7 +3222,7 @@ static void InumaRecordRenderQoSObservationLocked(
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @38,
+    @"tail_diagnostics_version" : @39,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
@@ -3103,6 +3268,23 @@ static void InumaRecordRenderQoSObservationLocked(
         @(snapshot->raster_repeat_boundary_extended_applies),
     @"raster_repeat_boundary_bypasses" :
         @(snapshot->raster_repeat_boundary_bypasses),
+    @"pre_notification_copy_guard_enabled" :
+        @(_inumaDirectFrameDisplayRetryEnabled),
+    @"pre_notification_copy_guard_default" : @"disabled",
+    @"pre_notification_copy_guard_contract" :
+        @"repeat_retained_predecessor_once_for_foreign_invalidation_before_"
+         @"normal_successor_own_notification_then_suppress_duplicate_and_"
+         @"leave_existing_strict_hold_notification_authoritative",
+    @"pre_notification_copy_guard_evaluations" :
+        @(snapshot->pre_notification_copy_guard_evaluations),
+    @"pre_notification_copy_guard_repeats" :
+        @(snapshot->pre_notification_copy_guard_repeats),
+    @"pre_notification_copy_guard_duplicate_suppressions" :
+        @(snapshot->pre_notification_copy_guard_duplicate_suppressions),
+    @"pre_notification_copy_guard_bypasses" :
+        @(snapshot->pre_notification_copy_guard_bypasses),
+    @"pre_notification_copy_guard_missing_predecessor" :
+        @(snapshot->pre_notification_copy_guard_missing_predecessor),
     @"rescue_notification_phase" :
         InumaRescueNotificationPhaseName(_inumaRescueNotificationPhase),
     @"rescue_notification_contract" :
@@ -3166,6 +3348,12 @@ static void InumaRecordRenderQoSObservationLocked(
         @(currentFrameRepeatDeferred),
     @"current_frame_rescue_promoted_at_snapshot" :
         @(currentFrameRescuePromoted),
+    @"current_frame_normal_notification_pending_at_snapshot" :
+        @(currentFrameNormalNotificationPending),
+    @"current_frame_own_notification_issued_at_snapshot" :
+        @(currentFrameOwnNotificationIssued),
+    @"current_frame_pre_notification_repeat_applied_at_snapshot" :
+        @(currentFramePreNotificationRepeatApplied),
     @"current_frame_age_ns_at_snapshot" : @(currentFrameAgeNs),
     @"current_repeat_retry_fired_at_snapshot" :
         @(currentRepeatRetryFired),
@@ -3479,6 +3667,42 @@ static void InumaRecordRenderQoSObservationLocked(
     @"raster_repeat_boundary_outcome" : InumaTraceByteSampleArray(
         snapshot->raster_repeat_boundary_outcome_samples,
         snapshot->raster_repeat_boundary_event_count),
+    @"pre_notification_copy_guard_reason_codes" : @{
+      @"0" : @"none",
+      @"1" : @"repeat_predecessor",
+      @"2" : @"suppress_duplicate",
+      @"3" : @"own_notification_issued",
+      @"4" : @"rescue_promoted",
+      @"5" : @"missing_predecessor",
+      @"6" : @"at_or_above_minimum_hold",
+      @"7" : @"no_normal_notification_owner",
+      @"8" : @"invalid_clock",
+    },
+    @"pre_notification_copy_guard_event_offset_ns" : InumaTraceSampleArray(
+        snapshot->pre_notification_copy_guard_event_offset_samples,
+        snapshot->pre_notification_copy_guard_event_count),
+    @"pre_notification_copy_guard_predecessor_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->pre_notification_copy_guard_predecessor_frame_timestamp_ns_samples,
+            snapshot->pre_notification_copy_guard_event_count),
+    @"pre_notification_copy_guard_current_frame_timestamp_ns" :
+        InumaTraceSignedSampleArray(
+            snapshot
+                ->pre_notification_copy_guard_current_frame_timestamp_ns_samples,
+            snapshot->pre_notification_copy_guard_event_count),
+    @"pre_notification_copy_guard_predecessor_tenure_ns" :
+        InumaTraceSampleArray(
+            snapshot->pre_notification_copy_guard_predecessor_tenure_samples,
+            snapshot->pre_notification_copy_guard_event_count),
+    @"pre_notification_copy_guard_reason" : InumaTraceByteSampleArray(
+        snapshot->pre_notification_copy_guard_reason_samples,
+        snapshot->pre_notification_copy_guard_event_count),
+    @"pre_notification_copy_guard_hold_timer_owned" :
+        InumaTraceByteSampleArray(
+            snapshot
+                ->pre_notification_copy_guard_hold_timer_owned_samples,
+            snapshot->pre_notification_copy_guard_event_count),
     @"raster_repeat_platform_retry_schedule_offset_ns" :
         InumaTraceSampleArray(
             snapshot->raster_repeat_platform_retry_schedule_offset_samples,
@@ -3613,6 +3837,9 @@ static void InumaRecordRenderQoSObservationLocked(
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
+    _inumaCurrentFrameNormalNotificationPending = false;
+    _inumaCurrentFrameOwnNotificationIssued = false;
+    _inumaCurrentFramePreNotificationRepeatApplied = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
 #else

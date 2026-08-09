@@ -47,6 +47,9 @@ typedef struct {
   size_t held_buffer_count;
   bool current_available;
   bool current_rescue_promoted;
+  bool current_normal_notification_pending;
+  bool current_own_notification_issued;
+  bool current_pre_notification_repeat_applied;
   bool current_repeat_deferred;
   bool current_from_grace;
   bool current_repeat_retry_fired;
@@ -78,6 +81,9 @@ typedef struct {
   uint64_t normal_hold_repeats;
   uint64_t extended_repeats;
   uint64_t boundary_bypasses;
+  uint64_t pre_notification_guard_evaluations;
+  uint64_t pre_notification_guard_repeats;
+  uint64_t pre_notification_guard_duplicate_suppressions;
   uint64_t grace_admits;
   uint64_t grace_shifts;
   uint64_t grace_drains;
@@ -109,6 +115,11 @@ void SimulateSourceArrival(RepeatBoundarySimulation *simulation,
 void SimulateSourceArrivalWithIdentity(
     RepeatBoundarySimulation *simulation, uint64_t frame,
     uint64_t renderer_identity, uint64_t ready_ns);
+void SimulateDirectNormalSourceArrivalAwaitingOwnNotification(
+    RepeatBoundarySimulation *simulation, uint64_t frame,
+    uint64_t ready_ns);
+void SimulateNormalOwnNotification(RepeatBoundarySimulation *simulation,
+                                   uint64_t frame);
 bool SimulateScheduleRetry(RepeatBoundarySimulation *simulation,
                            uint64_t scheduled_ns);
 bool SimulatePlatformTurnDispatch(RepeatBoundarySimulation *simulation);

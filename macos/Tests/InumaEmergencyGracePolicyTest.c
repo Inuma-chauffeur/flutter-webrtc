@@ -2,6 +2,7 @@
 
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
+#include "InumaPreNotificationCopyPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #include "InumaRendererQueueSimulation.h"
 
@@ -326,6 +327,92 @@ static void TestDirectRetryDefaultOffAndStrictOwnership(void) {
   assert(decision.stale);
 }
 
+static InumaPreNotificationCopyPolicyInput PreNotificationInput(void) {
+  return (InumaPreNotificationCopyPolicyInput){
+      .enabled = true,
+      .frame_available = true,
+      .current_frame_rescue_promoted = false,
+      .normal_notification_pending = true,
+      .own_notification_issued = false,
+      .predecessor_available = true,
+      .predecessor_already_repeated = false,
+      .last_copy_monotonic_ns = 100000000,
+      .checked_monotonic_ns = 116812000,
+      .minimum_hold_ns = kMinimumHoldNs,
+  };
+}
+
+static void TestPreNotificationForeignInvalidationExactContract(void) {
+  InumaPreNotificationCopyPolicyInput input = PreNotificationInput();
+  InumaPreNotificationCopyPolicyDecision decision =
+      InumaPreNotificationCopyEvaluate(input);
+  assert(decision.evaluated);
+  assert(decision.suppress_current_copy);
+  assert(decision.repeat_predecessor);
+  assert(decision.predecessor_tenure_ns == 16812000);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonRepeatPredecessor);
+
+  input.predecessor_already_repeated = true;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(decision.evaluated);
+  assert(decision.suppress_current_copy);
+  assert(!decision.repeat_predecessor);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonSuppressDuplicate);
+
+  input = PreNotificationInput();
+  input.checked_monotonic_ns = 119000000;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(decision.evaluated);
+  assert(!decision.suppress_current_copy);
+  assert(!decision.repeat_predecessor);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonAtOrAboveMinimumHold);
+}
+
+static void TestPreNotificationGuardStrictExclusions(void) {
+  InumaPreNotificationCopyPolicyInput input = PreNotificationInput();
+  input.enabled = false;
+  InumaPreNotificationCopyPolicyDecision decision =
+      InumaPreNotificationCopyEvaluate(input);
+  assert(!decision.evaluated);
+  assert(!decision.suppress_current_copy);
+
+  input = PreNotificationInput();
+  input.own_notification_issued = true;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(!decision.suppress_current_copy);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonOwnNotificationIssued);
+
+  input = PreNotificationInput();
+  input.current_frame_rescue_promoted = true;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(!decision.suppress_current_copy);
+  assert(decision.reason == InumaPreNotificationCopyReasonRescuePromoted);
+
+  input = PreNotificationInput();
+  input.normal_notification_pending = false;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(!decision.suppress_current_copy);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonNoNormalNotificationOwner);
+
+  input = PreNotificationInput();
+  input.predecessor_available = false;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(decision.suppress_current_copy);
+  assert(decision.reason ==
+         InumaPreNotificationCopyReasonMissingPredecessor);
+
+  input = PreNotificationInput();
+  input.checked_monotonic_ns = input.last_copy_monotonic_ns - 1;
+  decision = InumaPreNotificationCopyEvaluate(input);
+  assert(!decision.suppress_current_copy);
+  assert(decision.reason == InumaPreNotificationCopyReasonInvalidClock);
+}
+
 int main(void) {
   TestExactEligibilityBoundary();
   TestDefaultOffIsQuiescent();
@@ -339,6 +426,8 @@ int main(void) {
   TestRepeatBoundaryDefaultOffAndBaseGuard();
   TestDirectRetryExactAgeBoundary();
   TestDirectRetryDefaultOffAndStrictOwnership();
+  TestPreNotificationForeignInvalidationExactContract();
+  TestPreNotificationGuardStrictExclusions();
   InumaRunRendererQueueSimulationScenarios();
   return 0;
 }
