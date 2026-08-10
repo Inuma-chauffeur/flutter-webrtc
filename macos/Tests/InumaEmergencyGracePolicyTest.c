@@ -340,6 +340,13 @@ static void TestFrameOwnershipAcceptsZeroTimestampWithExactGeneration(void) {
   assert(!InumaFrameOwnershipValuesMatch(1, 1, 0, 1));
 }
 
+static void TestFrameGenerationIsMonotonicAndNeverZero(void) {
+  assert(InumaNextFrameGeneration(0) == 1);
+  assert(InumaNextFrameGeneration(1) == 2);
+  assert(InumaNextFrameGeneration(UINT64_MAX - 1) == UINT64_MAX);
+  assert(InumaNextFrameGeneration(UINT64_MAX) == 1);
+}
+
 static InumaMainRunLoopNotificationArmInput MainRunLoopArmInput(void) {
   return (InumaMainRunLoopNotificationArmInput){
       .enabled = true,
@@ -554,6 +561,7 @@ int main(void) {
   TestDirectRetryExactAgeBoundary();
   TestDirectRetryDefaultOffAndStrictOwnership();
   TestFrameOwnershipAcceptsZeroTimestampWithExactGeneration();
+  TestFrameGenerationIsMonotonicAndNeverZero();
   TestMainRunLoopNotificationArmContract();
   TestMainRunLoopNotificationFireAndLifecycleContract();
   TestMainRunLoopNotificationDeterministicSequences();

@@ -77,6 +77,7 @@ typedef struct {
 typedef struct {
   CVPixelBufferRef pixel_buffer;
   int64_t frame_timestamp_ns;
+  uint64_t frame_generation;
   uint64_t ready_monotonic_ns;
   uint64_t emergency_grace_admitted_monotonic_ns;
   bool from_emergency_grace;
@@ -218,18 +219,26 @@ typedef struct {
   uint64_t texture_notify_samples[kInumaTextureTraceCapacity];
   uint64_t texture_hold_delay_samples[kInumaTextureTraceCapacity];
   int64_t texture_hold_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_hold_frame_generation_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t texture_notify_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t texture_notify_frame_generation_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_scheduled_delay_samples[kInumaTextureTraceCapacity];
   uint64_t texture_notify_deadline_lateness_samples[kInumaTextureTraceCapacity];
   uint64_t queue_wait_samples[kInumaTextureTraceCapacity];
   uint64_t queue_enqueue_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t queue_enqueue_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t queue_enqueue_frame_generation_samples[kInumaTextureTraceCapacity];
   uint64_t queue_promote_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t queue_promote_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t queue_promote_frame_generation_samples[kInumaTextureTraceCapacity];
   int64_t rescue_hold_bypass_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t rescue_hold_bypass_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   int64_t rescue_hold_preservation_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t rescue_hold_preservation_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t rescue_display_link_schedule_offset_samples
       [kInumaTextureTraceCapacity];
@@ -239,6 +248,8 @@ typedef struct {
   uint64_t rescue_display_link_callback_count_samples
       [kInumaTextureTraceCapacity];
   int64_t rescue_display_link_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t rescue_display_link_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t direct_frame_display_retry_schedule_offset_samples
       [kInumaTextureTraceCapacity];
@@ -250,6 +261,8 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   int64_t direct_frame_display_retry_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t direct_frame_display_retry_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   uint8_t direct_frame_display_retry_outcome_samples
       [kInumaTextureTraceCapacity];
   uint64_t main_run_loop_notification_arm_offset_samples
@@ -260,6 +273,8 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   int64_t main_run_loop_notification_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t main_run_loop_notification_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   uint8_t main_run_loop_notification_outcome_samples
       [kInumaTextureTraceCapacity];
   uint64_t strict_hold_timer_deadline_offset_samples
@@ -267,16 +282,24 @@ typedef struct {
   uint64_t strict_hold_timer_fire_offset_samples[kInumaTextureTraceCapacity];
   int64_t strict_hold_timer_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t strict_hold_timer_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   uint64_t render_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t render_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t render_frame_generation_samples[kInumaTextureTraceCapacity];
   uint8_t render_outcome_samples[kInumaTextureTraceCapacity];
   uint64_t coalesced_pending_age_samples[kInumaTextureTraceCapacity];
   uint64_t copy_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t copy_frame_timestamp_ns_samples[kInumaTextureTraceCapacity];
+  uint64_t copy_frame_generation_samples[kInumaTextureTraceCapacity];
   uint64_t raster_repeat_event_offset_samples[kInumaTextureTraceCapacity];
   int64_t raster_repeat_predecessor_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_predecessor_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   int64_t raster_repeat_deferred_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_deferred_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_predecessor_tenure_samples
       [kInumaTextureTraceCapacity];
@@ -284,7 +307,11 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   int64_t raster_repeat_boundary_predecessor_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_boundary_predecessor_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   int64_t raster_repeat_boundary_successor_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_boundary_successor_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t raster_repeat_boundary_predecessor_tenure_samples
       [kInumaTextureTraceCapacity];
@@ -295,15 +322,23 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   int64_t raster_repeat_platform_retry_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t raster_repeat_platform_retry_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   uint64_t copied_buffer_second_next_copy_hold_samples
       [kInumaTextureTraceCapacity];
   uint64_t emergency_grace_admit_event_offset_samples
       [kInumaTextureTraceCapacity];
   int64_t emergency_grace_admit_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_admit_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   int64_t emergency_grace_admit_current_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_admit_current_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   int64_t emergency_grace_admit_primary_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_admit_primary_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t emergency_grace_admit_primary_age_samples
       [kInumaTextureTraceCapacity];
@@ -315,14 +350,20 @@ typedef struct {
       [kInumaTextureTraceCapacity];
   int64_t emergency_grace_shift_frame_timestamp_ns_samples
       [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_shift_frame_generation_samples
+      [kInumaTextureTraceCapacity];
   uint64_t emergency_grace_drain_event_offset_samples
       [kInumaTextureTraceCapacity];
   int64_t emergency_grace_drain_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_drain_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint64_t emergency_grace_residence_samples[kInumaTextureTraceCapacity];
   uint64_t emergency_grace_refuse_event_offset_samples
       [kInumaTextureTraceCapacity];
   int64_t emergency_grace_refuse_frame_timestamp_ns_samples
+      [kInumaTextureTraceCapacity];
+  uint64_t emergency_grace_refuse_frame_generation_samples
       [kInumaTextureTraceCapacity];
   uint8_t emergency_grace_refuse_reason_samples[kInumaTextureTraceCapacity];
   uint64_t emergency_grace_refuse_current_age_samples
@@ -406,7 +447,8 @@ static NSUInteger InumaReserveTraceSample(NSUInteger *count,
 
 static void InumaRecordEmergencyGraceRefusalLocked(
     InumaTextureTrace *trace, uint64_t eventAt, uint64_t traceStartedAt,
-    int64_t frameTimestampNs, InumaEmergencyGraceRefuseReason reason,
+    int64_t frameTimestampNs, uint64_t frameGeneration,
+    InumaEmergencyGraceRefuseReason reason,
     uint64_t currentAgeNs, uint64_t primaryAgeNs,
     bool currentRescuePromoted, bool currentAwaitsCopy) {
   trace->emergency_grace_refuses += 1;
@@ -444,6 +486,8 @@ static void InumaRecordEmergencyGraceRefusalLocked(
           : 0;
   trace->emergency_grace_refuse_frame_timestamp_ns_samples[refuseIndex] =
       frameTimestampNs;
+  trace->emergency_grace_refuse_frame_generation_samples[refuseIndex] =
+      frameGeneration;
   trace->emergency_grace_refuse_reason_samples[refuseIndex] = reason;
   trace->emergency_grace_refuse_current_age_samples[refuseIndex] =
       currentAgeNs;
@@ -479,9 +523,13 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
   INUMA_COPY_TRACE_ARRAY(texture_hold_delay_samples, texture_hold_delay_count);
   INUMA_COPY_TRACE_ARRAY(texture_hold_frame_timestamp_ns_samples,
                          texture_hold_delay_count);
+  INUMA_COPY_TRACE_ARRAY(texture_hold_frame_generation_samples,
+                         texture_hold_delay_count);
   INUMA_COPY_TRACE_ARRAY(texture_notify_event_offset_samples,
                          texture_notify_event_count);
   INUMA_COPY_TRACE_ARRAY(texture_notify_frame_timestamp_ns_samples,
+                         texture_notify_event_count);
+  INUMA_COPY_TRACE_ARRAY(texture_notify_frame_generation_samples,
                          texture_notify_event_count);
   INUMA_COPY_TRACE_ARRAY(texture_notify_scheduled_delay_samples,
                          texture_notify_event_count);
@@ -492,13 +540,21 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          queue_enqueue_event_count);
   INUMA_COPY_TRACE_ARRAY(queue_enqueue_frame_timestamp_ns_samples,
                          queue_enqueue_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_enqueue_frame_generation_samples,
+                         queue_enqueue_event_count);
   INUMA_COPY_TRACE_ARRAY(queue_promote_event_offset_samples,
                          queue_promote_event_count);
   INUMA_COPY_TRACE_ARRAY(queue_promote_frame_timestamp_ns_samples,
                          queue_promote_event_count);
+  INUMA_COPY_TRACE_ARRAY(queue_promote_frame_generation_samples,
+                         queue_promote_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_hold_bypass_frame_timestamp_ns_samples,
                          rescue_hold_bypass_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_hold_bypass_frame_generation_samples,
+                         rescue_hold_bypass_count);
   INUMA_COPY_TRACE_ARRAY(rescue_hold_preservation_frame_timestamp_ns_samples,
+                         rescue_hold_preservation_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_hold_preservation_frame_generation_samples,
                          rescue_hold_preservation_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_schedule_offset_samples,
                          rescue_display_link_event_count);
@@ -510,6 +566,8 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(rescue_display_link_frame_timestamp_ns_samples,
                          rescue_display_link_event_count);
+  INUMA_COPY_TRACE_ARRAY(rescue_display_link_frame_generation_samples,
+                         rescue_display_link_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_schedule_offset_samples,
                          direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_callback_offset_samples,
@@ -520,6 +578,8 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
       direct_frame_display_retry_notification_offset_samples,
       direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_frame_timestamp_ns_samples,
+                         direct_frame_display_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_frame_generation_samples,
                          direct_frame_display_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(direct_frame_display_retry_outcome_samples,
                          direct_frame_display_retry_event_count);
@@ -533,6 +593,9 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
   INUMA_COPY_TRACE_ARRAY(
       main_run_loop_notification_frame_timestamp_ns_samples,
       main_run_loop_notification_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      main_run_loop_notification_frame_generation_samples,
+      main_run_loop_notification_event_count);
   INUMA_COPY_TRACE_ARRAY(main_run_loop_notification_outcome_samples,
                          main_run_loop_notification_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_deadline_offset_samples,
@@ -541,20 +604,29 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          strict_hold_timer_event_count);
   INUMA_COPY_TRACE_ARRAY(strict_hold_timer_frame_timestamp_ns_samples,
                          strict_hold_timer_event_count);
+  INUMA_COPY_TRACE_ARRAY(strict_hold_timer_frame_generation_samples,
+                         strict_hold_timer_event_count);
   INUMA_COPY_TRACE_ARRAY(render_event_offset_samples, render_event_count);
   INUMA_COPY_TRACE_ARRAY(render_frame_timestamp_ns_samples,
                          render_event_count);
+  INUMA_COPY_TRACE_ARRAY(render_frame_generation_samples, render_event_count);
   INUMA_COPY_TRACE_ARRAY(render_outcome_samples, render_event_count);
   INUMA_COPY_TRACE_ARRAY(coalesced_pending_age_samples,
                          coalesced_pending_age_count);
   INUMA_COPY_TRACE_ARRAY(copy_event_offset_samples, copy_event_count);
   INUMA_COPY_TRACE_ARRAY(copy_frame_timestamp_ns_samples, copy_event_count);
+  INUMA_COPY_TRACE_ARRAY(copy_frame_generation_samples, copy_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_event_offset_samples,
                          raster_repeat_event_count);
   INUMA_COPY_TRACE_ARRAY(
       raster_repeat_predecessor_frame_timestamp_ns_samples,
       raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_predecessor_frame_generation_samples,
+      raster_repeat_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_deferred_frame_timestamp_ns_samples,
+                         raster_repeat_event_count);
+  INUMA_COPY_TRACE_ARRAY(raster_repeat_deferred_frame_generation_samples,
                          raster_repeat_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_predecessor_tenure_samples,
                          raster_repeat_event_count);
@@ -564,7 +636,13 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
       raster_repeat_boundary_predecessor_frame_timestamp_ns_samples,
       raster_repeat_boundary_event_count);
   INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_boundary_predecessor_frame_generation_samples,
+      raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(
       raster_repeat_boundary_successor_frame_timestamp_ns_samples,
+      raster_repeat_boundary_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_boundary_successor_frame_generation_samples,
       raster_repeat_boundary_event_count);
   INUMA_COPY_TRACE_ARRAY(raster_repeat_boundary_predecessor_tenure_samples,
                          raster_repeat_boundary_event_count);
@@ -578,17 +656,28 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
   INUMA_COPY_TRACE_ARRAY(
       raster_repeat_platform_retry_frame_timestamp_ns_samples,
       raster_repeat_platform_retry_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      raster_repeat_platform_retry_frame_generation_samples,
+      raster_repeat_platform_retry_event_count);
   INUMA_COPY_TRACE_ARRAY(copied_buffer_second_next_copy_hold_samples,
                          copied_buffer_second_next_copy_hold_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_event_offset_samples,
                          emergency_grace_admit_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_frame_timestamp_ns_samples,
                          emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_frame_generation_samples,
+                         emergency_grace_admit_event_count);
   INUMA_COPY_TRACE_ARRAY(
       emergency_grace_admit_current_frame_timestamp_ns_samples,
       emergency_grace_admit_event_count);
   INUMA_COPY_TRACE_ARRAY(
+      emergency_grace_admit_current_frame_generation_samples,
+      emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(
       emergency_grace_admit_primary_frame_timestamp_ns_samples,
+      emergency_grace_admit_event_count);
+  INUMA_COPY_TRACE_ARRAY(
+      emergency_grace_admit_primary_frame_generation_samples,
       emergency_grace_admit_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_admit_primary_age_samples,
                          emergency_grace_admit_event_count);
@@ -600,15 +689,21 @@ static void InumaCopyTextureTraceLocked(InumaTextureTrace *destination,
                          emergency_grace_shift_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_shift_frame_timestamp_ns_samples,
                          emergency_grace_shift_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_shift_frame_generation_samples,
+                         emergency_grace_shift_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_drain_event_offset_samples,
                          emergency_grace_drain_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_drain_frame_timestamp_ns_samples,
+                         emergency_grace_drain_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_drain_frame_generation_samples,
                          emergency_grace_drain_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_residence_samples,
                          emergency_grace_drain_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_event_offset_samples,
                          emergency_grace_refuse_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_frame_timestamp_ns_samples,
+                         emergency_grace_refuse_event_count);
+  INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_frame_generation_samples,
                          emergency_grace_refuse_event_count);
   INUMA_COPY_TRACE_ARRAY(emergency_grace_refuse_reason_samples,
                          emergency_grace_refuse_event_count);
@@ -956,6 +1051,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   uint64_t _inumaFrameGenerationCounter;
   uint64_t _inumaCurrentFrameGeneration;
   int64_t _inumaLastCopiedFrameTimestampNs;
+  uint64_t _inumaLastCopiedFrameGeneration;
   uint64_t _inumaMinimumTextureHoldNs;
   bool _inumaRasterRepeatGuardEnabled;
   uint64_t _inumaRasterRepeatBoundaryNs;
@@ -1080,6 +1176,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaFrameGenerationCounter = 0;
     _inumaCurrentFrameGeneration = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
+    _inumaLastCopiedFrameGeneration = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
@@ -1222,8 +1319,14 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           .raster_repeat_boundary_predecessor_frame_timestamp_ns_samples
               [boundaryIndex] = _inumaLastCopiedFrameTimestampNs;
       _inumaTrace
+          .raster_repeat_boundary_predecessor_frame_generation_samples
+              [boundaryIndex] = _inumaLastCopiedFrameGeneration;
+      _inumaTrace
           .raster_repeat_boundary_successor_frame_timestamp_ns_samples
               [boundaryIndex] = _inumaFrameTimestampNs;
+      _inumaTrace
+          .raster_repeat_boundary_successor_frame_generation_samples
+              [boundaryIndex] = _inumaCurrentFrameGeneration;
       _inumaTrace
           .raster_repeat_boundary_predecessor_tenure_samples[boundaryIndex] =
           predecessorTenureNs;
@@ -1268,8 +1371,13 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             _inumaTrace
                 .raster_repeat_predecessor_frame_timestamp_ns_samples
                     [repeatIndex] = _inumaLastCopiedFrameTimestampNs;
+            _inumaTrace
+                .raster_repeat_predecessor_frame_generation_samples
+                    [repeatIndex] = _inumaLastCopiedFrameGeneration;
             _inumaTrace.raster_repeat_deferred_frame_timestamp_ns_samples
                 [repeatIndex] = _inumaFrameTimestampNs;
+            _inumaTrace.raster_repeat_deferred_frame_generation_samples
+                [repeatIndex] = _inumaCurrentFrameGeneration;
             _inumaTrace.raster_repeat_predecessor_tenure_samples[repeatIndex] =
                 repeatCheckedAt - _inumaLastCopyMonotonicNs;
           }
@@ -1300,6 +1408,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                                   copiedAt:copiedAt];
     _inumaLastCopyMonotonicNs = copiedAt;
     _inumaLastCopiedFrameTimestampNs = _inumaFrameTimestampNs;
+    _inumaLastCopiedFrameGeneration = _inumaCurrentFrameGeneration;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
@@ -1323,6 +1432,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               locked - _inumaTraceStartedMonotonicNs;
           _inumaTrace.copy_frame_timestamp_ns_samples[copyEventIndex] =
               _inumaFrameTimestampNs;
+          _inumaTrace.copy_frame_generation_samples[copyEventIndex] =
+              _inumaCurrentFrameGeneration;
         }
       }
     }
@@ -1360,6 +1471,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             _inumaTrace
                 .emergency_grace_shift_frame_timestamp_ns_samples
                     [shiftIndex] = shifted.frame_timestamp_ns;
+            _inumaTrace.emergency_grace_shift_frame_generation_samples
+                [shiftIndex] = shifted.frame_generation;
           }
         }
       }
@@ -1369,14 +1482,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
       _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
-      _inumaFrameGenerationCounter += 1;
-      if (_inumaFrameGenerationCounter == 0) {
-        _inumaFrameGenerationCounter += 1;
-      }
-      _inumaCurrentFrameGeneration = _inumaFrameGenerationCounter;
-      if (_inumaTrace.enabled) {
-        _inumaTrace.frame_generation_assignments += 1;
-      }
+      _inumaCurrentFrameGeneration = promoted.frame_generation;
       _inumaCurrentFrameWasRescuePromoted = true;
       _inumaCurrentNormalNotificationRequired = false;
       if (previousBuffer != nil) {
@@ -1403,6 +1509,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             _inumaTrace
                 .emergency_grace_drain_frame_timestamp_ns_samples
                     [drainIndex] = promoted.frame_timestamp_ns;
+            _inumaTrace.emergency_grace_drain_frame_generation_samples
+                [drainIndex] = promoted.frame_generation;
             _inumaTrace.emergency_grace_residence_samples[drainIndex] =
                 promoted.emergency_grace_admitted_monotonic_ns > 0 &&
                         copiedAt >=
@@ -1422,6 +1530,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             _inumaTrace
                 .rescue_hold_preservation_frame_timestamp_ns_samples
                     [preservationIndex] = promoted.frame_timestamp_ns;
+            _inumaTrace
+                .rescue_hold_preservation_frame_generation_samples
+                    [preservationIndex] = promoted.frame_generation;
           }
         }
         if (copiedAt >= promoted.ready_monotonic_ns) {
@@ -1441,6 +1552,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 copiedAt - _inumaTraceStartedMonotonicNs;
             _inumaTrace.queue_promote_frame_timestamp_ns_samples
                 [promoteIndex] = promoted.frame_timestamp_ns;
+            _inumaTrace.queue_promote_frame_generation_samples[promoteIndex] =
+                promoted.frame_generation;
           }
         }
       }
@@ -1535,6 +1648,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   _inumaFrameReadyMonotonicNs = 0;
   _inumaLastCopyMonotonicNs = 0;
   _inumaLastCopiedFrameTimestampNs = 0;
+  _inumaLastCopiedFrameGeneration = 0;
   _inumaFrameTimestampNs = 0;
   _inumaCurrentFrameGeneration = 0;
   _inumaCurrentFrameWasRescuePromoted = false;
@@ -1572,6 +1686,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
+    _inumaLastCopiedFrameGeneration = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameGeneration = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
@@ -1703,6 +1818,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               strongSelf->_inumaTrace
                   .direct_frame_display_retry_frame_timestamp_ns_samples
                       [eventIndex] = frameTimestampNs;
+              strongSelf->_inumaTrace
+                  .direct_frame_display_retry_frame_generation_samples
+                      [eventIndex] = frameGeneration;
               strongSelf->_inumaTrace
                   .direct_frame_display_retry_outcome_samples[eventIndex] =
                   InumaDirectFrameDisplayRetryOutcomePending;
@@ -1851,6 +1969,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             _inumaTrace
                 .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
                 frameTimestampNs;
+            _inumaTrace
+                .texture_notify_frame_generation_samples[notifyEventIndex] =
+                frameGeneration;
             _inumaTrace
                 .texture_notify_scheduled_delay_samples[notifyEventIndex] = 0;
             const uint64_t plannedDeadline =
@@ -2049,12 +2170,16 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   bool inumaShouldNotifyTexture = false;
   int64_t inumaTextureIdToNotify = -1;
   int64_t inumaFrameTimestampToNotify = 0;
+  uint64_t inumaFrameGeneration = 0;
   uint64_t inumaFrameGenerationToNotify = 0;
   uint64_t inumaRendererStateGenerationToNotify = 0;
 #endif
   os_unfair_lock_lock(&_lock);
 #if TARGET_OS_OSX
   const uint64_t locked = _inumaTrace.enabled ? InumaMonotonicNanoseconds() : 0;
+  _inumaFrameGenerationCounter =
+      InumaNextFrameGeneration(_inumaFrameGenerationCounter);
+  inumaFrameGeneration = _inumaFrameGenerationCounter;
   if (_inumaTrace.enabled) {
     InumaRecordRenderQoSObservationLocked(&_inumaTrace, inumaRenderQoS);
     if (inumaExecutingOnOwnedRenderQoSQueue) {
@@ -2063,6 +2188,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _inumaTrace.render_qos_calling_thread_entries += 1;
     }
     _inumaTrace.render_frames += 1;
+    _inumaTrace.frame_generation_assignments += 1;
     if (frame.timeStampNs == 0) {
       _inumaTrace.zero_timestamp_render_frames += 1;
     }
@@ -2076,6 +2202,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             locked - _inumaTraceStartedMonotonicNs;
         _inumaTrace.render_frame_timestamp_ns_samples[inumaRenderEventIndex] =
             frame.timeStampNs;
+        _inumaTrace.render_frame_generation_samples[inumaRenderEventIndex] =
+            inumaFrameGeneration;
         _inumaTrace.render_outcome_samples[inumaRenderEventIndex] = 0;
       }
     }
@@ -2177,14 +2305,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = frameReadyNs;
       _inumaFrameTimestampNs = frame.timeStampNs;
-      _inumaFrameGenerationCounter += 1;
-      if (_inumaFrameGenerationCounter == 0) {
-        _inumaFrameGenerationCounter += 1;
-      }
-      _inumaCurrentFrameGeneration = _inumaFrameGenerationCounter;
-      if (_inumaTrace.enabled) {
-        _inumaTrace.frame_generation_assignments += 1;
-      }
+      _inumaCurrentFrameGeneration = inumaFrameGeneration;
       _inumaCurrentFrameWasRescuePromoted = false;
       _inumaCurrentFrameRepeatDeferred = false;
       _inumaCurrentRepeatRetryFired = false;
@@ -2209,6 +2330,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           (InumaPendingTextureFrame){
               .pixel_buffer = preparedBuffer,
               .frame_timestamp_ns = frame.timeStampNs,
+              .frame_generation = inumaFrameGeneration,
               .ready_monotonic_ns = frameReadyNs,
               .emergency_grace_admitted_monotonic_ns = 0,
               .from_emergency_grace = false,
@@ -2229,6 +2351,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 frameReadyNs - _inumaTraceStartedMonotonicNs;
             _inumaTrace.queue_enqueue_frame_timestamp_ns_samples[enqueueIndex] =
                 frame.timeStampNs;
+            _inumaTrace.queue_enqueue_frame_generation_samples[enqueueIndex] =
+                inumaFrameGeneration;
           }
         }
       }
@@ -2238,6 +2362,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           (InumaPendingTextureFrame){
               .pixel_buffer = preparedBuffer,
               .frame_timestamp_ns = frame.timeStampNs,
+              .frame_generation = inumaFrameGeneration,
               .ready_monotonic_ns = frameReadyNs,
               .emergency_grace_admitted_monotonic_ns = frameReadyNs,
               .from_emergency_grace = true,
@@ -2261,12 +2386,18 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           _inumaTrace
               .emergency_grace_admit_frame_timestamp_ns_samples
                   [admitIndex] = frame.timeStampNs;
+          _inumaTrace.emergency_grace_admit_frame_generation_samples
+              [admitIndex] = inumaFrameGeneration;
           _inumaTrace
               .emergency_grace_admit_current_frame_timestamp_ns_samples
                   [admitIndex] = _inumaFrameTimestampNs;
+          _inumaTrace.emergency_grace_admit_current_frame_generation_samples
+              [admitIndex] = _inumaCurrentFrameGeneration;
           _inumaTrace
               .emergency_grace_admit_primary_frame_timestamp_ns_samples
                   [admitIndex] = emergencyGracePrimary.frame_timestamp_ns;
+          _inumaTrace.emergency_grace_admit_primary_frame_generation_samples
+              [admitIndex] = emergencyGracePrimary.frame_generation;
           _inumaTrace.emergency_grace_admit_primary_age_samples[admitIndex] =
               emergencyGraceCheckedAt -
               emergencyGracePrimary.ready_monotonic_ns;
@@ -2295,6 +2426,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       InumaRecordEmergencyGraceRefusalLocked(
           &_inumaTrace, emergencyGraceCheckedAt,
           _inumaTraceStartedMonotonicNs, frame.timeStampNs,
+          inumaFrameGeneration,
           InumaEmergencyGraceRefuseReasonConversionFailure,
           emergencyGraceCurrentAge, emergencyGracePrimaryAge,
           _inumaCurrentFrameWasRescuePromoted, _frameAvailable);
@@ -2321,6 +2453,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             &_inumaTrace,
             emergencyGraceCheckedAt > 0 ? emergencyGraceCheckedAt : locked,
             _inumaTraceStartedMonotonicNs, frame.timeStampNs,
+            inumaFrameGeneration,
             emergencyGraceRefuseReason ==
                     InumaEmergencyGraceRefuseReasonNone
                 ? InumaEmergencyGraceRefuseReasonQueueShape
@@ -2618,6 +2751,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         _inumaTrace
             .main_run_loop_notification_frame_timestamp_ns_samples
                 [eventIndex] = frameTimestampNs;
+        _inumaTrace
+            .main_run_loop_notification_frame_generation_samples[eventIndex] =
+            frameGeneration;
         _inumaTrace.main_run_loop_notification_outcome_samples[eventIndex] = 0;
         _inumaMainRunLoopNotificationEventIndex = eventIndex;
       }
@@ -2868,6 +3004,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _inumaTrace
           .raster_repeat_platform_retry_frame_timestamp_ns_samples
               [rasterRepeatRetryEventIndex] = frameTimestampNs;
+      _inumaTrace.raster_repeat_platform_retry_frame_generation_samples
+          [rasterRepeatRetryEventIndex] = frameGeneration;
     }
     if (!notificationCanBeScheduled) {
       // The raster repeat already owns this retry even if lifecycle state
@@ -2892,6 +3030,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _inumaTrace
           .rescue_hold_bypass_frame_timestamp_ns_samples[bypassIndex] =
           frameTimestampNs;
+      _inumaTrace.rescue_hold_bypass_frame_generation_samples[bypassIndex] =
+          frameGeneration;
     }
   }
   if (notificationCanBeScheduled && !bypassMinimumHold &&
@@ -2914,6 +3054,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           _inumaTrace
               .texture_hold_frame_timestamp_ns_samples[holdIndex] =
               frameTimestampNs;
+          _inumaTrace.texture_hold_frame_generation_samples[holdIndex] =
+              frameGeneration;
         }
       }
     }
@@ -2982,6 +3124,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         strongSelf->_inumaTrace
             .texture_notify_frame_timestamp_ns_samples[notifyEventIndex] =
             frameTimestampNs;
+        strongSelf->_inumaTrace
+            .texture_notify_frame_generation_samples[notifyEventIndex] =
+            frameGeneration;
         strongSelf->_inumaTrace
             .texture_notify_scheduled_delay_samples[notifyEventIndex] =
             scheduledDelayNs;
@@ -3146,6 +3291,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 deadlineNs - _inumaTraceStartedMonotonicNs;
             _inumaTrace.strict_hold_timer_frame_timestamp_ns_samples
                 [timerEventIndex] = frameTimestampNs;
+            _inumaTrace.strict_hold_timer_frame_generation_samples
+                [timerEventIndex] = frameGeneration;
           }
         }
       }
@@ -3271,6 +3418,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               strongSelf->_inumaTrace
                   .rescue_display_link_frame_timestamp_ns_samples[eventIndex] =
                   frameTimestampNs;
+              strongSelf->_inumaTrace
+                  .rescue_display_link_frame_generation_samples[eventIndex] =
+                  frameGeneration;
               strongSelf->_inumaRescueDisplayLinkEventIndex = eventIndex;
             }
           }
@@ -3731,7 +3881,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @46,
+    @"tail_diagnostics_version" : @47,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"prerenderer_smoothing_configuration_contract" :
         @"explicit_objc_to_native_peer_configuration",
@@ -3758,7 +3908,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"texture_notification_contract" :
         @"frame_state_before_platform_thread_notification",
     @"frame_ownership_contract" :
-        @"explicit_monotonic_generation_timestamp_zero_accepted",
+        @"explicit_monotonic_render_generation_timestamp_zero_accepted",
+    @"frame_identity_contract" :
+        @"renderer_local_monotonic_generation_not_media_timestamp",
     @"trace_snapshot_monotonic_ns" : @(traceSnapshotMonotonicNs),
     @"trace_snapshot_count" : @(_inumaTraceSnapshotCount),
     @"trace_snapshot_lock_hold_ns" : @(traceSnapshotLockHoldNs),
@@ -4111,11 +4263,17 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"texture_hold_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->texture_hold_frame_timestamp_ns_samples,
         snapshot->texture_hold_delay_count),
+    @"texture_hold_frame_generation" : InumaTraceSampleArray(
+        snapshot->texture_hold_frame_generation_samples,
+        snapshot->texture_hold_delay_count),
     @"texture_notify_event_offset_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_event_offset_samples,
         snapshot->texture_notify_event_count),
     @"texture_notify_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->texture_notify_frame_timestamp_ns_samples,
+        snapshot->texture_notify_event_count),
+    @"texture_notify_frame_generation" : InumaTraceSampleArray(
+        snapshot->texture_notify_frame_generation_samples,
         snapshot->texture_notify_event_count),
     @"texture_notify_scheduled_delay_ns" : InumaTraceSampleArray(
         snapshot->texture_notify_scheduled_delay_samples,
@@ -4131,18 +4289,31 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"queue_enqueue_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->queue_enqueue_frame_timestamp_ns_samples,
         snapshot->queue_enqueue_event_count),
+    @"queue_enqueue_frame_generation" : InumaTraceSampleArray(
+        snapshot->queue_enqueue_frame_generation_samples,
+        snapshot->queue_enqueue_event_count),
     @"queue_promote_event_offset_ns" : InumaTraceSampleArray(
         snapshot->queue_promote_event_offset_samples,
         snapshot->queue_promote_event_count),
     @"queue_promote_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->queue_promote_frame_timestamp_ns_samples,
         snapshot->queue_promote_event_count),
+    @"queue_promote_frame_generation" : InumaTraceSampleArray(
+        snapshot->queue_promote_frame_generation_samples,
+        snapshot->queue_promote_event_count),
     @"rescue_hold_bypass_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->rescue_hold_bypass_frame_timestamp_ns_samples,
+        snapshot->rescue_hold_bypass_count),
+    @"rescue_hold_bypass_frame_generation" : InumaTraceSampleArray(
+        snapshot->rescue_hold_bypass_frame_generation_samples,
         snapshot->rescue_hold_bypass_count),
     @"rescue_hold_preservation_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot->rescue_hold_preservation_frame_timestamp_ns_samples,
+            snapshot->rescue_hold_preservation_count),
+    @"rescue_hold_preservation_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot->rescue_hold_preservation_frame_generation_samples,
             snapshot->rescue_hold_preservation_count),
     @"rescue_display_link_schedule_offset_ns" : InumaTraceSampleArray(
         snapshot->rescue_display_link_schedule_offset_samples,
@@ -4158,6 +4329,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         snapshot->rescue_display_link_event_count),
     @"rescue_display_link_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->rescue_display_link_frame_timestamp_ns_samples,
+        snapshot->rescue_display_link_event_count),
+    @"rescue_display_link_frame_generation" : InumaTraceSampleArray(
+        snapshot->rescue_display_link_frame_generation_samples,
         snapshot->rescue_display_link_event_count),
     @"direct_frame_display_retry_schedule_offset_ns" : InumaTraceSampleArray(
         snapshot->direct_frame_display_retry_schedule_offset_samples,
@@ -4176,6 +4350,10 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"direct_frame_display_retry_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot->direct_frame_display_retry_frame_timestamp_ns_samples,
+            snapshot->direct_frame_display_retry_event_count),
+    @"direct_frame_display_retry_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot->direct_frame_display_retry_frame_generation_samples,
             snapshot->direct_frame_display_retry_event_count),
     @"direct_frame_display_retry_outcome" : InumaTraceByteSampleArray(
         snapshot->direct_frame_display_retry_outcome_samples,
@@ -4201,6 +4379,11 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             snapshot
                 ->main_run_loop_notification_frame_timestamp_ns_samples,
             snapshot->main_run_loop_notification_event_count),
+    @"main_run_loop_notification_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot
+                ->main_run_loop_notification_frame_generation_samples,
+            snapshot->main_run_loop_notification_event_count),
     @"main_run_loop_notification_outcome" : InumaTraceByteSampleArray(
         snapshot->main_run_loop_notification_outcome_samples,
         snapshot->main_run_loop_notification_event_count),
@@ -4219,11 +4402,17 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"strict_hold_timer_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->strict_hold_timer_frame_timestamp_ns_samples,
         snapshot->strict_hold_timer_event_count),
+    @"strict_hold_timer_frame_generation" : InumaTraceSampleArray(
+        snapshot->strict_hold_timer_frame_generation_samples,
+        snapshot->strict_hold_timer_event_count),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
     @"render_event_offset_ns" : InumaTraceSampleArray(
         snapshot->render_event_offset_samples, snapshot->render_event_count),
     @"render_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->render_frame_timestamp_ns_samples,
+        snapshot->render_event_count),
+    @"render_frame_generation" : InumaTraceSampleArray(
+        snapshot->render_frame_generation_samples,
         snapshot->render_event_count),
     @"render_outcome" : InumaTraceByteSampleArray(
         snapshot->render_outcome_samples, snapshot->render_event_count),
@@ -4241,6 +4430,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"copy_frame_timestamp_ns" : InumaTraceSignedSampleArray(
         snapshot->copy_frame_timestamp_ns_samples,
         snapshot->copy_event_count),
+    @"copy_frame_generation" : InumaTraceSampleArray(
+        snapshot->copy_frame_generation_samples,
+        snapshot->copy_event_count),
     @"raster_repeat_event_offset_ns" : InumaTraceSampleArray(
         snapshot->raster_repeat_event_offset_samples,
         snapshot->raster_repeat_event_count),
@@ -4248,10 +4440,17 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->raster_repeat_predecessor_frame_timestamp_ns_samples,
             snapshot->raster_repeat_event_count),
+    @"raster_repeat_predecessor_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot->raster_repeat_predecessor_frame_generation_samples,
+            snapshot->raster_repeat_event_count),
     @"raster_repeat_deferred_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot->raster_repeat_deferred_frame_timestamp_ns_samples,
             snapshot->raster_repeat_event_count),
+    @"raster_repeat_deferred_frame_generation" : InumaTraceSampleArray(
+        snapshot->raster_repeat_deferred_frame_generation_samples,
+        snapshot->raster_repeat_event_count),
     @"raster_repeat_predecessor_tenure_ns" : InumaTraceSampleArray(
         snapshot->raster_repeat_predecessor_tenure_samples,
         snapshot->raster_repeat_event_count),
@@ -4268,10 +4467,20 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             snapshot
                 ->raster_repeat_boundary_predecessor_frame_timestamp_ns_samples,
             snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_predecessor_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot
+                ->raster_repeat_boundary_predecessor_frame_generation_samples,
+            snapshot->raster_repeat_boundary_event_count),
     @"raster_repeat_boundary_successor_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot
                 ->raster_repeat_boundary_successor_frame_timestamp_ns_samples,
+            snapshot->raster_repeat_boundary_event_count),
+    @"raster_repeat_boundary_successor_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot
+                ->raster_repeat_boundary_successor_frame_generation_samples,
             snapshot->raster_repeat_boundary_event_count),
     @"raster_repeat_boundary_predecessor_tenure_ns" :
         InumaTraceSampleArray(
@@ -4292,6 +4501,10 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->raster_repeat_platform_retry_frame_timestamp_ns_samples,
             snapshot->raster_repeat_platform_retry_event_count),
+    @"raster_repeat_platform_retry_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot->raster_repeat_platform_retry_frame_generation_samples,
+            snapshot->raster_repeat_platform_retry_event_count),
     @"copied_buffer_second_next_copy_hold_ns" : InumaTraceSampleArray(
         snapshot->copied_buffer_second_next_copy_hold_samples,
         snapshot->copied_buffer_second_next_copy_hold_count),
@@ -4302,15 +4515,28 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->emergency_grace_admit_frame_timestamp_ns_samples,
             snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_frame_generation" : InumaTraceSampleArray(
+        snapshot->emergency_grace_admit_frame_generation_samples,
+        snapshot->emergency_grace_admit_event_count),
     @"emergency_grace_admit_current_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot
                 ->emergency_grace_admit_current_frame_timestamp_ns_samples,
             snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_current_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot
+                ->emergency_grace_admit_current_frame_generation_samples,
+            snapshot->emergency_grace_admit_event_count),
     @"emergency_grace_admit_primary_frame_timestamp_ns" :
         InumaTraceSignedSampleArray(
             snapshot
                 ->emergency_grace_admit_primary_frame_timestamp_ns_samples,
+            snapshot->emergency_grace_admit_event_count),
+    @"emergency_grace_admit_primary_frame_generation" :
+        InumaTraceSampleArray(
+            snapshot
+                ->emergency_grace_admit_primary_frame_generation_samples,
             snapshot->emergency_grace_admit_event_count),
     @"emergency_grace_admit_primary_age_ns" : InumaTraceSampleArray(
         snapshot->emergency_grace_admit_primary_age_samples,
@@ -4328,6 +4554,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->emergency_grace_shift_frame_timestamp_ns_samples,
             snapshot->emergency_grace_shift_event_count),
+    @"emergency_grace_shift_frame_generation" : InumaTraceSampleArray(
+        snapshot->emergency_grace_shift_frame_generation_samples,
+        snapshot->emergency_grace_shift_event_count),
     @"emergency_grace_drain_event_offset_ns" : InumaTraceSampleArray(
         snapshot->emergency_grace_drain_event_offset_samples,
         snapshot->emergency_grace_drain_event_count),
@@ -4335,6 +4564,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->emergency_grace_drain_frame_timestamp_ns_samples,
             snapshot->emergency_grace_drain_event_count),
+    @"emergency_grace_drain_frame_generation" : InumaTraceSampleArray(
+        snapshot->emergency_grace_drain_frame_generation_samples,
+        snapshot->emergency_grace_drain_event_count),
     @"emergency_grace_residence_ns" : InumaTraceSampleArray(
         snapshot->emergency_grace_residence_samples,
         snapshot->emergency_grace_drain_event_count),
@@ -4345,6 +4577,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         InumaTraceSignedSampleArray(
             snapshot->emergency_grace_refuse_frame_timestamp_ns_samples,
             snapshot->emergency_grace_refuse_event_count),
+    @"emergency_grace_refuse_frame_generation" : InumaTraceSampleArray(
+        snapshot->emergency_grace_refuse_frame_generation_samples,
+        snapshot->emergency_grace_refuse_event_count),
     @"emergency_grace_refuse_reason" : InumaTraceByteSampleArray(
         snapshot->emergency_grace_refuse_reason_samples,
         snapshot->emergency_grace_refuse_event_count),
@@ -4413,6 +4648,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
+    _inumaLastCopiedFrameGeneration = 0;
     _inumaFrameTimestampNs = 0;
     _inumaCurrentFrameGeneration = 0;
     _inumaCurrentFrameWasRescuePromoted = false;

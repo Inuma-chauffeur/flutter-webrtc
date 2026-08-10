@@ -16,6 +16,15 @@ typedef struct {
   int64_t expected_timestamp_ns;
 } InumaFrameOwnershipInput;
 
+// Allocate a renderer-local identity for every incoming frame. Zero stays
+// reserved for "no owner" even when the uint64_t counter wraps. The identity
+// is deliberately separate from RTCVideoFrame.timeStampNs, which may be zero
+// or repeat because it is media timing metadata rather than object identity.
+static inline uint64_t InumaNextFrameGeneration(uint64_t current_generation) {
+  current_generation += 1;
+  return current_generation == 0 ? 1 : current_generation;
+}
+
 static inline bool
 InumaFrameOwnershipMatches(InumaFrameOwnershipInput input) {
   return input.expected_generation != 0 &&
