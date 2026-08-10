@@ -99,6 +99,14 @@
   [_videoView setSize:size];
 }
 
+- (void)writeInumaNativeVideoSurfaceTrace {
+  [_videoView inumaWriteNativeVideoSurfaceTrace];
+}
+
+- (void)stopInumaNativeVideoSurface {
+  [_videoView inumaStopNativeVideoSurface];
+}
+
 #pragma mark - FlutterStreamHandler methods
 
 - (FlutterError* _Nullable)onCancelWithArguments:(id _Nullable)arguments {

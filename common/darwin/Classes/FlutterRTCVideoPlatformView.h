@@ -11,4 +11,8 @@
 
 - (void)setSize:(CGSize)size;
 
+- (void)inumaWriteNativeVideoSurfaceTrace;
+
+- (void)inumaStopNativeVideoSurface;
+
 @end

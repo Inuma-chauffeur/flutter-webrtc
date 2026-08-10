@@ -20,4 +20,8 @@
 
 - (FlutterRTCVideoPlatformNativeView* _Nonnull)view;
 
+- (void)writeInumaNativeVideoSurfaceTrace;
+
+- (void)stopInumaNativeVideoSurface;
+
 @end

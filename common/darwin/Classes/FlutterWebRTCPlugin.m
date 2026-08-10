@@ -1414,6 +1414,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       FlutterRTCVideoPlatformViewController* render = _platformViewFactory.renders[viewId];
       if(render != nil) {
         render.videoTrack = nil;
+        [render stopInumaNativeVideoSurface];
         [_platformViewFactory.renders removeObjectForKey:viewId];
       }
       result(nil);
