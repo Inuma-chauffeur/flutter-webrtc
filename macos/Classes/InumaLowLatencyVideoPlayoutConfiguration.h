@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 typedef NS_ENUM(NSUInteger, InumaLowLatencyVideoPlayoutParseResult) {
   InumaLowLatencyVideoPlayoutParseResultAbsent = 0,
   InumaLowLatencyVideoPlayoutParseResultValid = 1,
@@ -26,3 +28,5 @@ InumaRecordLowLatencyVideoPlayoutConfiguration(BOOL enabled);
 
 FOUNDATION_EXPORT uint64_t
 InumaLowLatencyVideoPlayoutEnabledConfigurationCount(void);
+
+NS_ASSUME_NONNULL_END
