@@ -21,7 +21,7 @@ typedef struct {
   bool source_registered;
   bool texture_registered;
   bool frame_available;
-  bool frame_timestamp_valid;
+  bool frame_ownership_valid;
   bool token_occupied;
 } InumaMainRunLoopNotificationArmInput;
 
@@ -50,7 +50,7 @@ InumaMainRunLoopNotificationEvaluateArm(
     return decision;
   }
   if (!input.texture_registered || !input.frame_available ||
-      !input.frame_timestamp_valid) {
+      !input.frame_ownership_valid) {
     decision.reason = InumaMainRunLoopNotificationArmReasonInvalidOwner;
     return decision;
   }
@@ -75,7 +75,7 @@ typedef struct {
   bool registry_available;
   bool texture_matches;
   bool frame_available;
-  bool frame_timestamp_matches;
+  bool frame_ownership_matches;
 } InumaMainRunLoopNotificationFireInput;
 
 typedef struct {
@@ -99,7 +99,7 @@ InumaMainRunLoopNotificationEvaluateFire(
                            input.texture_registered &&
                            input.registry_available && input.texture_matches &&
                            input.frame_available &&
-                           input.frame_timestamp_matches;
+                           input.frame_ownership_matches;
   decision.fire = decision.state_current;
   decision.close_stale = input.token_occupied && !decision.state_current;
   return decision;

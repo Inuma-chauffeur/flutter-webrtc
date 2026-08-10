@@ -22,6 +22,7 @@
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
 #include "InumaEmergencyGracePolicy.h"
+#include "InumaFrameOwnershipPolicy.h"
 #include "InumaMainRunLoopNotificationPolicy.h"
 #include "InumaLowLatencyVideoPlayoutConfiguration.h"
 #include "InumaPrerendererSmoothingConfiguration.h"
@@ -90,6 +91,9 @@ typedef struct {
   uint64_t render_qos_calling_thread_entries;
   uint64_t accepted_frames;
   uint64_t coalesced_frames;
+  uint64_t frame_generation_assignments;
+  uint64_t zero_timestamp_render_frames;
+  uint64_t zero_timestamp_accepted_frames;
   uint64_t copy_calls;
   uint64_t copy_hits;
   uint64_t copy_misses;
@@ -854,6 +858,7 @@ static void InumaRecordRenderQoSObservationLocked(
 - (CVPixelBufferRef)inumaCreateFreshStockBGRABuffer;
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:(int64_t)frameTimestampNs
+                                     frameGeneration:(uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                                    bypassMinimumHold:(bool)bypassMinimumHold
@@ -863,6 +868,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                                     frameGeneration:
+                                         (uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                             predecessorCopyUptimeNs:
@@ -872,6 +879,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (void)inumaScheduleDirectFrameDisplayRetryForTextureId:(int64_t)textureId
                                         frameTimestampNs:
                                             (int64_t)frameTimestampNs
+                                         frameGeneration:
+                                             (uint64_t)frameGeneration
                                  rendererStateGeneration:
                                      (uint64_t)rendererStateGeneration;
 - (void)inumaDirectFrameDisplayRetryDidFire:(CADisplayLink *)displayLink
@@ -880,6 +889,8 @@ static void InumaRecordRenderQoSObservationLocked(
 - (BOOL)inumaArmMainRunLoopNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                                     frameGeneration:
+                                         (uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                                       successorRearm:(bool)successorRearm;
@@ -942,6 +953,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   uint64_t _inumaFrameReadyMonotonicNs;
   uint64_t _inumaLastCopyMonotonicNs;
   uint64_t _inumaRendererStateGeneration;
+  uint64_t _inumaFrameGenerationCounter;
+  uint64_t _inumaCurrentFrameGeneration;
   int64_t _inumaLastCopiedFrameTimestampNs;
   uint64_t _inumaMinimumTextureHoldNs;
   bool _inumaRasterRepeatGuardEnabled;
@@ -979,6 +992,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   bool _inumaMainRunLoopNotificationTokenOccupied;
   int64_t _inumaMainRunLoopNotificationTextureId;
   int64_t _inumaMainRunLoopNotificationFrameTimestampNs;
+  uint64_t _inumaMainRunLoopNotificationFrameGeneration;
   uint64_t _inumaMainRunLoopNotificationRendererStateGeneration;
   uint64_t _inumaMainRunLoopNotificationArmedMonotonicNs;
   NSUInteger _inumaMainRunLoopNotificationEventIndex;
@@ -986,10 +1000,12 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   uint64_t _inumaTraceSnapshotCount;
   uint64_t _inumaTraceSnapshotLockHoldMaxNs;
   int64_t _inumaRescueDisplayLinkFrameTimestampNs;
+  uint64_t _inumaRescueDisplayLinkFrameGeneration;
   uint64_t _inumaRescueDisplayLinkRendererStateGeneration;
   uint64_t _inumaRescuePredecessorCopyUptimeNs;
   NSUInteger _inumaRescueDisplayLinkEventIndex;
   int64_t _inumaDirectFrameDisplayRetryFrameTimestampNs;
+  uint64_t _inumaDirectFrameDisplayRetryFrameGeneration;
   uint64_t _inumaDirectFrameDisplayRetryRendererStateGeneration;
   uint64_t _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs;
   uint64_t _inumaDirectFrameDisplayRetryScheduledMonotonicNs;
@@ -1061,6 +1077,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaFrameReadyMonotonicNs = 0;
     _inumaLastCopyMonotonicNs = 0;
     _inumaRendererStateGeneration = 1;
+    _inumaFrameGenerationCounter = 0;
+    _inumaCurrentFrameGeneration = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
@@ -1078,6 +1096,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaMainRunLoopNotificationTokenOccupied = false;
     _inumaMainRunLoopNotificationTextureId = -1;
     _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+    _inumaMainRunLoopNotificationFrameGeneration = 0;
     _inumaMainRunLoopNotificationRendererStateGeneration = 0;
     _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
     _inumaMainRunLoopNotificationEventIndex = NSNotFound;
@@ -1085,10 +1104,12 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaTraceSnapshotCount = 0;
     _inumaTraceSnapshotLockHoldMaxNs = 0;
     _inumaRescueDisplayLinkFrameTimestampNs = 0;
+    _inumaRescueDisplayLinkFrameGeneration = 0;
     _inumaRescueDisplayLinkRendererStateGeneration = 0;
     _inumaRescuePredecessorCopyUptimeNs = 0;
     _inumaRescueDisplayLinkEventIndex = NSNotFound;
     _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+    _inumaDirectFrameDisplayRetryFrameGeneration = 0;
     _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
     _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
     _inumaDirectFrameDisplayRetryScheduledMonotonicNs = 0;
@@ -1137,11 +1158,13 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   bool notifyPromotedFrame = false;
   int64_t promotedTextureId = -1;
   int64_t promotedFrameTimestampNs = 0;
+  uint64_t promotedFrameGeneration = 0;
   uint64_t promotedRendererStateGeneration = 0;
   uint64_t promotedPredecessorCopyUptimeNs = 0;
   bool retryRasterRepeatedFrame = false;
   int64_t repeatedFrameTextureId = -1;
   int64_t repeatedDeferredFrameTimestampNs = 0;
+  uint64_t repeatedFrameGeneration = 0;
   uint64_t repeatedRendererStateGeneration = 0;
 #endif
   os_unfair_lock_lock(&_lock);
@@ -1214,8 +1237,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     if (_inumaTrace.enabled) {
       _inumaTrace.raster_repeat_guard_eligible_copy_calls += 1;
     }
-    if (_inumaCopiedBufferHoldCount > 0 &&
-        _inumaLastCopiedFrameTimestampNs != 0) {
+    if (_inumaCopiedBufferHoldCount > 0) {
       const NSUInteger newestHoldIndex =
           (_inumaCopiedBufferHoldHead + _inumaCopiedBufferHoldCount - 1) %
           kInumaCopiedBufferHoldCapacity;
@@ -1229,6 +1251,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         retryRasterRepeatedFrame = _textureId != -1;
         repeatedFrameTextureId = _textureId;
         repeatedDeferredFrameTimestampNs = _inumaFrameTimestampNs;
+        repeatedFrameGeneration = _inumaCurrentFrameGeneration;
         repeatedRendererStateGeneration = _inumaRendererStateGeneration;
         if (_inumaTrace.enabled) {
           _inumaTrace.copy_hits += 1;
@@ -1346,6 +1369,14 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = promoted.ready_monotonic_ns;
       _inumaFrameTimestampNs = promoted.frame_timestamp_ns;
+      _inumaFrameGenerationCounter += 1;
+      if (_inumaFrameGenerationCounter == 0) {
+        _inumaFrameGenerationCounter += 1;
+      }
+      _inumaCurrentFrameGeneration = _inumaFrameGenerationCounter;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.frame_generation_assignments += 1;
+      }
       _inumaCurrentFrameWasRescuePromoted = true;
       _inumaCurrentNormalNotificationRequired = false;
       if (previousBuffer != nil) {
@@ -1354,6 +1385,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       notifyPromotedFrame = _textureId != -1;
       promotedTextureId = _textureId;
       promotedFrameTimestampNs = promoted.frame_timestamp_ns;
+      promotedFrameGeneration = _inumaCurrentFrameGeneration;
       promotedRendererStateGeneration = _inumaRendererStateGeneration;
       promotedPredecessorCopyUptimeNs = copiedAtUptimeNs;
       if (_inumaTrace.enabled) {
@@ -1430,6 +1462,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               repeatedFrameTextureId
                                           frameTimestampNs:
                                               repeatedDeferredFrameTimestampNs
+                                           frameGeneration:
+                                               repeatedFrameGeneration
                                    rendererStateGeneration:
                                        repeatedRendererStateGeneration
                                          bypassMinimumHold:true
@@ -1447,6 +1481,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       [self inumaScheduleTextureNotificationForTextureId:promotedTextureId
                                         frameTimestampNs:
                                             promotedFrameTimestampNs
+                                         frameGeneration:
+                                             promotedFrameGeneration
                                  rendererStateGeneration:
                                      promotedRendererStateGeneration
                                        bypassMinimumHold:true
@@ -1456,6 +1492,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       [self inumaScheduleDisplayLinkedRescueForTextureId:promotedTextureId
                                         frameTimestampNs:
                                             promotedFrameTimestampNs
+                                         frameGeneration:
+                                             promotedFrameGeneration
                                  rendererStateGeneration:
                                      promotedRendererStateGeneration
                                 predecessorCopyUptimeNs:
@@ -1498,6 +1536,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   _inumaLastCopyMonotonicNs = 0;
   _inumaLastCopiedFrameTimestampNs = 0;
   _inumaFrameTimestampNs = 0;
+  _inumaCurrentFrameGeneration = 0;
   _inumaCurrentFrameWasRescuePromoted = false;
   _inumaCurrentFrameRepeatDeferred = false;
   _inumaCurrentRepeatRetryFired = false;
@@ -1534,6 +1573,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaLastCopyMonotonicNs = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaCurrentFrameGeneration = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;
@@ -1557,6 +1597,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
 - (void)inumaScheduleDirectFrameDisplayRetryForTextureId:(int64_t)textureId
                                         frameTimestampNs:
                                             (int64_t)frameTimestampNs
+                                         frameGeneration:
+                                             (uint64_t)frameGeneration
                                  rendererStateGeneration:
                                      (uint64_t)rendererStateGeneration {
   const uint64_t scheduledAt = InumaMonotonicNanoseconds();
@@ -1577,7 +1619,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           strongSelf->_textureId == textureId &&
           strongSelf->_frameAvailable &&
           !strongSelf->_inumaCurrentFrameWasRescuePromoted &&
-          strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+          InumaFrameOwnershipValuesMatch(
+              strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+              strongSelf->_inumaFrameTimestampNs, frameTimestampNs) &&
           strongSelf->_inumaFrameReadyMonotonicNs > 0 &&
           !strongSelf->_inumaDirectFrameDisplayRetryActive;
       if (retryMayStillBeCurrent) {
@@ -1613,7 +1657,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           strongSelf->_textureId == textureId &&
           strongSelf->_frameAvailable &&
           !strongSelf->_inumaCurrentFrameWasRescuePromoted &&
-          strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+          InumaFrameOwnershipValuesMatch(
+              strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+              strongSelf->_inumaFrameTimestampNs, frameTimestampNs) &&
           strongSelf->_inumaFrameReadyMonotonicNs > 0 &&
           !strongSelf->_inumaDirectFrameDisplayRetryActive &&
           (strongSelf->_inumaDirectFrameDisplayRetryLink == nil ||
@@ -1631,6 +1677,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         strongSelf->_inumaDirectFrameDisplayRetryActive = true;
         strongSelf->_inumaDirectFrameDisplayRetryFrameTimestampNs =
             frameTimestampNs;
+        strongSelf->_inumaDirectFrameDisplayRetryFrameGeneration =
+            frameGeneration;
         strongSelf->_inumaDirectFrameDisplayRetryRendererStateGeneration =
             rendererStateGeneration;
         strongSelf->_inumaDirectFrameDisplayRetryFrameReadyMonotonicNs =
@@ -1673,7 +1721,10 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                      rendererStateGeneration &&
                  strongSelf->_textureId == textureId &&
                  strongSelf->_frameAvailable &&
-                 strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+                 InumaFrameOwnershipValuesMatch(
+                     strongSelf->_inumaCurrentFrameGeneration,
+                     frameGeneration, strongSelf->_inumaFrameTimestampNs,
+                     frameTimestampNs) &&
                  strongSelf->_inumaTrace.enabled) {
         strongSelf->_inumaTrace.direct_frame_display_retry_create_failures +=
             1;
@@ -1696,7 +1747,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         strongSelf->_inumaRendererStateGeneration ==
             rendererStateGeneration &&
         strongSelf->_textureId == textureId && strongSelf->_frameAvailable &&
-        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+            strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
     if (creationWasRequired && strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.direct_frame_display_retry_create_failures += 1;
     }
@@ -1709,6 +1762,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   const uint64_t checkedAt = InumaMonotonicNanoseconds();
   int64_t textureId = -1;
   int64_t frameTimestampNs = 0;
+  uint64_t frameGeneration = 0;
   id<FlutterTextureRegistry> registry = nil;
   bool shouldDefer = false;
   bool shouldFire = false;
@@ -1721,6 +1775,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   if (ownsDisplayLink) {
     textureId = _textureId;
     frameTimestampNs = _inumaDirectFrameDisplayRetryFrameTimestampNs;
+    frameGeneration = _inumaDirectFrameDisplayRetryFrameGeneration;
     registry = _registry;
     scheduledAt = _inumaDirectFrameDisplayRetryScheduledMonotonicNs;
     eventIndex = _inumaDirectFrameDisplayRetryEventIndex;
@@ -1740,7 +1795,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 .texture_matches = textureId != -1 && registry != nil,
                 .frame_available = _frameAvailable,
                 .frame_timestamp_matches =
-                    _inumaFrameTimestampNs == frameTimestampNs,
+                    InumaFrameOwnershipValuesMatch(
+                        _inumaCurrentFrameGeneration, frameGeneration,
+                        _inumaFrameTimestampNs, frameTimestampNs),
                 .predecessor_hold_satisfied = predecessorHoldSatisfied,
                 .frame_ready_monotonic_ns =
                     _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs,
@@ -1811,6 +1868,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     if (!shouldDefer) {
       _inumaDirectFrameDisplayRetryActive = false;
       _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+      _inumaDirectFrameDisplayRetryFrameGeneration = 0;
       _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
       _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
       _inumaDirectFrameDisplayRetryScheduledMonotonicNs = 0;
@@ -1991,6 +2049,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   bool inumaShouldNotifyTexture = false;
   int64_t inumaTextureIdToNotify = -1;
   int64_t inumaFrameTimestampToNotify = 0;
+  uint64_t inumaFrameGenerationToNotify = 0;
   uint64_t inumaRendererStateGenerationToNotify = 0;
 #endif
   os_unfair_lock_lock(&_lock);
@@ -2004,6 +2063,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _inumaTrace.render_qos_calling_thread_entries += 1;
     }
     _inumaTrace.render_frames += 1;
+    if (frame.timeStampNs == 0) {
+      _inumaTrace.zero_timestamp_render_frames += 1;
+    }
     if (_inumaTraceStartedMonotonicNs > 0 &&
         locked >= _inumaTraceStartedMonotonicNs) {
       inumaRenderEventIndex = InumaReserveTraceSample(
@@ -2115,6 +2177,14 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _frameAvailable = true;
       _inumaFrameReadyMonotonicNs = frameReadyNs;
       _inumaFrameTimestampNs = frame.timeStampNs;
+      _inumaFrameGenerationCounter += 1;
+      if (_inumaFrameGenerationCounter == 0) {
+        _inumaFrameGenerationCounter += 1;
+      }
+      _inumaCurrentFrameGeneration = _inumaFrameGenerationCounter;
+      if (_inumaTrace.enabled) {
+        _inumaTrace.frame_generation_assignments += 1;
+      }
       _inumaCurrentFrameWasRescuePromoted = false;
       _inumaCurrentFrameRepeatDeferred = false;
       _inumaCurrentRepeatRetryFired = false;
@@ -2126,6 +2196,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         inumaShouldNotifyTexture = true;
         inumaTextureIdToNotify = _textureId;
         inumaFrameTimestampToNotify = frame.timeStampNs;
+        inumaFrameGenerationToNotify = _inumaCurrentFrameGeneration;
         inumaRendererStateGenerationToNotify =
             _inumaRendererStateGeneration;
       }
@@ -2210,6 +2281,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     }
     if (_inumaTrace.enabled && framePrepared) {
       _inumaTrace.accepted_frames += 1;
+      if (frame.timeStampNs == 0) {
+        _inumaTrace.zero_timestamp_accepted_frames += 1;
+      }
       if (inumaRenderEventIndex != NSNotFound) {
         _inumaTrace.render_outcome_samples[inumaRenderEventIndex] =
             emergencyGraceStateEligible ? 3 : 1;
@@ -2277,6 +2351,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               inumaTextureIdToNotify
                                           frameTimestampNs:
                                               inumaFrameTimestampToNotify
+                                           frameGeneration:
+                                               inumaFrameGenerationToNotify
                                    rendererStateGeneration:
                                        inumaRendererStateGenerationToNotify
                                          bypassMinimumHold:false
@@ -2290,6 +2366,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 inumaTextureIdToNotify
                                             frameTimestampNs:
                                                 inumaFrameTimestampToNotify
+                                             frameGeneration:
+                                                 inumaFrameGenerationToNotify
                                      rendererStateGeneration:
                                          inumaRendererStateGenerationToNotify];
     }
@@ -2488,6 +2566,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
 - (BOOL)inumaArmMainRunLoopNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                                     frameGeneration:
+                                         (uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                                       successorRearm:(bool)successorRearm {
@@ -2504,9 +2584,10 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           .texture_registered = _textureId == textureId && textureId != -1 &&
                                 _registry != nil,
           .frame_available = _frameAvailable,
-          .frame_timestamp_valid =
-              frameTimestampNs != 0 &&
-              _inumaFrameTimestampNs == frameTimestampNs &&
+          .frame_ownership_valid =
+              InumaFrameOwnershipValuesMatch(
+                  _inumaCurrentFrameGeneration, frameGeneration,
+                  _inumaFrameTimestampNs, frameTimestampNs) &&
               _inumaRendererStateGeneration == rendererStateGeneration,
           .token_occupied =
               _inumaMainRunLoopNotificationTokenOccupied,
@@ -2515,6 +2596,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaMainRunLoopNotificationTokenOccupied = true;
     _inumaMainRunLoopNotificationTextureId = textureId;
     _inumaMainRunLoopNotificationFrameTimestampNs = frameTimestampNs;
+    _inumaMainRunLoopNotificationFrameGeneration = frameGeneration;
     _inumaMainRunLoopNotificationRendererStateGeneration =
         rendererStateGeneration;
     _inumaMainRunLoopNotificationArmedMonotonicNs = armedAt;
@@ -2582,6 +2664,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   bool shouldRearmSuccessor = false;
   int64_t successorTextureId = -1;
   int64_t successorFrameTimestampNs = 0;
+  uint64_t successorFrameGeneration = 0;
   uint64_t successorRendererStateGeneration = 0;
   os_unfair_lock_lock(&_lock);
   if (_inumaTrace.enabled) {
@@ -2606,9 +2689,12 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               .texture_matches =
                   _textureId == _inumaMainRunLoopNotificationTextureId,
               .frame_available = _frameAvailable,
-              .frame_timestamp_matches =
-                  _inumaFrameTimestampNs ==
-                  _inumaMainRunLoopNotificationFrameTimestampNs,
+              .frame_ownership_matches =
+                  InumaFrameOwnershipValuesMatch(
+                      _inumaCurrentFrameGeneration,
+                      _inumaMainRunLoopNotificationFrameGeneration,
+                      _inumaFrameTimestampNs,
+                      _inumaMainRunLoopNotificationFrameTimestampNs),
           });
   eventIndex = _inumaMainRunLoopNotificationEventIndex;
   if (decision.fire) {
@@ -2644,16 +2730,18 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   _inumaMainRunLoopNotificationTokenOccupied = false;
   _inumaMainRunLoopNotificationTextureId = -1;
   _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+  _inumaMainRunLoopNotificationFrameGeneration = 0;
   _inumaMainRunLoopNotificationRendererStateGeneration = 0;
   _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
   _inumaMainRunLoopNotificationEventIndex = NSNotFound;
   shouldRearmSuccessor = !shouldFire &&
                          _inumaCurrentNormalNotificationRequired &&
                          _frameAvailable && _textureId != -1 &&
-                         _inumaFrameTimestampNs != 0;
+                         _inumaCurrentFrameGeneration != 0;
   if (shouldRearmSuccessor) {
     successorTextureId = _textureId;
     successorFrameTimestampNs = _inumaFrameTimestampNs;
+    successorFrameGeneration = _inumaCurrentFrameGeneration;
     successorRendererStateGeneration = _inumaRendererStateGeneration;
   }
   os_unfair_lock_unlock(&_lock);
@@ -2676,6 +2764,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     [self inumaArmMainRunLoopNotificationForTextureId:successorTextureId
                                      frameTimestampNs:
                                          successorFrameTimestampNs
+                                      frameGeneration:
+                                          successorFrameGeneration
                               rendererStateGeneration:
                                   successorRendererStateGeneration
                                        successorRearm:true];
@@ -2699,6 +2789,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   _inumaMainRunLoopNotificationTokenOccupied = false;
   _inumaMainRunLoopNotificationTextureId = -1;
   _inumaMainRunLoopNotificationFrameTimestampNs = 0;
+  _inumaMainRunLoopNotificationFrameGeneration = 0;
   _inumaMainRunLoopNotificationRendererStateGeneration = 0;
   _inumaMainRunLoopNotificationArmedMonotonicNs = 0;
   _inumaMainRunLoopNotificationEventIndex = NSNotFound;
@@ -2743,6 +2834,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
 - (void)inumaScheduleTextureNotificationForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                                     frameGeneration:
+                                         (uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                                    bypassMinimumHold:(bool)bypassMinimumHold
@@ -2759,7 +2852,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   const bool notificationCanBeScheduled =
       _inumaRendererStateGeneration == rendererStateGeneration &&
       _textureId == textureId && _frameAvailable &&
-      _inumaFrameTimestampNs == frameTimestampNs;
+      InumaFrameOwnershipValuesMatch(
+          _inumaCurrentFrameGeneration, frameGeneration,
+          _inumaFrameTimestampNs, frameTimestampNs);
   if (recordRasterRepeatRetry && _inumaTrace.enabled) {
     _inumaTrace.raster_repeat_platform_retry_schedules += 1;
     rasterRepeatRetryEventIndex = InumaReserveTraceSample(
@@ -2841,7 +2936,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             rendererStateGeneration &&
         strongSelf->_textureId == textureId &&
         strongSelf->_frameAvailable &&
-        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+            strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
     const bool traceEnabled = strongSelf->_inumaTrace.enabled;
     id<FlutterTextureRegistry> registry = strongSelf->_registry;
     if (traceEnabled && !notificationIsCurrent) {
@@ -2931,7 +3028,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             rendererStateGeneration &&
         strongSelf->_textureId == textureId &&
         strongSelf->_frameAvailable &&
-        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+            strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
     if (platformTurnCanBeScheduled && strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.texture_notification_platform_turn_schedules +=
           1;
@@ -2995,6 +3094,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         [strongSelf
             inumaArmMainRunLoopNotificationForTextureId:textureId
                                          frameTimestampNs:frameTimestampNs
+                                          frameGeneration:frameGeneration
                                   rendererStateGeneration:
                                       rendererStateGeneration
                                            successorRearm:false]) {
@@ -3026,7 +3126,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     const bool timerFrameIsCurrent =
         _inumaRendererStateGeneration == rendererStateGeneration &&
         _textureId == textureId && _frameAvailable &&
-        _inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            _inumaCurrentFrameGeneration, frameGeneration,
+            _inumaFrameTimestampNs, frameTimestampNs);
     const bool timerSlotAvailable = _inumaTextureHoldTimer == nil;
     const bool timerIsCurrent = timerFrameIsCurrent && timerSlotAvailable;
     if (timerIsCurrent) {
@@ -3081,7 +3183,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                            rendererStateGeneration &&
           strongSelf->_textureId == textureId &&
           strongSelf->_frameAvailable &&
-          strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+          InumaFrameOwnershipValuesMatch(
+              strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+              strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
       if (ownsTimer) {
         strongSelf->_inumaTextureHoldTimer = nil;
       }
@@ -3113,6 +3217,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
 - (void)inumaScheduleDisplayLinkedRescueForTextureId:(int64_t)textureId
                                     frameTimestampNs:
                                         (int64_t)frameTimestampNs
+                                     frameGeneration:
+                                         (uint64_t)frameGeneration
                              rendererStateGeneration:
                                  (uint64_t)rendererStateGeneration
                             predecessorCopyUptimeNs:
@@ -3136,12 +3242,16 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
               rendererStateGeneration &&
           strongSelf->_textureId == textureId &&
           strongSelf->_frameAvailable &&
-          strongSelf->_inumaFrameTimestampNs == frameTimestampNs &&
+          InumaFrameOwnershipValuesMatch(
+              strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+              strongSelf->_inumaFrameTimestampNs, frameTimestampNs) &&
           strongSelf->_inumaRescueDisplayLink == nil;
       if (rescueIsCurrent) {
         strongSelf->_inumaRescueDisplayLink = displayLink;
         strongSelf->_inumaRescueDisplayLinkFrameTimestampNs =
             frameTimestampNs;
+        strongSelf->_inumaRescueDisplayLinkFrameGeneration =
+            frameGeneration;
         strongSelf->_inumaRescueDisplayLinkRendererStateGeneration =
             rendererStateGeneration;
         strongSelf->_inumaRescuePredecessorCopyUptimeNs =
@@ -3180,7 +3290,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
                 rendererStateGeneration &&
             strongSelf->_textureId == textureId &&
             strongSelf->_frameAvailable &&
-            strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+            InumaFrameOwnershipValuesMatch(
+                strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+                strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
         if (fallbackIsCurrent && strongSelf->_inumaTrace.enabled) {
           strongSelf->_inumaTrace.rescue_display_link_fallbacks += 1;
         }
@@ -3189,6 +3301,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
           [strongSelf
               inumaScheduleTextureNotificationForTextureId:textureId
                                           frameTimestampNs:frameTimestampNs
+                                           frameGeneration:frameGeneration
                                    rendererStateGeneration:
                                        rendererStateGeneration
                                          bypassMinimumHold:false
@@ -3205,7 +3318,9 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
             rendererStateGeneration &&
         strongSelf->_textureId == textureId &&
         strongSelf->_frameAvailable &&
-        strongSelf->_inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            strongSelf->_inumaCurrentFrameGeneration, frameGeneration,
+            strongSelf->_inumaFrameTimestampNs, frameTimestampNs);
     if (fallbackIsCurrent && strongSelf->_inumaTrace.enabled) {
       strongSelf->_inumaTrace.rescue_display_link_fallbacks += 1;
     }
@@ -3214,6 +3329,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       [strongSelf inumaScheduleTextureNotificationForTextureId:textureId
                                              frameTimestampNs:
                                                  frameTimestampNs
+                                              frameGeneration:
+                                                  frameGeneration
                                       rendererStateGeneration:
                                           rendererStateGeneration
                                             bypassMinimumHold:false
@@ -3230,6 +3347,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       InumaDisplayLinkTimestampNanoseconds(displayLink);
   int64_t textureId = -1;
   int64_t frameTimestampNs = 0;
+  uint64_t frameGeneration = 0;
   uint64_t rendererStateGeneration = 0;
   bool rescueIsCurrent = false;
   bool predecessorWasPresented = false;
@@ -3239,12 +3357,15 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   if (ownsDisplayLink) {
     textureId = _textureId;
     frameTimestampNs = _inumaRescueDisplayLinkFrameTimestampNs;
+    frameGeneration = _inumaRescueDisplayLinkFrameGeneration;
     rendererStateGeneration =
         _inumaRescueDisplayLinkRendererStateGeneration;
     rescueIsCurrent =
         _inumaRendererStateGeneration == rendererStateGeneration &&
         textureId != -1 && _frameAvailable &&
-        _inumaFrameTimestampNs == frameTimestampNs;
+        InumaFrameOwnershipValuesMatch(
+            _inumaCurrentFrameGeneration, frameGeneration,
+            _inumaFrameTimestampNs, frameTimestampNs);
     predecessorWasPresented =
         _inumaRescuePredecessorCopyUptimeNs > 0 &&
         displayedAtUptimeNs >= _inumaRescuePredecessorCopyUptimeNs;
@@ -3278,6 +3399,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     if (!deferUntilPresentation) {
       _inumaRescueDisplayLink = nil;
       _inumaRescueDisplayLinkFrameTimestampNs = 0;
+      _inumaRescueDisplayLinkFrameGeneration = 0;
       _inumaRescueDisplayLinkRendererStateGeneration = 0;
       _inumaRescuePredecessorCopyUptimeNs = 0;
       _inumaRescueDisplayLinkEventIndex = NSNotFound;
@@ -3291,6 +3413,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   if (rescueIsCurrent && predecessorWasPresented) {
     [self inumaScheduleTextureNotificationForTextureId:textureId
                                       frameTimestampNs:frameTimestampNs
+                                      frameGeneration:frameGeneration
                                rendererStateGeneration:
                                    rendererStateGeneration
                                      bypassMinimumHold:true
@@ -3318,6 +3441,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   }
   _inumaRescueDisplayLink = nil;
   _inumaRescueDisplayLinkFrameTimestampNs = 0;
+  _inumaRescueDisplayLinkFrameGeneration = 0;
   _inumaRescueDisplayLinkRendererStateGeneration = 0;
   _inumaRescuePredecessorCopyUptimeNs = 0;
   _inumaRescueDisplayLinkEventIndex = NSNotFound;
@@ -3335,6 +3459,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   const NSUInteger eventIndex = _inumaDirectFrameDisplayRetryEventIndex;
   _inumaDirectFrameDisplayRetryActive = false;
   _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+  _inumaDirectFrameDisplayRetryFrameGeneration = 0;
   _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
   _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
   _inumaDirectFrameDisplayRetryScheduledMonotonicNs = 0;
@@ -3361,6 +3486,12 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   }
   _inumaDirectFrameDisplayRetryActive = false;
   _inumaDirectFrameDisplayRetryLink = nil;
+  _inumaDirectFrameDisplayRetryFrameTimestampNs = 0;
+  _inumaDirectFrameDisplayRetryFrameGeneration = 0;
+  _inumaDirectFrameDisplayRetryRendererStateGeneration = 0;
+  _inumaDirectFrameDisplayRetryFrameReadyMonotonicNs = 0;
+  _inumaDirectFrameDisplayRetryScheduledMonotonicNs = 0;
+  _inumaDirectFrameDisplayRetryEventIndex = NSNotFound;
   displayLink.paused = YES;
   if (_inumaTrace.enabled) {
     _inumaTrace.direct_frame_display_retry_link_invalidations += 1;
@@ -3512,6 +3643,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   int64_t primaryFrameTimestampNs = 0;
   int64_t emergencyGraceFrameTimestampNs = 0;
   int64_t mainRunLoopNotificationFrameTimestampNs = 0;
+  uint64_t currentFrameGeneration = 0;
+  uint64_t mainRunLoopNotificationFrameGeneration = 0;
   uint64_t primaryFrameAgeNs = 0;
   uint64_t currentFrameAgeNs = 0;
   uint64_t emergencyGraceResidenceNs = 0;
@@ -3530,6 +3663,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
       _inumaMainRunLoopNotificationTokenOccupied;
   mainRunLoopNotificationFrameTimestampNs =
       _inumaMainRunLoopNotificationFrameTimestampNs;
+  mainRunLoopNotificationFrameGeneration =
+      _inumaMainRunLoopNotificationFrameGeneration;
   if (_inumaMainRunLoopNotificationArmedMonotonicNs > 0 &&
       traceSnapshotMonotonicNs >=
           _inumaMainRunLoopNotificationArmedMonotonicNs) {
@@ -3541,6 +3676,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
   currentFrameRescuePromoted = _inumaCurrentFrameWasRescuePromoted;
   currentRepeatRetryFired = _inumaCurrentRepeatRetryFired;
   currentFrameTimestampNs = _inumaFrameTimestampNs;
+  currentFrameGeneration = _inumaCurrentFrameGeneration;
   if (_inumaFrameReadyMonotonicNs > 0 &&
       traceSnapshotMonotonicNs >= _inumaFrameReadyMonotonicNs) {
     currentFrameAgeNs =
@@ -3595,7 +3731,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @45,
+    @"tail_diagnostics_version" : @46,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"prerenderer_smoothing_configuration_contract" :
         @"explicit_objc_to_native_peer_configuration",
@@ -3621,6 +3757,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :
         @"frame_state_before_platform_thread_notification",
+    @"frame_ownership_contract" :
+        @"explicit_monotonic_generation_timestamp_zero_accepted",
     @"trace_snapshot_monotonic_ns" : @(traceSnapshotMonotonicNs),
     @"trace_snapshot_count" : @(_inumaTraceSnapshotCount),
     @"trace_snapshot_lock_hold_ns" : @(traceSnapshotLockHoldNs),
@@ -3631,6 +3769,15 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"render_frames" : @(snapshot->render_frames),
     @"accepted_frames" : @(snapshot->accepted_frames),
     @"coalesced_frames" : @(snapshot->coalesced_frames),
+    @"frame_generation_assignments" :
+        @(snapshot->frame_generation_assignments),
+    @"zero_timestamp_render_frames" :
+        @(snapshot->zero_timestamp_render_frames),
+    @"zero_timestamp_accepted_frames" :
+        @(snapshot->zero_timestamp_accepted_frames),
+    @"current_frame_generation_at_snapshot" : @(currentFrameGeneration),
+    @"main_run_loop_notification_frame_generation_at_snapshot" :
+        @(mainRunLoopNotificationFrameGeneration),
     @"copy_calls" : @(snapshot->copy_calls),
     @"copy_hits" : @(snapshot->copy_hits),
     @"copy_misses" : @(snapshot->copy_misses),
@@ -4267,6 +4414,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     _inumaLastCopyMonotonicNs = 0;
     _inumaLastCopiedFrameTimestampNs = 0;
     _inumaFrameTimestampNs = 0;
+    _inumaCurrentFrameGeneration = 0;
     _inumaCurrentFrameWasRescuePromoted = false;
     _inumaCurrentFrameRepeatDeferred = false;
     _inumaCurrentRepeatRetryFired = false;

@@ -2,6 +2,7 @@
 
 #include "InumaEmergencyGracePolicy.h"
 #include "InumaDirectFrameDisplayRetryPolicy.h"
+#include "InumaFrameOwnershipPolicy.h"
 #include "InumaMainRunLoopNotificationPolicy.h"
 #include "InumaRepeatBoundaryPolicy.h"
 #include "InumaRendererQueueSimulation.h"
@@ -327,6 +328,18 @@ static void TestDirectRetryDefaultOffAndStrictOwnership(void) {
   assert(decision.stale);
 }
 
+static void TestFrameOwnershipAcceptsZeroTimestampWithExactGeneration(void) {
+  assert(InumaFrameOwnershipValuesMatch(1, 1, 0, 0));
+  assert(InumaFrameOwnershipValuesMatch(42, 42, 1234, 1234));
+
+  // Generation zero is the explicit unowned sentinel. Media timestamp zero
+  // remains valid and cannot substitute for lifecycle ownership.
+  assert(!InumaFrameOwnershipValuesMatch(0, 0, 0, 0));
+  assert(!InumaFrameOwnershipValuesMatch(1, 0, 0, 0));
+  assert(!InumaFrameOwnershipValuesMatch(2, 1, 0, 0));
+  assert(!InumaFrameOwnershipValuesMatch(1, 1, 0, 1));
+}
+
 static InumaMainRunLoopNotificationArmInput MainRunLoopArmInput(void) {
   return (InumaMainRunLoopNotificationArmInput){
       .enabled = true,
@@ -334,7 +347,7 @@ static InumaMainRunLoopNotificationArmInput MainRunLoopArmInput(void) {
       .source_registered = true,
       .texture_registered = true,
       .frame_available = true,
-      .frame_timestamp_valid = true,
+      .frame_ownership_valid = true,
       .token_occupied = false,
   };
 }
@@ -396,7 +409,7 @@ static InumaMainRunLoopNotificationFireInput MainRunLoopFireInput(void) {
       .registry_available = true,
       .texture_matches = true,
       .frame_available = true,
-      .frame_timestamp_matches = true,
+      .frame_ownership_matches = true,
   };
 }
 
@@ -409,7 +422,7 @@ static void TestMainRunLoopNotificationFireAndLifecycleContract(void) {
   assert(decision.fire);
   assert(!decision.close_stale);
 
-  input.frame_timestamp_matches = false;
+  input.frame_ownership_matches = false;
   decision = InumaMainRunLoopNotificationEvaluateFire(input);
   assert(!decision.state_current);
   assert(!decision.fire);
@@ -540,6 +553,7 @@ int main(void) {
   TestRepeatBoundaryDefaultOffAndBaseGuard();
   TestDirectRetryExactAgeBoundary();
   TestDirectRetryDefaultOffAndStrictOwnership();
+  TestFrameOwnershipAcceptsZeroTimestampWithExactGeneration();
   TestMainRunLoopNotificationArmContract();
   TestMainRunLoopNotificationFireAndLifecycleContract();
   TestMainRunLoopNotificationDeterministicSequences();
