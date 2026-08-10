@@ -20,6 +20,7 @@ A new flutter plugin project.
     'Classes/InumaDecoderBoundaryTrace.h',
     'Classes/InumaDirectFrameDisplayRetryPolicy.h',
     'Classes/InumaEmergencyGracePolicy.h',
+    'Classes/InumaFrameOwnershipPolicy.h',
     'Classes/InumaMainRunLoopNotificationPolicy.h',
     'Classes/InumaLowLatencyVideoPlayoutConfiguration.h',
     'Classes/InumaPrerendererSmoothingConfiguration.h',
