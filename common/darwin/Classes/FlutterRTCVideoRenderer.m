@@ -3882,7 +3882,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @55,
+    @"tail_diagnostics_version" : @56,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"receiver_scheduler_trace" :
         RTCInumaReceiverSchedulerTraceSnapshot(),
