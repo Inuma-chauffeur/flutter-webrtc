@@ -24,6 +24,7 @@ A new flutter plugin project.
     'Classes/InumaMainRunLoopNotificationPolicy.h',
     'Classes/InumaLowLatencyVideoPlayoutConfiguration.h',
     'Classes/InumaPrerendererSmoothingConfiguration.h',
+    'Classes/InumaReceiverSchedulerTraceConfiguration.h',
     'Classes/InumaRepeatBoundaryPolicy.h',
   ]
 

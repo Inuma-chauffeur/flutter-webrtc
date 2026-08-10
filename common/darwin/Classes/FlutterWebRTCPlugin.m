@@ -22,6 +22,8 @@
 #import "InumaDecoderBoundaryTrace.h"
 #import "InumaLowLatencyVideoPlayoutConfiguration.h"
 #import "InumaPrerendererSmoothingConfiguration.h"
+#import "InumaReceiverSchedulerTraceConfiguration.h"
+#import <WebRTC/RTCTracing.h>
 #import <os/lock.h>
 #include <pthread/qos.h>
 #include <stdlib.h>
@@ -696,12 +698,14 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 - (void)initialize:(NSArray*)networkIgnoreMask
     bypassVoiceProcessing:(BOOL)bypassVoiceProcessing
   lowLatencyVideoPlayout:(BOOL)lowLatencyVideoPlayout
+  receiverSchedulerTrace:(BOOL)receiverSchedulerTrace
                  severity:(RTCLoggingSeverity)severity {
     // RTCSetMinDebugLogLevel(severity);
     [self initLoggerCallback:severity];
 
     if (!_peerConnectionFactory) {
 #if TARGET_OS_OSX
+        RTCResetInumaReceiverSchedulerTrace(receiverSchedulerTrace);
         InumaRecordLowLatencyVideoPlayoutConfiguration(
             lowLatencyVideoPlayout);
         if (lowLatencyVideoPlayout) {
@@ -806,6 +810,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     }
 
     BOOL lowLatencyVideoPlayout = NO;
+    BOOL receiverSchedulerTrace = NO;
 #if TARGET_OS_OSX
     InumaLowLatencyVideoPlayoutParseResult lowLatencyVideoPlayoutResult =
         InumaParseLowLatencyVideoPlayoutConfiguration(
@@ -819,11 +824,23 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
                 details:nil]);
       return;
     }
+    InumaReceiverSchedulerTraceParseResult receiverSchedulerTraceResult =
+        InumaParseReceiverSchedulerTraceConfiguration(
+            options, &receiverSchedulerTrace);
+    if (receiverSchedulerTraceResult ==
+        InumaReceiverSchedulerTraceParseResultInvalid) {
+      result([FlutterError
+          errorWithCode:@"invalid-options"
+                message:@"receiverSchedulerTrace must be a Boolean"
+                details:nil]);
+      return;
+    }
 #endif
 
     [self initialize:networkIgnoreMask
         bypassVoiceProcessing:enableBypassVoiceProcessing
        lowLatencyVideoPlayout:lowLatencyVideoPlayout
+       receiverSchedulerTrace:receiverSchedulerTrace
                      severity:severity];
     result(@"");
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {

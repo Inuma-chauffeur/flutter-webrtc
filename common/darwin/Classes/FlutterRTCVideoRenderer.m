@@ -6,6 +6,7 @@
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCYUVHelper.h>
 #import <WebRTC/RTCYUVPlanarBuffer.h>
+#import <WebRTC/RTCTracing.h>
 #import <WebRTC/WebRTC.h>
 
 #import <objc/runtime.h>
@@ -3881,8 +3882,10 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @47,
+    @"tail_diagnostics_version" : @55,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
+    @"receiver_scheduler_trace" :
+        RTCInumaReceiverSchedulerTraceSnapshot(),
     @"prerenderer_smoothing_configuration_contract" :
         @"explicit_objc_to_native_peer_configuration",
     @"prerenderer_smoothing_disabled_configuration_count" :
