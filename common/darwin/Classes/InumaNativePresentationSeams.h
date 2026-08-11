@@ -41,6 +41,7 @@ typedef struct {
 
 @end
 
+API_AVAILABLE(macos(14.0))
 @interface InumaAVSampleRendererBackend : NSObject <InumaSampleRendererBackend>
 
 - (instancetype)initWithRenderer:(AVSampleBufferVideoRenderer*)renderer;
