@@ -92,12 +92,13 @@ static uint64_t InumaStrictReplayReserveNanoseconds(
     NSDictionary<NSString*, NSString*>* environment) {
   NSString* raw = environment[
       @"INUMA_FLUTTER_WEBRTC_MACOS_STRICT_REPLAY_RESERVE_NS"];
+  const long long signedValue = raw.longLongValue;
   if (raw.length == 0 ||
-      ![raw isEqualToString:[NSString stringWithFormat:@"%llu",
-                                                       raw.unsignedLongLongValue]]) {
+      signedValue <= 0 ||
+      ![raw isEqualToString:[NSString stringWithFormat:@"%lld", signedValue]]) {
     return 0;
   }
-  const uint64_t value = raw.unsignedLongLongValue;
+  const uint64_t value = (uint64_t)signedValue;
   switch (value) {
     case 33333333:
     case 50000000:
