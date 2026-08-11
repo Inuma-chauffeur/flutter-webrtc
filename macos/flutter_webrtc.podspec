@@ -23,6 +23,7 @@ A new flutter plugin project.
     'Classes/InumaFrameOwnershipPolicy.h',
     'Classes/InumaMainRunLoopNotificationPolicy.h',
     'Classes/InumaNativePresentationSeams.h',
+    'Classes/InumaNativePresentationTrace.h',
     'Classes/InumaLowLatencyVideoPlayoutConfiguration.h',
     'Classes/InumaPrerendererSmoothingConfiguration.h',
     'Classes/InumaReceiverSchedulerTraceConfiguration.h',

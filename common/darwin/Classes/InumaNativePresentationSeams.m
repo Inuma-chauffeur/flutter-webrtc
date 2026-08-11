@@ -103,6 +103,22 @@
   return _renderer.status == AVQueuedSampleBufferRenderingStatusFailed;
 }
 
+- (int32_t)rendererStatus {
+  return (int32_t)_renderer.status;
+}
+
+- (int32_t)rendererErrorDomainClass {
+  NSError* error = _renderer.error;
+  if (error == nil) return InumaRendererErrorDomainNone;
+  return [error.domain hasPrefix:@"AVFoundation"]
+             ? InumaRendererErrorDomainAVFoundation
+             : InumaRendererErrorDomainOther;
+}
+
+- (int64_t)rendererErrorCode {
+  return (int64_t)_renderer.error.code;
+}
+
 @end
 
 typedef struct {
@@ -219,6 +235,14 @@ typedef struct {
 
 - (InumaRendererSubmissionResult)submitSampleBuffer:(CMSampleBufferRef)sampleBuffer
                                          generation:(uint64_t)generation {
+  InumaPresentationFrameContext context = {0};
+  context.renderOrdinal = generation == 0 ? 0 : generation - 1;
+  context.nativeGeneration = generation;
+  return [self submitSampleBuffer:sampleBuffer context:context];
+}
+
+- (InumaRendererSubmissionResult)submitSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                                            context:(InumaPresentationFrameContext)context {
   InumaRendererSubmissionResult result = {0};
   os_unfair_lock_lock(&_lock);
   if (_stopped) {
@@ -230,20 +254,69 @@ typedef struct {
   InumaMonotonicClock* clock = _clock;
   os_unfair_lock_unlock(&_lock);
 
+  const BOOL recordsRealtimeTrace =
+      traceSink != nil &&
+      [traceSink respondsToSelector:
+          @selector(recordSubmissionBeginContext:atNs:)] &&
+      [traceSink respondsToSelector:
+          @selector(recordRendererFlushContext:atNs:result:)] &&
+      [traceSink respondsToSelector:
+          @selector(recordReadinessContext:atNs:result:)] &&
+      [traceSink respondsToSelector:
+          @selector(recordSubmissionEndContext:startedAtNs:completedAtNs:result:)];
   const uint64_t startedAtNs = traceSink == nil ? 0 : [clock nowNanoseconds];
   result.accepted = YES;
+  if (recordsRealtimeTrace) {
+    [traceSink recordSubmissionBeginContext:context atNs:startedAtNs];
+  }
+  if ([backend respondsToSelector:@selector(rendererStatus)]) {
+    result.rendererStatusBeforeEnqueue = [backend rendererStatus];
+  }
   if ([backend requiresFlushToResumeDecoding]) {
     [backend flushRemovingDisplayedImage];
     result.flushedBeforeEnqueue = YES;
+    if (recordsRealtimeTrace) {
+      [traceSink recordRendererFlushContext:context
+                                      atNs:[clock nowNanoseconds]
+                                     result:result];
+    }
   }
   result.readyBeforeEnqueue = [backend readyForMoreMediaData];
-  [backend enqueueSampleBuffer:sampleBuffer generation:generation];
+  if (recordsRealtimeTrace) {
+    [traceSink recordReadinessContext:context
+                                 atNs:[clock nowNanoseconds]
+                                result:result];
+  }
+  [backend enqueueSampleBuffer:sampleBuffer generation:context.nativeGeneration];
   result.failedAfterEnqueue = [backend failed];
+  if ([backend respondsToSelector:@selector(rendererStatus)]) {
+    result.rendererStatusAfterEnqueue = [backend rendererStatus];
+  }
+  if ([backend respondsToSelector:@selector(rendererErrorDomainClass)]) {
+    result.rendererErrorDomainClass = [backend rendererErrorDomainClass];
+  }
+  if ([backend respondsToSelector:@selector(rendererErrorCode)]) {
+    result.rendererErrorCode = [backend rendererErrorCode];
+  }
   if (traceSink != nil) {
-    [traceSink recordGeneration:generation
+    const uint64_t completedAtNs = [clock nowNanoseconds];
+    if (recordsRealtimeTrace) {
+      [traceSink recordSubmissionEndContext:context
+                                   startedAtNs:startedAtNs
+                                 completedAtNs:completedAtNs
+                                        result:result];
+    } else if ([traceSink respondsToSelector:
+            @selector(recordContext:startedAtNs:completedAtNs:result:)]) {
+      [traceSink recordContext:context
                    startedAtNs:startedAtNs
-                 completedAtNs:[clock nowNanoseconds]
+                 completedAtNs:completedAtNs
                         result:result];
+    } else {
+      [traceSink recordGeneration:context.nativeGeneration
+                     startedAtNs:startedAtNs
+                   completedAtNs:completedAtNs
+                          result:result];
+    }
   }
   return result;
 }

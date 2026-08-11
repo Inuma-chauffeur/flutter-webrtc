@@ -174,6 +174,63 @@ int main(void) {
     result = [adapter submitSampleBuffer:sampleBuffer generation:12];
     INUMA_REQUIRE(!result.accepted);
     INUMA_REQUIRE(reconnected.enqueueCount == 1);
+
+    InumaNativePresentationTrace* realtimeTrace =
+        [[InumaNativePresentationTrace alloc] initWithCapacity:32
+                                               sessionSequence:2
+                                                   startedAtNs:900];
+    InumaFakeSampleRendererBackend* realtimePressured =
+        [[InumaFakeSampleRendererBackend alloc] init];
+    realtimePressured.ready = NO;
+    InumaSampleRendererAdapter* realtimeAdapter =
+        [[InumaSampleRendererAdapter alloc]
+            initWithBackend:realtimePressured
+                       clock:InumaTestClock(
+                                 @[ @1000, @1010, @1020, @1030, @1040, @1050 ])
+                   traceSink:realtimeTrace];
+    InumaPresentationFrameContext firstContext = {
+        .sourceIdentity = 20,
+        .renderOrdinal = 20,
+        .nativeGeneration = 21,
+        .rtpTimestamp = 60000,
+        .timingPolicy = InumaPresentationTimingImmediateInvalid,
+        .sourceIdentityValid = YES,
+    };
+    result = [realtimeAdapter submitSampleBuffer:sampleBuffer
+                                         context:firstContext];
+    INUMA_REQUIRE(result.accepted && !result.readyBeforeEnqueue);
+    InumaFakeSampleRendererBackend* realtimeReady =
+        [[InumaFakeSampleRendererBackend alloc] init];
+    [realtimeAdapter reconnectWithBackend:realtimeReady];
+    InumaPresentationFrameContext secondContext = firstContext;
+    secondContext.sourceIdentity = 21;
+    secondContext.renderOrdinal = 21;
+    secondContext.nativeGeneration = 22;
+    secondContext.rtpTimestamp = 63000;
+    result = [realtimeAdapter submitSampleBuffer:sampleBuffer
+                                         context:secondContext];
+    INUMA_REQUIRE(result.accepted && result.readyBeforeEnqueue);
+    NSDictionary* realtimeSnapshot = [realtimeTrace snapshotAtNs:1100];
+    NSArray* realtimeEvents = realtimeSnapshot[@"events"];
+    INUMA_REQUIRE(realtimeEvents.count == 7);
+    INUMA_REQUIRE([realtimeEvents[1][@"event_kind"]
+        isEqualToString:@"enqueue_begin"]);
+    INUMA_REQUIRE(
+        [realtimeEvents[1][@"monotonic_ns"] unsignedLongLongValue] == 1000);
+    INUMA_REQUIRE([realtimeEvents[2][@"event_kind"]
+        isEqualToString:@"readiness_false"]);
+    INUMA_REQUIRE(
+        [realtimeEvents[2][@"monotonic_ns"] unsignedLongLongValue] == 1010);
+    INUMA_REQUIRE([realtimeEvents[3][@"event_kind"]
+        isEqualToString:@"enqueue_end"]);
+    INUMA_REQUIRE(
+        [realtimeEvents[3][@"monotonic_ns"] unsignedLongLongValue] == 1020);
+    INUMA_REQUIRE([realtimeEvents[5][@"event_kind"]
+        isEqualToString:@"readiness_true"]);
+    INUMA_REQUIRE(
+        [realtimeEvents[5][@"duration_ns"] unsignedLongLongValue] == 30);
+    INUMA_REQUIRE(
+        [realtimeEvents[6][@"monotonic_ns"] unsignedLongLongValue] == 1050);
     CFRelease(sampleBuffer);
   }
   return 0;

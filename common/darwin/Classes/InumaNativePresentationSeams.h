@@ -2,18 +2,13 @@
 #import <Foundation/Foundation.h>
 #import <TargetConditionals.h>
 
+#import "InumaNativePresentationTrace.h"
+
 #if TARGET_OS_OSX
 
 NS_ASSUME_NONNULL_BEGIN
 
 typedef uint64_t (^InumaMonotonicClockBlock)(void);
-
-typedef struct {
-  BOOL accepted;
-  BOOL flushedBeforeEnqueue;
-  BOOL readyBeforeEnqueue;
-  BOOL failedAfterEnqueue;
-} InumaRendererSubmissionResult;
 
 @interface InumaMonotonicClock : NSObject
 
@@ -39,21 +34,17 @@ typedef struct {
                  generation:(uint64_t)generation;
 - (BOOL)failed;
 
+@optional
+- (int32_t)rendererStatus;
+- (int32_t)rendererErrorDomainClass;
+- (int64_t)rendererErrorCode;
+
 @end
 
 API_AVAILABLE(macos(14.0))
 @interface InumaAVSampleRendererBackend : NSObject <InumaSampleRendererBackend>
 
 - (instancetype)initWithRenderer:(AVSampleBufferVideoRenderer*)renderer;
-
-@end
-
-@protocol InumaPresentationTraceSink <NSObject>
-
-- (void)recordGeneration:(uint64_t)generation
-             startedAtNs:(uint64_t)startedAtNs
-           completedAtNs:(uint64_t)completedAtNs
-                  result:(InumaRendererSubmissionResult)result;
 
 @end
 
@@ -75,6 +66,8 @@ API_AVAILABLE(macos(14.0))
                        traceSink:(nullable id<InumaPresentationTraceSink>)traceSink;
 - (InumaRendererSubmissionResult)submitSampleBuffer:(CMSampleBufferRef)sampleBuffer
                                          generation:(uint64_t)generation;
+- (InumaRendererSubmissionResult)submitSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                                            context:(InumaPresentationFrameContext)context;
 - (void)stop;
 - (void)reconnectWithBackend:(id<InumaSampleRendererBackend>)backend;
 
