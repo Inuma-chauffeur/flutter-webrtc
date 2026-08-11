@@ -34,7 +34,12 @@ typedef NS_ENUM(uint32_t, InumaPresentationEventKind) {
   InumaPresentationEventPendingCancelledAtShutdown = 23,
   InumaPresentationEventCallbackAfterStopRejected = 24,
   InumaPresentationEventShutdownEnd = 25,
-  InumaPresentationEventKindCount = 26,
+  InumaPresentationEventPacingAccepted = 26,
+  InumaPresentationEventPacingLateRejected = 27,
+  InumaPresentationEventPacingOverflowRejected = 28,
+  InumaPresentationEventPacingSequenceRejected = 29,
+  InumaPresentationEventPacingAddedLatencyRejected = 30,
+  InumaPresentationEventKindCount = 31,
 };
 
 typedef NS_ENUM(int32_t, InumaRendererErrorDomainClass) {
@@ -55,6 +60,11 @@ typedef struct {
   uint64_t nativeGeneration;
   uint64_t rtpTimestamp;
   uint64_t pendingAgeNs;
+  uint64_t presentationReserveNs;
+  uint64_t scheduledPresentationTimeNs;
+  uint64_t presentationResidenceNs;
+  uint64_t presentationLatenessNs;
+  uint64_t presentationQueueDepth;
   InumaPresentationTimingPolicy timingPolicy;
   BOOL sourceIdentityValid;
 } InumaPresentationFrameContext;

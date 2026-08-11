@@ -18,6 +18,11 @@ typedef struct {
   uint64_t native_generation;
   uint64_t rtp_timestamp;
   uint64_t pending_age_ns;
+  uint64_t presentation_reserve_ns;
+  uint64_t scheduled_presentation_time_ns;
+  uint64_t presentation_residence_ns;
+  uint64_t presentation_lateness_ns;
+  uint64_t presentation_queue_depth;
   uint64_t duration_ns;
   uint64_t value;
   int64_t renderer_error_code;
@@ -174,6 +179,15 @@ static NSString* InumaPresentationEventName(uint32_t kind) {
     case InumaPresentationEventCallbackAfterStopRejected:
       return @"callback_after_stop_rejected";
     case InumaPresentationEventShutdownEnd: return @"shutdown_end";
+    case InumaPresentationEventPacingAccepted: return @"pacing_accepted";
+    case InumaPresentationEventPacingLateRejected:
+      return @"pacing_late_rejected";
+    case InumaPresentationEventPacingOverflowRejected:
+      return @"pacing_overflow_rejected";
+    case InumaPresentationEventPacingSequenceRejected:
+      return @"pacing_sequence_rejected";
+    case InumaPresentationEventPacingAddedLatencyRejected:
+      return @"pacing_added_latency_rejected";
     case InumaPresentationEventKindCount: break;
   }
   return @"invalid";
@@ -200,6 +214,11 @@ static InumaPresentationEventRecord InumaPresentationRecord(
   record.native_generation = context.nativeGeneration;
   record.rtp_timestamp = context.rtpTimestamp;
   record.pending_age_ns = context.pendingAgeNs;
+  record.presentation_reserve_ns = context.presentationReserveNs;
+  record.scheduled_presentation_time_ns = context.scheduledPresentationTimeNs;
+  record.presentation_residence_ns = context.presentationResidenceNs;
+  record.presentation_lateness_ns = context.presentationLatenessNs;
+  record.presentation_queue_depth = context.presentationQueueDepth;
   record.duration_ns = durationNs;
   record.value = value;
   record.renderer_error_code = result.rendererErrorCode;
@@ -467,6 +486,12 @@ static InumaPresentationEventRecord InumaPresentationRecord(
       @"native_generation" : @(record.native_generation),
       @"rtp_timestamp" : @(record.rtp_timestamp),
       @"pending_age_ns" : @(record.pending_age_ns),
+      @"presentation_reserve_ns" : @(record.presentation_reserve_ns),
+      @"scheduled_presentation_time_ns" :
+          @(record.scheduled_presentation_time_ns),
+      @"presentation_residence_ns" : @(record.presentation_residence_ns),
+      @"presentation_lateness_ns" : @(record.presentation_lateness_ns),
+      @"presentation_queue_depth" : @(record.presentation_queue_depth),
       @"timing_policy" : InumaPresentationTimingPolicyName(record.timing_policy),
       @"duration_ns" : @(record.duration_ns),
       @"value" : @(record.value),

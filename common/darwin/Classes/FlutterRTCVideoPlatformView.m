@@ -19,6 +19,7 @@ enum {
   kInumaNativePresentationTraceV2Capacity = 65536,
   kInumaDisplayedContextCapacity = 256,
 };
+static const uint64_t kInumaStrictReplayFrameIntervalNs = 33333333;
 static const void* kInumaNativeVideoSurfaceQueueKey =
     &kInumaNativeVideoSurfaceQueueKey;
 static os_unfair_lock gInumaNativeVideoSurfaceLifecycleLock =
@@ -48,6 +49,14 @@ typedef struct {
   uint64_t drain_callbacks_scheduled;
   uint64_t drain_dequeues;
   uint64_t queue_depth_high_water;
+  uint64_t strict_replay_pacing_accepted;
+  uint64_t strict_replay_pacing_late_rejections;
+  uint64_t strict_replay_pacing_overflow_rejections;
+  uint64_t strict_replay_pacing_sequence_rejections;
+  uint64_t strict_replay_pacing_added_latency_rejections;
+  uint64_t strict_replay_dispatch_submissions;
+  uint64_t strict_replay_dispatch_overflow_rejections;
+  uint64_t strict_replay_dispatch_depth_high_water;
   uint64_t shutdown_count;
   uint64_t display_identity_context_registrations;
   uint64_t display_identity_context_registration_failures;
@@ -68,6 +77,37 @@ typedef struct {
 
 static uint64_t InumaNativeSurfaceMonotonicNanoseconds(void) {
   return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+}
+
+static uint64_t InumaNativeSurfaceHostTimeNanoseconds(void) {
+  const CMTime hostTime = CMClockGetTime(CMClockGetHostTimeClock());
+  const CMTime nanoseconds =
+      CMTimeConvertScale(hostTime, 1000000000, kCMTimeRoundingMethod_Default);
+  return CMTIME_IS_NUMERIC(nanoseconds) && nanoseconds.value > 0
+             ? (uint64_t)nanoseconds.value
+             : 0;
+}
+
+static uint64_t InumaStrictReplayReserveNanoseconds(
+    NSDictionary<NSString*, NSString*>* environment) {
+  NSString* raw = environment[
+      @"INUMA_FLUTTER_WEBRTC_MACOS_STRICT_REPLAY_RESERVE_NS"];
+  if (raw.length == 0 ||
+      ![raw isEqualToString:[NSString stringWithFormat:@"%llu",
+                                                       raw.unsignedLongLongValue]]) {
+    return 0;
+  }
+  const uint64_t value = raw.unsignedLongLongValue;
+  switch (value) {
+    case 33333333:
+    case 50000000:
+    case 66666667:
+    case 83333333:
+    case 100000000:
+      return value;
+    default:
+      return 0;
+  }
 }
 
 static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
@@ -105,14 +145,18 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   BOOL _inumaHasObservedPresentationState;
   BOOL _inumaLastObservationResolved;
   BOOL _inumaNativeSurfaceSelected;
+  BOOL _inumaStrictReplayPaced;
+  uint64_t _inumaStrictReplayReserveNs;
   BOOL _inumaSurfaceRegistered;
   BOOL _inumaDrainScheduled;
+  NSUInteger _inumaStrictReplayDispatchPending;
   BOOL _inumaShuttingDown;
   CMSampleBufferRef _inumaPendingSampleBuffer;
   RTCVideoRotation _inumaPendingRotation;
   uint64_t _inumaPendingSetAtNs;
   InumaPresentationFrameContext _inumaPendingContext;
   InumaVideoSampleBuilder* _inumaSampleBuilder;
+  InumaStrictReplayPacer* _inumaStrictReplayPacer;
   InumaSampleRendererAdapter* _inumaRendererAdapter;
   InumaNativePresentationTrace* _inumaPresentationTrace;
   uint64_t _inumaSurfaceSessionSequence;
@@ -142,6 +186,13 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     _inumaNativeSurfaceSelected =
         [environment[@"INUMA_FLUTTER_WEBRTC_MACOS_PIXEL_MODE"]
             isEqualToString:@"native_platform_view"];
+    _inumaStrictReplayPaced =
+        [environment[@"INUMA_FLUTTER_WEBRTC_MACOS_PRESENTATION_POLICY"]
+            isEqualToString:@"strict_replay_paced"];
+    _inumaStrictReplayReserveNs =
+        _inumaStrictReplayPaced
+            ? InumaStrictReplayReserveNanoseconds(environment)
+            : 0;
     _inumaTracePath = _inumaNativeSurfaceSelected
                           ? [environment[@"INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH"] copy]
                           : nil;
@@ -151,6 +202,17 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                                         : 0;
     if (_inumaNativeSurfaceSelected) {
       _inumaSampleBuilder = [[InumaVideoSampleBuilder alloc] init];
+      if (_inumaStrictReplayPaced && _inumaStrictReplayReserveNs > 0) {
+        const NSUInteger capacity =
+            (NSUInteger)(_inumaStrictReplayReserveNs /
+                         kInumaStrictReplayFrameIntervalNs) +
+            1;
+        _inumaStrictReplayPacer = [[InumaStrictReplayPacer alloc]
+            initWithPresentationReserveNs:_inumaStrictReplayReserveNs
+                           frameIntervalNs:kInumaStrictReplayFrameIntervalNs
+                             queueCapacity:capacity
+                             hostTimeClock:nil];
+      }
       os_unfair_lock_lock(&gInumaNativeVideoSurfaceLifecycleLock);
       gInumaNativeVideoSurfaceCreatedCount += 1;
       gInumaNativeVideoSurfaceLiveCount += 1;
@@ -252,7 +314,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   uint64_t frameGeneration = 0;
   uint64_t frameRtpTimestamp = 0;
   InumaPresentationFrameContext frameContext = {0};
-  if (_inumaTrace.enabled) {
+  if (_inumaTrace.enabled || _inumaStrictReplayPaced) {
     const uint64_t renderedAt = InumaNativeSurfaceMonotonicNanoseconds();
     os_unfair_lock_lock(&_inumaTraceLock);
     _inumaFrameGeneration += 1;
@@ -269,14 +331,22 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     os_unfair_lock_unlock(&_inumaTraceLock);
     frameContext.renderOrdinal = frameGeneration - 1;
     frameContext.nativeGeneration = frameGeneration;
+    if (_inumaStrictReplayPaced) {
+      frameContext.sourceIdentity = frameContext.renderOrdinal;
+      frameContext.sourceIdentityValid = YES;
+    }
     frameContext.rtpTimestamp = (uint64_t)(uint32_t)frame.timeStamp;
-    frameContext.timingPolicy = InumaPresentationTimingImmediateInvalid;
+    frameContext.timingPolicy = _inumaStrictReplayPaced
+                                    ? InumaPresentationTimingValidHostPTS
+                                    : InumaPresentationTimingImmediateInvalid;
     frameRtpTimestamp = frameContext.rtpTimestamp;
-    [_inumaPresentationTrace recordEventKind:InumaPresentationEventRenderReceived
-                                        atNs:renderedAt
-                                     context:frameContext
-                                   durationNs:0
-                                         value:0];
+    if (_inumaTrace.enabled) {
+      [_inumaPresentationTrace recordEventKind:InumaPresentationEventRenderReceived
+                                          atNs:renderedAt
+                                       context:frameContext
+                                     durationNs:0
+                                           value:0];
+    }
   }
 #else
   const uint64_t frameGeneration = 0;
@@ -327,11 +397,70 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                                    durationNs:0
                                          value:0];
   }
-  CMSampleBufferRef sampleBuffer = _inumaSampleBuilder == nil
-                                       ? [self sampleBufferFromPixelBuffer:pixelBuffer]
-                                       : [_inumaSampleBuilder
-                                             copyImmediateSampleBufferFromPixelBuffer:
-                                                 pixelBuffer];
+  InumaStrictReplayPacingDecision pacingDecision = {0};
+  if (_inumaStrictReplayPaced && _inumaStrictReplayPacer != nil) {
+    pacingDecision =
+        [_inumaStrictReplayPacer decisionForGeneration:frameGeneration];
+    frameContext.presentationReserveNs = _inumaStrictReplayReserveNs;
+    frameContext.scheduledPresentationTimeNs =
+        pacingDecision.scheduledPresentationTimeNs;
+    frameContext.presentationResidenceNs =
+        pacingDecision.presentationResidenceNs;
+    frameContext.presentationLatenessNs = pacingDecision.latenessNs;
+    frameContext.presentationQueueDepth = pacingDecision.queueDepthAfter;
+  }
+  if (_inumaStrictReplayPaced && !pacingDecision.accepted) {
+    const InumaPresentationEventKind rejection =
+        !pacingDecision.generationSequenceValid
+            ? InumaPresentationEventPacingSequenceRejected
+            : (pacingDecision.addedLatencyExceeded
+                   ? InumaPresentationEventPacingAddedLatencyRejected
+                   : (pacingDecision.overflowed
+                          ? InumaPresentationEventPacingOverflowRejected
+                          : InumaPresentationEventPacingLateRejected));
+    if (_inumaTrace.enabled) {
+      os_unfair_lock_lock(&_inumaTraceLock);
+      _inumaTrace.strict_replay_pacing_sequence_rejections +=
+          rejection == InumaPresentationEventPacingSequenceRejected ? 1 : 0;
+      _inumaTrace.strict_replay_pacing_overflow_rejections +=
+          rejection == InumaPresentationEventPacingOverflowRejected ? 1 : 0;
+      _inumaTrace.strict_replay_pacing_late_rejections +=
+          rejection == InumaPresentationEventPacingLateRejected ? 1 : 0;
+      _inumaTrace.strict_replay_pacing_added_latency_rejections +=
+          rejection == InumaPresentationEventPacingAddedLatencyRejected ? 1 : 0;
+      os_unfair_lock_unlock(&_inumaTraceLock);
+      [_inumaPresentationTrace recordEventKind:rejection
+                                          atNs:sampleBuildStarted
+                                       context:frameContext
+                                     durationNs:pacingDecision.latenessNs
+                                           value:pacingDecision.queueDepthBefore];
+    }
+    CFRelease(pixelBuffer);
+    return;
+  }
+  if (_inumaTrace.enabled && _inumaStrictReplayPaced) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    _inumaTrace.strict_replay_pacing_accepted += 1;
+    os_unfair_lock_unlock(&_inumaTraceLock);
+    [_inumaPresentationTrace recordEventKind:InumaPresentationEventPacingAccepted
+                                        atNs:sampleBuildStarted
+                                     context:frameContext
+                                   durationNs:pacingDecision.presentationResidenceNs
+                                         value:pacingDecision.queueDepthAfter];
+  }
+  CMSampleBufferRef sampleBuffer = nil;
+  if (_inumaSampleBuilder == nil) {
+    sampleBuffer = [self sampleBufferFromPixelBuffer:pixelBuffer];
+  } else if (_inumaStrictReplayPaced) {
+    sampleBuffer = [_inumaSampleBuilder
+        copyTimedSampleBufferFromPixelBuffer:pixelBuffer
+                          presentationTimeNs:
+                              pacingDecision.scheduledPresentationTimeNs
+                               durationNs:kInumaStrictReplayFrameIntervalNs];
+  } else {
+    sampleBuffer = [_inumaSampleBuilder
+        copyImmediateSampleBufferFromPixelBuffer:pixelBuffer];
+  }
 #else
   CMSampleBufferRef sampleBuffer = [self sampleBufferFromPixelBuffer:pixelBuffer];
 #endif
@@ -366,9 +495,15 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                        forSampleBuffer:sampleBuffer];
   }
   if (_inumaNativeSurfaceSelected) {
-    [self inumaSubmitLatestSampleBuffer:sampleBuffer
-                              rotation:rotation
-                          frameContext:frameContext];
+    if (_inumaStrictReplayPaced) {
+      [self inumaSubmitStrictReplaySampleBuffer:sampleBuffer
+                                       rotation:rotation
+                                   frameContext:frameContext];
+    } else {
+      [self inumaSubmitLatestSampleBuffer:sampleBuffer
+                                rotation:rotation
+                            frameContext:frameContext];
+    }
   } else {
 #endif
     dispatch_async(_sampleBufferQueue, ^{
@@ -501,6 +636,121 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
 }
 
 #if TARGET_OS_OSX
+- (void)inumaRenderNativeSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                             rotation:(RTCVideoRotation)rotation
+                         frameContext:
+                             (InumaPresentationFrameContext)frameContext {
+  [self updateVideoLayerTransformForRotation:rotation];
+  const uint64_t enqueueStarted = _inumaTrace.enabled
+                                      ? InumaNativeSurfaceMonotonicNanoseconds()
+                                      : 0;
+  if (_inumaStrictReplayPaced &&
+      frameContext.scheduledPresentationTimeNs > 0) {
+    const uint64_t hostNow = InumaNativeSurfaceHostTimeNanoseconds();
+    if (hostNow == 0 ||
+        hostNow >= frameContext.scheduledPresentationTimeNs) {
+      frameContext.presentationLatenessNs =
+          hostNow > frameContext.scheduledPresentationTimeNs
+              ? hostNow - frameContext.scheduledPresentationTimeNs
+              : 0;
+      if (_inumaTrace.enabled) {
+        os_unfair_lock_lock(&_inumaTraceLock);
+        _inumaTrace.strict_replay_pacing_late_rejections += 1;
+        os_unfair_lock_unlock(&_inumaTraceLock);
+        [_inumaPresentationTrace
+            recordEventKind:InumaPresentationEventPacingLateRejected
+                        atNs:enqueueStarted
+                     context:frameContext
+                   durationNs:frameContext.presentationLatenessNs
+                         value:frameContext.presentationQueueDepth];
+      }
+      return;
+    }
+  }
+  if (_inumaTrace.enabled) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    _inumaTrace.enqueue_attempts += 1;
+    os_unfair_lock_unlock(&_inumaTraceLock);
+  }
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+  if (@available(macOS 14.0, *)) {
+    if (_inumaRendererAdapter != nil) {
+      InumaRendererSubmissionResult result =
+          [_inumaRendererAdapter submitSampleBuffer:sampleBuffer
+                                            context:frameContext];
+      if (_inumaTrace.enabled) {
+        os_unfair_lock_lock(&_inumaTraceLock);
+        _inumaTrace.renderer_flushes += result.flushedBeforeEnqueue ? 1 : 0;
+        _inumaTrace.renderer_not_ready_observations +=
+            result.readyBeforeEnqueue ? 0 : 1;
+        _inumaTrace.modern_renderer_enqueues += result.accepted ? 1 : 0;
+        _inumaTrace.renderer_failures += result.failedAfterEnqueue ? 1 : 0;
+        os_unfair_lock_unlock(&_inumaTraceLock);
+        if (result.accepted) {
+          [self inumaRecordEnqueueCompletionForGeneration:
+                    frameContext.nativeGeneration
+                                                 startedAt:enqueueStarted];
+        }
+      }
+      return;
+    }
+  }
+#endif
+  [_videoLayer enqueueSampleBuffer:sampleBuffer];
+  if (_inumaTrace.enabled) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    _inumaTrace.legacy_layer_enqueues += 1;
+    if (_videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+      _inumaTrace.renderer_failures += 1;
+    }
+    os_unfair_lock_unlock(&_inumaTraceLock);
+    [self inumaRecordEnqueueCompletionForGeneration:frameContext.nativeGeneration
+                                         startedAt:enqueueStarted];
+  }
+}
+
+- (void)inumaSubmitStrictReplaySampleBuffer:(CMSampleBufferRef)sampleBuffer
+                                   rotation:(RTCVideoRotation)rotation
+                               frameContext:
+                                   (InumaPresentationFrameContext)frameContext {
+  BOOL rejected = NO;
+  os_unfair_lock_lock(&_inumaTraceLock);
+  const NSUInteger capacity = _inumaStrictReplayPacer.queueCapacity;
+  if (_inumaShuttingDown || capacity == 0 ||
+      _inumaStrictReplayDispatchPending >= capacity) {
+    _inumaTrace.strict_replay_dispatch_overflow_rejections += 1;
+    rejected = YES;
+  } else {
+    _inumaStrictReplayDispatchPending += 1;
+    _inumaTrace.strict_replay_dispatch_submissions += 1;
+    _inumaTrace.strict_replay_dispatch_depth_high_water =
+        MAX(_inumaTrace.strict_replay_dispatch_depth_high_water,
+            _inumaStrictReplayDispatchPending);
+  }
+  os_unfair_lock_unlock(&_inumaTraceLock);
+  if (rejected) {
+    if (_inumaTrace.enabled) {
+      [_inumaPresentationTrace
+          recordEventKind:InumaPresentationEventPacingOverflowRejected
+                      atNs:InumaNativeSurfaceMonotonicNanoseconds()
+                   context:frameContext
+                 durationNs:0
+                       value:capacity];
+    }
+    CFRelease(sampleBuffer);
+    return;
+  }
+  dispatch_async(_sampleBufferQueue, ^{
+    [self inumaRenderNativeSampleBuffer:sampleBuffer
+                               rotation:rotation
+                           frameContext:frameContext];
+    os_unfair_lock_lock(&self->_inumaTraceLock);
+    self->_inumaStrictReplayDispatchPending -= 1;
+    os_unfair_lock_unlock(&self->_inumaTraceLock);
+    CFRelease(sampleBuffer);
+  });
+}
+
 - (void)inumaSubmitLatestSampleBuffer:(CMSampleBufferRef)sampleBuffer
                             rotation:(RTCVideoRotation)rotation
                         frameContext:(InumaPresentationFrameContext)frameContext {
@@ -621,11 +871,9 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                    durationNs:pendingContext.pendingAgeNs
                          value:0];
       }
-      [self renderSampleBuffer:pendingSampleBuffer
-                      rotation:pendingRotation
-               frameGeneration:pendingContext.nativeGeneration
-                   rtpTimestamp:pendingContext.rtpTimestamp
-                    pendingAgeNs:pendingContext.pendingAgeNs];
+      [self inumaRenderNativeSampleBuffer:pendingSampleBuffer
+                                rotation:pendingRotation
+                            frameContext:pendingContext];
       CFRelease(pendingSampleBuffer);
     }
   });
@@ -761,6 +1009,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   memcpy(snapshot, &_inumaTrace, sizeof(InumaNativeVideoSurfaceTrace));
   const BOOL pendingSamplePresent = _inumaPendingSampleBuffer != nil;
   const BOOL drainScheduled = _inumaDrainScheduled;
+  const NSUInteger strictReplayDispatchPending =
+      _inumaStrictReplayDispatchPending;
   const BOOL shuttingDown = _inumaShuttingDown;
   _inumaTraceSnapshotCount += 1;
   const uint64_t snapshotCount = _inumaTraceSnapshotCount;
@@ -795,7 +1045,38 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"status" : @"pass",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
-        @"one_appkit_view_one_avsamplebufferdisplaylayer_immediate_display",
+        (_inumaStrictReplayPaced
+             ? @"one_appkit_view_one_avsamplebufferdisplaylayer_strict_replay_paced_valid_host_pts"
+             : @"one_appkit_view_one_avsamplebufferdisplaylayer_immediate_display"),
+    @"presentation_policy" :
+        (_inumaStrictReplayPaced ? @"strict_replay_paced"
+                                 : @"legacy_immediate_unpaced"),
+    @"presentation_timing_policy" :
+        (_inumaStrictReplayPaced ? @"valid_host_pts"
+                                 : @"immediate_invalid"),
+    @"presentation_clock_contract" :
+        (_inumaStrictReplayPaced
+             ? @"display_layer_nil_control_timebase_uses_mach_host_clock"
+             : @"display_immediately_ignores_pts"),
+    @"strict_replay_configured_reserve_ns" :
+        @(_inumaStrictReplayReserveNs),
+    @"strict_replay_frame_interval_ns" :
+        @(_inumaStrictReplayPaced ? kInumaStrictReplayFrameIntervalNs : 0),
+    @"strict_replay_queue_capacity" :
+        @(_inumaStrictReplayPacer.queueCapacity),
+    @"strict_replay_pacer_accepted_count" :
+        @(_inumaStrictReplayPacer.acceptedCount),
+    @"strict_replay_pacer_late_count" : @(_inumaStrictReplayPacer.lateCount),
+    @"strict_replay_pacer_overflow_count" :
+        @(_inumaStrictReplayPacer.overflowCount),
+    @"strict_replay_pacer_generation_sequence_failure_count" :
+        @(_inumaStrictReplayPacer.generationSequenceFailureCount),
+    @"strict_replay_maximum_added_latency_ns" :
+        @(_inumaStrictReplayPacer.maximumAddedLatencyNs),
+    @"strict_replay_pacer_added_latency_violation_count" :
+        @(_inumaStrictReplayPacer.addedLatencyViolationCount),
+    @"strict_replay_pacer_queue_depth_high_water" :
+        @(_inumaStrictReplayPacer.queueDepthHighWater),
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
@@ -832,6 +1113,23 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"drain_callbacks_scheduled" : @(snapshot->drain_callbacks_scheduled),
     @"drain_dequeues" : @(snapshot->drain_dequeues),
     @"queue_depth_high_water" : @(snapshot->queue_depth_high_water),
+    @"strict_replay_pacing_accepted" :
+        @(snapshot->strict_replay_pacing_accepted),
+    @"strict_replay_pacing_late_rejections" :
+        @(snapshot->strict_replay_pacing_late_rejections),
+    @"strict_replay_pacing_overflow_rejections" :
+        @(snapshot->strict_replay_pacing_overflow_rejections),
+    @"strict_replay_pacing_sequence_rejections" :
+        @(snapshot->strict_replay_pacing_sequence_rejections),
+    @"strict_replay_pacing_added_latency_rejections" :
+        @(snapshot->strict_replay_pacing_added_latency_rejections),
+    @"strict_replay_dispatch_submissions" :
+        @(snapshot->strict_replay_dispatch_submissions),
+    @"strict_replay_dispatch_overflow_rejections" :
+        @(snapshot->strict_replay_dispatch_overflow_rejections),
+    @"strict_replay_dispatch_depth_high_water" :
+        @(snapshot->strict_replay_dispatch_depth_high_water),
+    @"strict_replay_dispatch_pending" : @(strictReplayDispatchPending),
     @"shutdown_count" : @(snapshot->shutdown_count),
     @"display_identity_context_registrations" :
         @(snapshot->display_identity_context_registrations),
@@ -949,6 +1247,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       CFRelease(pendingSampleBuffer);
     }
     [self->_inumaRendererAdapter stop];
+    [self->_inumaStrictReplayPacer stop];
     if (self->_inumaTrace.enabled) {
       const uint64_t stoppedAt = InumaNativeSurfaceMonotonicNanoseconds();
       [self->_inumaPresentationTrace closeOpenIntervalsAtNs:stoppedAt
