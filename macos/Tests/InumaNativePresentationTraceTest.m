@@ -28,6 +28,13 @@ static uint64_t InumaEventCount(NSDictionary* snapshot, NSString* name) {
   return [snapshot[@"event_counts"][name] unsignedLongLongValue];
 }
 
+static CVPixelBufferRef InumaTestPixelBuffer(void) {
+  CVPixelBufferRef pixelBuffer = nil;
+  const CVReturn result = CVPixelBufferCreate(
+      kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixelBuffer);
+  return result == kCVReturnSuccess ? pixelBuffer : nil;
+}
+
 int main(void) {
   @autoreleasepool {
     InumaNativePresentationTrace* trace = [[InumaNativePresentationTrace alloc]
@@ -139,6 +146,59 @@ int main(void) {
     INUMA_REQUIRE(
         [snapshot[@"last_retained_event_sequence"] unsignedLongLongValue] == 6);
     INUMA_REQUIRE([snapshot[@"capacity_exhaustions"] unsignedLongLongValue] == 0);
+
+    InumaDisplayedFrameIdentityLedger* identity =
+        [[InumaDisplayedFrameIdentityLedger alloc] initWithCapacity:2];
+    INUMA_REQUIRE(identity != nil && identity.capacity == 2);
+    CVPixelBufferRef reused = InumaTestPixelBuffer();
+    CVPixelBufferRef propagated = InumaTestPixelBuffer();
+    CVPixelBufferRef untagged = InumaTestPixelBuffer();
+    INUMA_REQUIRE(reused != nil && propagated != nil && untagged != nil);
+    InumaPresentationFrameContext observed = {0};
+    INUMA_REQUIRE([identity registerContext:first forPixelBuffer:reused]);
+    INUMA_REQUIRE(
+        [identity lookupContextForDisplayedPixelBuffer:reused context:&observed] ==
+        InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(observed.nativeGeneration == 1);
+
+    // Reusing the exact same CVPixelBuffer must replace the scalar attachment;
+    // an address-keyed lookup would incorrectly allow the stale generation.
+    INUMA_REQUIRE([identity registerContext:second forPixelBuffer:reused]);
+    observed = (InumaPresentationFrameContext){0};
+    INUMA_REQUIRE(
+        [identity lookupContextForDisplayedPixelBuffer:reused context:&observed] ==
+        InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(observed.nativeGeneration == 2);
+
+    CVBufferPropagateAttachments(reused, propagated);
+    observed = (InumaPresentationFrameContext){0};
+    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:propagated
+                                                     context:&observed] ==
+                  InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(observed.nativeGeneration == 2);
+    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:untagged
+                                                     context:&observed] ==
+                  InumaDisplayedFrameIdentityLookupAttachmentMissing);
+
+    InumaDisplayedFrameIdentityLedger* bounded =
+        [[InumaDisplayedFrameIdentityLedger alloc] initWithCapacity:1];
+    CVPixelBufferRef evicted = InumaTestPixelBuffer();
+    CVPixelBufferRef current = InumaTestPixelBuffer();
+    INUMA_REQUIRE(evicted != nil && current != nil);
+    INUMA_REQUIRE([bounded registerContext:first forPixelBuffer:evicted]);
+    INUMA_REQUIRE([bounded registerContext:second forPixelBuffer:current]);
+    observed = (InumaPresentationFrameContext){0};
+    INUMA_REQUIRE([bounded lookupContextForDisplayedPixelBuffer:evicted
+                                                    context:&observed] ==
+                  InumaDisplayedFrameIdentityLookupContextMissing);
+    InumaPresentationFrameContext invalid = first;
+    invalid.nativeGeneration = 0;
+    INUMA_REQUIRE(![bounded registerContext:invalid forPixelBuffer:current]);
+    CVPixelBufferRelease(reused);
+    CVPixelBufferRelease(propagated);
+    CVPixelBufferRelease(untagged);
+    CVPixelBufferRelease(evicted);
+    CVPixelBufferRelease(current);
   }
   return 0;
 }

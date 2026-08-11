@@ -2,6 +2,7 @@
 
 #import <Foundation/Foundation.h>
 #import <TargetConditionals.h>
+#import <CoreVideo/CoreVideo.h>
 
 #if TARGET_OS_OSX
 
@@ -68,6 +69,30 @@ typedef struct {
   int32_t rendererErrorDomainClass;
   int64_t rendererErrorCode;
 } InumaRendererSubmissionResult;
+
+typedef NS_ENUM(uint32_t, InumaDisplayedFrameIdentityLookupResult) {
+  InumaDisplayedFrameIdentityLookupFound = 0,
+  InumaDisplayedFrameIdentityLookupAttachmentMissing = 1,
+  InumaDisplayedFrameIdentityLookupContextMissing = 2,
+  InumaDisplayedFrameIdentityLookupInvalid = 3,
+};
+
+// Binds a scalar generation to the live CVPixelBuffer and resolves only an
+// exact generation-keyed context. It never stores or compares buffer pointers.
+@interface InumaDisplayedFrameIdentityLedger : NSObject
+
+@property(nonatomic, readonly) NSUInteger capacity;
+
+- (nullable instancetype)initWithCapacity:(NSUInteger)capacity;
+
+- (BOOL)registerContext:(InumaPresentationFrameContext)context
+         forPixelBuffer:(CVPixelBufferRef)pixelBuffer;
+
+- (InumaDisplayedFrameIdentityLookupResult)
+    lookupContextForDisplayedPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                                  context:(InumaPresentationFrameContext*)context;
+
+@end
 
 @protocol InumaPresentationTraceSink <NSObject>
 

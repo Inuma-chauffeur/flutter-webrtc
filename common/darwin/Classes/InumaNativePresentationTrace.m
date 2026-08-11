@@ -4,6 +4,7 @@
 
 #include <os/lock.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,115 @@ typedef struct {
   bool flushed_before_enqueue;
   bool failed_after_enqueue;
 } InumaPresentationEventRecord;
+
+typedef struct {
+  uint64_t native_generation;
+  InumaPresentationFrameContext context;
+} InumaDisplayedFrameIdentityEntry;
+
+static CFStringRef const kInumaDisplayedFrameGenerationAttachment =
+    CFSTR("com.inuma.flutter-webrtc.native-presentation-generation");
+
+static BOOL InumaCopyDisplayedFrameGeneration(CVPixelBufferRef pixelBuffer,
+                                              uint64_t* generation) {
+  if (pixelBuffer == nil || generation == NULL) return NO;
+  CFTypeRef raw = CVBufferCopyAttachment(
+      pixelBuffer, kInumaDisplayedFrameGenerationAttachment, NULL);
+  if (raw == NULL) return NO;
+  int64_t signedGeneration = 0;
+  const BOOL valid = CFGetTypeID(raw) == CFNumberGetTypeID() &&
+                     CFNumberGetValue((CFNumberRef)raw, kCFNumberSInt64Type,
+                                      &signedGeneration) &&
+                     signedGeneration > 0;
+  CFRelease(raw);
+  if (!valid) return NO;
+  *generation = (uint64_t)signedGeneration;
+  return YES;
+}
+
+@implementation InumaDisplayedFrameIdentityLedger {
+  os_unfair_lock _lock;
+  InumaDisplayedFrameIdentityEntry* _entries;
+  NSUInteger _count;
+  NSUInteger _nextIndex;
+}
+
+- (instancetype)initWithCapacity:(NSUInteger)capacity {
+  if (capacity == 0) return nil;
+  self = [super init];
+  if (self) {
+    _entries = calloc(capacity, sizeof(*_entries));
+    if (_entries == NULL) return nil;
+    _lock = OS_UNFAIR_LOCK_INIT;
+    _capacity = capacity;
+  }
+  return self;
+}
+
+- (void)dealloc {
+  free(_entries);
+}
+
+- (BOOL)registerContext:(InumaPresentationFrameContext)context
+         forPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+  if (pixelBuffer == nil || context.nativeGeneration == 0 ||
+      context.nativeGeneration > INT64_MAX ||
+      context.renderOrdinal != context.nativeGeneration - 1 ||
+      context.timingPolicy == InumaPresentationTimingUnknown) {
+    return NO;
+  }
+  int64_t signedGeneration = (int64_t)context.nativeGeneration;
+  CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
+                                     &signedGeneration);
+  if (number == NULL) return NO;
+  CVBufferSetAttachment(pixelBuffer, kInumaDisplayedFrameGenerationAttachment,
+                        number, kCVAttachmentMode_ShouldPropagate);
+  CFRelease(number);
+  uint64_t verifiedGeneration = 0;
+  if (!InumaCopyDisplayedFrameGeneration(pixelBuffer, &verifiedGeneration) ||
+      verifiedGeneration != context.nativeGeneration) {
+    return NO;
+  }
+  os_unfair_lock_lock(&_lock);
+  _entries[_nextIndex] = (InumaDisplayedFrameIdentityEntry){
+      .native_generation = context.nativeGeneration,
+      .context = context,
+  };
+  _nextIndex = (_nextIndex + 1) % _capacity;
+  _count = MIN(_count + 1, _capacity);
+  os_unfair_lock_unlock(&_lock);
+  return YES;
+}
+
+- (InumaDisplayedFrameIdentityLookupResult)
+    lookupContextForDisplayedPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                                  context:(InumaPresentationFrameContext*)context {
+  if (pixelBuffer == nil || context == NULL) {
+    return InumaDisplayedFrameIdentityLookupInvalid;
+  }
+  uint64_t generation = 0;
+  if (!InumaCopyDisplayedFrameGeneration(pixelBuffer, &generation)) {
+    return InumaDisplayedFrameIdentityLookupAttachmentMissing;
+  }
+  BOOL found = NO;
+  InumaPresentationFrameContext matched = {0};
+  os_unfair_lock_lock(&_lock);
+  for (NSUInteger distance = 0; distance < _count; distance++) {
+    const NSUInteger index =
+        (_nextIndex + _capacity - 1 - distance) % _capacity;
+    if (_entries[index].native_generation == generation) {
+      matched = _entries[index].context;
+      found = YES;
+      break;
+    }
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (!found) return InumaDisplayedFrameIdentityLookupContextMissing;
+  *context = matched;
+  return InumaDisplayedFrameIdentityLookupFound;
+}
+
+@end
 
 static NSString* InumaPresentationEventName(uint32_t kind) {
   switch ((InumaPresentationEventKind)kind) {

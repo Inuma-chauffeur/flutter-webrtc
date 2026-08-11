@@ -49,6 +49,13 @@ typedef struct {
   uint64_t drain_dequeues;
   uint64_t queue_depth_high_water;
   uint64_t shutdown_count;
+  uint64_t display_identity_context_registrations;
+  uint64_t display_identity_context_registration_failures;
+  uint64_t display_identity_attachment_reads;
+  uint64_t display_identity_attachment_misses;
+  uint64_t display_identity_context_misses;
+  uint64_t display_identity_invalid_lookups;
+  uint64_t display_identity_pointer_comparisons;
   uint64_t capacity_exhaustions;
   NSUInteger render_event_count;
   NSUInteger enqueue_event_count;
@@ -58,13 +65,6 @@ typedef struct {
   uint64_t enqueue_frame_generation[kInumaNativeVideoSurfaceTraceCapacity];
   uint64_t enqueue_call_duration_ns[kInumaNativeVideoSurfaceTraceCapacity];
 } InumaNativeVideoSurfaceTrace;
-
-// The lookup ring is process-local only. Pointer values are compared but are
-// never dereferenced after submission and are never serialized into evidence.
-typedef struct {
-  CVPixelBufferRef pixel_buffer_identity;
-  InumaPresentationFrameContext context;
-} InumaDisplayedContextEntry;
 
 static uint64_t InumaNativeSurfaceMonotonicNanoseconds(void) {
   return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -99,13 +99,11 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   dispatch_queue_t _inumaTraceWriterQueue;
   dispatch_source_t _inumaPresentationObserverTimer;
   dispatch_queue_t _inumaPresentationObserverQueue;
-  InumaDisplayedContextEntry
-      _inumaDisplayedContexts[kInumaDisplayedContextCapacity];
-  NSUInteger _inumaDisplayedContextCount;
-  NSUInteger _inumaDisplayedContextNextIndex;
-  CVPixelBufferRef _inumaLastObservedPixelBufferIdentity;
+  InumaDisplayedFrameIdentityLedger* _inumaDisplayedIdentityLedger;
   uint64_t _inumaLastObservedNativeGeneration;
   BOOL _inumaHasLastObservedNativeGeneration;
+  BOOL _inumaHasObservedPresentationState;
+  BOOL _inumaLastObservationResolved;
   BOOL _inumaNativeSurfaceSelected;
   BOOL _inumaSurfaceRegistered;
   BOOL _inumaDrainScheduled;
@@ -167,6 +165,9 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
             initWithCapacity:kInumaNativePresentationTraceV2Capacity
              sessionSequence:_inumaSurfaceSessionSequence
                  startedAtNs:_inumaTraceStartedMonotonicNs];
+        _inumaDisplayedIdentityLedger =
+            [[InumaDisplayedFrameIdentityLedger alloc]
+                initWithCapacity:kInumaDisplayedContextCapacity];
       }
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
       if (@available(macOS 14.0, *)) {
@@ -177,7 +178,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
             initWithBackend:backend
                        clock:[InumaMonotonicClock systemClock]
                    traceSink:_inumaPresentationTrace];
-        if (_inumaPresentationTrace != nil) {
+        if (_inumaPresentationTrace != nil &&
+            _inumaDisplayedIdentityLedger != nil) {
           [self inumaStartNativePresentationObserver];
         }
       }
@@ -650,16 +652,13 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                        forSampleBuffer:(CMSampleBufferRef)sampleBuffer {
   CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
   if (imageBuffer == nil) return;
+  const BOOL registered = [_inumaDisplayedIdentityLedger
+      registerContext:context
+       forPixelBuffer:(CVPixelBufferRef)imageBuffer];
   os_unfair_lock_lock(&_inumaTraceLock);
-  _inumaDisplayedContexts[_inumaDisplayedContextNextIndex] =
-      (InumaDisplayedContextEntry){
-          .pixel_buffer_identity = (CVPixelBufferRef)imageBuffer,
-          .context = context,
-      };
-  _inumaDisplayedContextNextIndex =
-      (_inumaDisplayedContextNextIndex + 1) % kInumaDisplayedContextCapacity;
-  _inumaDisplayedContextCount =
-      MIN(_inumaDisplayedContextCount + 1, kInumaDisplayedContextCapacity);
+  _inumaTrace.display_identity_context_registrations += registered ? 1 : 0;
+  _inumaTrace.display_identity_context_registration_failures +=
+      registered ? 0 : 1;
   os_unfair_lock_unlock(&_inumaTraceLock);
 }
 
@@ -690,31 +689,35 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       [_videoLayer.sampleBufferRenderer copyDisplayedPixelBuffer];
   if (displayed == nil) return;
   InumaPresentationFrameContext context = {0};
-  BOOL lookupFound = NO;
+  const InumaDisplayedFrameIdentityLookupResult lookup =
+      [_inumaDisplayedIdentityLedger
+          lookupContextForDisplayedPixelBuffer:displayed
+                                        context:&context];
+  const BOOL lookupFound = lookup == InumaDisplayedFrameIdentityLookupFound;
   BOOL newObservation = NO;
   os_unfair_lock_lock(&_inumaTraceLock);
-  for (NSUInteger distance = 0; distance < _inumaDisplayedContextCount;
-       distance++) {
-    const NSUInteger index =
-        (_inumaDisplayedContextNextIndex + kInumaDisplayedContextCapacity - 1 -
-         distance) %
-        kInumaDisplayedContextCapacity;
-    if (_inumaDisplayedContexts[index].pixel_buffer_identity == displayed) {
-      context = _inumaDisplayedContexts[index].context;
-      lookupFound = YES;
-      break;
-    }
-  }
+  _inumaTrace.display_identity_attachment_reads += 1;
+  _inumaTrace.display_identity_attachment_misses +=
+      lookup == InumaDisplayedFrameIdentityLookupAttachmentMissing ? 1 : 0;
+  _inumaTrace.display_identity_context_misses +=
+      lookup == InumaDisplayedFrameIdentityLookupContextMissing ? 1 : 0;
+  _inumaTrace.display_identity_invalid_lookups +=
+      lookup == InumaDisplayedFrameIdentityLookupInvalid ? 1 : 0;
   if (lookupFound) {
-    newObservation = !_inumaHasLastObservedNativeGeneration ||
+    newObservation = !_inumaHasObservedPresentationState ||
+                     !_inumaLastObservationResolved ||
+                     !_inumaHasLastObservedNativeGeneration ||
                      context.nativeGeneration !=
                          _inumaLastObservedNativeGeneration;
+    _inumaHasObservedPresentationState = YES;
+    _inumaLastObservationResolved = YES;
     _inumaHasLastObservedNativeGeneration = YES;
     _inumaLastObservedNativeGeneration = context.nativeGeneration;
-    _inumaLastObservedPixelBufferIdentity = nil;
-  } else if (displayed != _inumaLastObservedPixelBufferIdentity) {
-    _inumaLastObservedPixelBufferIdentity = displayed;
-    newObservation = YES;
+  } else {
+    newObservation = !_inumaHasObservedPresentationState ||
+                     _inumaLastObservationResolved;
+    _inumaHasObservedPresentationState = YES;
+    _inumaLastObservationResolved = NO;
   }
   os_unfair_lock_unlock(&_inumaTraceLock);
   if (newObservation) {
@@ -788,7 +791,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v1",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v2",
     @"status" : @"pass",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -798,6 +801,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"frame_identity_contract" :
         @"renderer_local_monotonic_generation_not_media_timestamp",
+    @"display_identity_binding_contract" :
+        @"propagated_cvbuffer_generation_attachment_with_exact_generation_keyed_context_no_pointer_identity",
     @"sample_capacity" : @(kInumaNativeVideoSurfaceTraceCapacity),
     @"sample_capacity_exhaustions" : @(snapshot->capacity_exhaustions),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
@@ -828,6 +833,20 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"drain_dequeues" : @(snapshot->drain_dequeues),
     @"queue_depth_high_water" : @(snapshot->queue_depth_high_water),
     @"shutdown_count" : @(snapshot->shutdown_count),
+    @"display_identity_context_registrations" :
+        @(snapshot->display_identity_context_registrations),
+    @"display_identity_context_registration_failures" :
+        @(snapshot->display_identity_context_registration_failures),
+    @"display_identity_attachment_reads" :
+        @(snapshot->display_identity_attachment_reads),
+    @"display_identity_attachment_misses" :
+        @(snapshot->display_identity_attachment_misses),
+    @"display_identity_context_misses" :
+        @(snapshot->display_identity_context_misses),
+    @"display_identity_invalid_lookups" :
+        @(snapshot->display_identity_invalid_lookups),
+    @"display_identity_pointer_comparisons" :
+        @(snapshot->display_identity_pointer_comparisons),
     @"surface_created_count" : @(surfaceCreatedCount),
     @"surface_live_count" : @(surfaceLiveCount),
     @"surface_maximum_live_count" : @(surfaceMaximumLiveCount),
