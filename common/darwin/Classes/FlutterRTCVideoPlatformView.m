@@ -1041,7 +1041,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v2",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v3",
     @"status" : @"pass",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
