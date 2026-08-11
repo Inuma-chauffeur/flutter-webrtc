@@ -2,6 +2,8 @@
 
 #import <Foundation/Foundation.h>
 
+#include <string.h>
+
 #import "../../common/darwin/Classes/InumaNativePresentationTrace.h"
 
 #define INUMA_REQUIRE(condition)                                                \
@@ -28,7 +30,110 @@ static uint64_t InumaEventCount(NSDictionary* snapshot, NSString* name) {
   return [snapshot[@"event_counts"][name] unsignedLongLongValue];
 }
 
-static CVPixelBufferRef InumaTestPixelBuffer(void) {
+static uint16_t InumaTestProductChecksum(const uint8_t* bytes) {
+  uint16_t checksum = 0xFFFF;
+  for (NSUInteger index = 0; index < 14; index++) {
+    checksum ^= (uint16_t)bytes[index] << 8;
+    for (NSUInteger bit = 0; bit < 8; bit++) {
+      checksum = (checksum & 0x8000) != 0
+                     ? (uint16_t)((checksum << 1) ^ 0x1021)
+                     : (uint16_t)(checksum << 1);
+    }
+  }
+  return checksum;
+}
+
+static void InumaTestWriteUint32(uint8_t* bytes, NSUInteger offset,
+                                 uint32_t value) {
+  bytes[offset] = (uint8_t)(value >> 24);
+  bytes[offset + 1] = (uint8_t)(value >> 16);
+  bytes[offset + 2] = (uint8_t)(value >> 8);
+  bytes[offset + 3] = (uint8_t)value;
+}
+
+static BOOL InumaTestWriteProductWatermark(CVPixelBufferRef pixelBuffer,
+                                           uint32_t identity,
+                                           BOOL corruptChecksum) {
+  if (pixelBuffer == nil) return NO;
+  const OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  const BOOL bgra = format == kCVPixelFormatType_32BGRA;
+  const BOOL nv12 = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+  if (!bgra && !nv12) return NO;
+  if (CVPixelBufferLockBaseAddress(pixelBuffer, 0) != kCVReturnSuccess) return NO;
+  uint8_t* base = nv12 ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+                       : CVPixelBufferGetBaseAddress(pixelBuffer);
+  const size_t stride =
+      nv12 ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetBytesPerRow(pixelBuffer);
+  const size_t width =
+      nv12 ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetWidth(pixelBuffer);
+  const size_t height =
+      nv12 ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetHeight(pixelBuffer);
+  for (size_t y = 0; y < height; y++) {
+    uint8_t* row = base + y * stride;
+    if (bgra) {
+      for (size_t x = 0; x < width; x++) {
+        row[x * 4] = 80;
+        row[x * 4 + 1] = 80;
+        row[x * 4 + 2] = 80;
+        row[x * 4 + 3] = 255;
+      }
+    } else {
+      memset(row, 80, width);
+    }
+  }
+  uint8_t bytes[16] = {0xDD, 0xAB};
+  InumaTestWriteUint32(bytes, 2, identity);
+  InumaTestWriteUint32(bytes, 6, 1000000 + identity * 33333);
+  InumaTestWriteUint32(bytes, 10, 1010000 + identity * 33333);
+  const uint16_t checksum = InumaTestProductChecksum(bytes);
+  bytes[14] = (uint8_t)(checksum >> 8);
+  bytes[15] = (uint8_t)checksum;
+  if (corruptChecksum) bytes[15] ^= 1;
+  for (NSUInteger bit = 0; bit < 128; bit++) {
+    const uint8_t value =
+        (bytes[bit / 8] & (uint8_t)(0x80 >> (bit % 8))) != 0 ? 235 : 16;
+    const NSUInteger column = bit % 16;
+    const NSUInteger markerRow = bit / 16;
+    for (NSUInteger y = 96 + markerRow * 12;
+         y < 96 + (markerRow + 1) * 12; y++) {
+      uint8_t* row = base + y * stride;
+      for (NSUInteger x = 128 + column * 6;
+           x < 128 + (column + 1) * 6; x++) {
+        if (bgra) {
+          row[x * 4] = value;
+          row[x * 4 + 1] = value;
+          row[x * 4 + 2] = value;
+          row[x * 4 + 3] = 255;
+        } else {
+          row[x] = value;
+        }
+      }
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+  return YES;
+}
+
+static CVPixelBufferRef InumaTestProductPixelBuffer(OSType format,
+                                                     uint32_t identity,
+                                                     BOOL corruptChecksum) {
+  CVPixelBufferRef pixelBuffer = nil;
+  NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+  const CVReturn result = CVPixelBufferCreate(
+      kCFAllocatorDefault, 320, 240, format,
+      (__bridge CFDictionaryRef)attributes, &pixelBuffer);
+  if (result != kCVReturnSuccess || pixelBuffer == nil ||
+      !InumaTestWriteProductWatermark(pixelBuffer, identity, corruptChecksum)) {
+    if (pixelBuffer != nil) CVPixelBufferRelease(pixelBuffer);
+    return nil;
+  }
+  return pixelBuffer;
+}
+
+static CVPixelBufferRef InumaTestSmallPixelBuffer(void) {
   CVPixelBufferRef pixelBuffer = nil;
   const CVReturn result = CVPixelBufferCreate(
       kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixelBuffer);
@@ -181,53 +286,74 @@ int main(void) {
     InumaDisplayedFrameIdentityLedger* identity =
         [[InumaDisplayedFrameIdentityLedger alloc] initWithCapacity:2];
     INUMA_REQUIRE(identity != nil && identity.capacity == 2);
-    CVPixelBufferRef reused = InumaTestPixelBuffer();
-    CVPixelBufferRef propagated = InumaTestPixelBuffer();
-    CVPixelBufferRef untagged = InumaTestPixelBuffer();
-    INUMA_REQUIRE(reused != nil && propagated != nil && untagged != nil);
+    CVPixelBufferRef reused = InumaTestProductPixelBuffer(
+        kCVPixelFormatType_32BGRA, (uint32_t)first.sourceIdentity, NO);
+    CVPixelBufferRef nv12 = InumaTestProductPixelBuffer(
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        (uint32_t)second.sourceIdentity, NO);
+    CVPixelBufferRef corrupt = InumaTestProductPixelBuffer(
+        kCVPixelFormatType_32BGRA, (uint32_t)first.sourceIdentity, YES);
+    CVPixelBufferRef tooSmall = InumaTestSmallPixelBuffer();
+    INUMA_REQUIRE(reused != nil && nv12 != nil && corrupt != nil &&
+                  tooSmall != nil);
+    InumaProductWatermarkIdentity decoded = {0};
+    INUMA_REQUIRE(InumaDecodeProductWatermark(reused, &decoded) ==
+                  InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(decoded.frameIdentity == first.sourceIdentity);
+    INUMA_REQUIRE(InumaDecodeProductWatermark(nv12, &decoded) ==
+                  InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(decoded.frameIdentity == second.sourceIdentity);
+    INUMA_REQUIRE(InumaDecodeProductWatermark(corrupt, &decoded) ==
+                  InumaDisplayedFrameIdentityLookupChecksumMismatch);
+    INUMA_REQUIRE(InumaDecodeProductWatermark(tooSmall, &decoded) ==
+                  InumaDisplayedFrameIdentityLookupGeometryInvalid);
     InumaPresentationFrameContext observed = {0};
-    INUMA_REQUIRE([identity registerContext:first forPixelBuffer:reused]);
+    INUMA_REQUIRE([identity registerContext:first]);
     INUMA_REQUIRE(
         [identity lookupContextForDisplayedPixelBuffer:reused context:&observed] ==
         InumaDisplayedFrameIdentityLookupFound);
     INUMA_REQUIRE(observed.nativeGeneration == 1);
 
-    // Reusing the exact same CVPixelBuffer must replace the scalar attachment;
-    // an address-keyed lookup would incorrectly allow the stale generation.
-    INUMA_REQUIRE([identity registerContext:second forPixelBuffer:reused]);
+    // Reusing the exact same CVPixelBuffer with a different watermark must
+    // resolve by decoded scalar identity, never by pointer identity.
+    INUMA_REQUIRE([identity registerContext:second]);
+    INUMA_REQUIRE(InumaTestWriteProductWatermark(
+        reused, (uint32_t)second.sourceIdentity, NO));
     observed = (InumaPresentationFrameContext){0};
     INUMA_REQUIRE(
         [identity lookupContextForDisplayedPixelBuffer:reused context:&observed] ==
         InumaDisplayedFrameIdentityLookupFound);
     INUMA_REQUIRE(observed.nativeGeneration == 2);
 
-    CVBufferPropagateAttachments(reused, propagated);
     observed = (InumaPresentationFrameContext){0};
-    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:propagated
+    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:nv12
                                                      context:&observed] ==
                   InumaDisplayedFrameIdentityLookupFound);
     INUMA_REQUIRE(observed.nativeGeneration == 2);
-    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:untagged
+    INUMA_REQUIRE([identity lookupContextForDisplayedPixelBuffer:corrupt
                                                      context:&observed] ==
-                  InumaDisplayedFrameIdentityLookupAttachmentMissing);
+                  InumaDisplayedFrameIdentityLookupChecksumMismatch);
 
     InumaDisplayedFrameIdentityLedger* bounded =
         [[InumaDisplayedFrameIdentityLedger alloc] initWithCapacity:1];
-    CVPixelBufferRef evicted = InumaTestPixelBuffer();
-    CVPixelBufferRef current = InumaTestPixelBuffer();
+    CVPixelBufferRef evicted = InumaTestProductPixelBuffer(
+        kCVPixelFormatType_32BGRA, (uint32_t)first.sourceIdentity, NO);
+    CVPixelBufferRef current = InumaTestProductPixelBuffer(
+        kCVPixelFormatType_32BGRA, (uint32_t)second.sourceIdentity, NO);
     INUMA_REQUIRE(evicted != nil && current != nil);
-    INUMA_REQUIRE([bounded registerContext:first forPixelBuffer:evicted]);
-    INUMA_REQUIRE([bounded registerContext:second forPixelBuffer:current]);
+    INUMA_REQUIRE([bounded registerContext:first]);
+    INUMA_REQUIRE([bounded registerContext:second]);
     observed = (InumaPresentationFrameContext){0};
     INUMA_REQUIRE([bounded lookupContextForDisplayedPixelBuffer:evicted
                                                     context:&observed] ==
                   InumaDisplayedFrameIdentityLookupContextMissing);
     InumaPresentationFrameContext invalid = first;
-    invalid.nativeGeneration = 0;
-    INUMA_REQUIRE(![bounded registerContext:invalid forPixelBuffer:current]);
+    invalid.sourceIdentityValid = NO;
+    INUMA_REQUIRE(![bounded registerContext:invalid]);
     CVPixelBufferRelease(reused);
-    CVPixelBufferRelease(propagated);
-    CVPixelBufferRelease(untagged);
+    CVPixelBufferRelease(nv12);
+    CVPixelBufferRelease(corrupt);
+    CVPixelBufferRelease(tooSmall);
     CVPixelBufferRelease(evicted);
     CVPixelBufferRelease(current);
   }

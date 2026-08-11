@@ -63,8 +63,18 @@ typedef struct {
   uint64_t shutdown_count;
   uint64_t display_identity_context_registrations;
   uint64_t display_identity_context_registration_failures;
-  uint64_t display_identity_attachment_reads;
-  uint64_t display_identity_attachment_misses;
+  uint64_t display_identity_watermark_reads;
+  uint64_t display_identity_watermark_decode_successes;
+  uint64_t display_identity_watermark_decode_total_duration_ns;
+  uint64_t display_identity_watermark_decode_maximum_duration_ns;
+  uint64_t display_identity_watermark_decode_durations_over_250us;
+  uint64_t display_identity_watermark_decode_durations_over_1ms;
+  uint64_t display_identity_unsupported_pixel_format_failures;
+  uint64_t display_identity_pixel_buffer_lock_failures;
+  uint64_t display_identity_geometry_failures;
+  uint64_t display_identity_contrast_failures;
+  uint64_t display_identity_sync_failures;
+  uint64_t display_identity_checksum_failures;
   uint64_t display_identity_context_misses;
   uint64_t display_identity_invalid_lookups;
   uint64_t display_identity_pointer_comparisons;
@@ -533,8 +543,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                                      context:frameContext
                                    durationNs:sampleBuiltAt - sampleBuildStarted
                                          value:0];
-    [self inumaRegisterDisplayedContext:frameContext
-                       forSampleBuffer:sampleBuffer];
+    [self inumaRegisterDisplayedContext:frameContext];
   }
   if (_inumaNativeSurfaceSelected) {
     if (_inumaStrictReplayPaced) {
@@ -938,13 +947,9 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   os_unfair_lock_unlock(&_inumaTraceLock);
 }
 
-- (void)inumaRegisterDisplayedContext:(InumaPresentationFrameContext)context
-                       forSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-  CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-  if (imageBuffer == nil) return;
-  const BOOL registered = [_inumaDisplayedIdentityLedger
-      registerContext:context
-       forPixelBuffer:(CVPixelBufferRef)imageBuffer];
+- (void)inumaRegisterDisplayedContext:(InumaPresentationFrameContext)context {
+  const BOOL registered =
+      [_inumaDisplayedIdentityLedger registerContext:context];
   os_unfair_lock_lock(&_inumaTraceLock);
   _inumaTrace.display_identity_context_registrations += registered ? 1 : 0;
   _inumaTrace.display_identity_context_registration_failures +=
@@ -979,16 +984,43 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       [_videoLayer.sampleBufferRenderer copyDisplayedPixelBuffer];
   if (displayed == nil) return;
   InumaPresentationFrameContext context = {0};
+  const uint64_t lookupStartedAt = InumaNativeSurfaceMonotonicNanoseconds();
   const InumaDisplayedFrameIdentityLookupResult lookup =
       [_inumaDisplayedIdentityLedger
           lookupContextForDisplayedPixelBuffer:displayed
                                         context:&context];
+  const uint64_t lookupDurationNs =
+      InumaNativeSurfaceMonotonicNanoseconds() - lookupStartedAt;
   const BOOL lookupFound = lookup == InumaDisplayedFrameIdentityLookupFound;
   BOOL newObservation = NO;
   os_unfair_lock_lock(&_inumaTraceLock);
-  _inumaTrace.display_identity_attachment_reads += 1;
-  _inumaTrace.display_identity_attachment_misses +=
-      lookup == InumaDisplayedFrameIdentityLookupAttachmentMissing ? 1 : 0;
+  _inumaTrace.display_identity_watermark_reads += 1;
+  _inumaTrace.display_identity_watermark_decode_successes +=
+      lookup == InumaDisplayedFrameIdentityLookupFound ||
+              lookup == InumaDisplayedFrameIdentityLookupContextMissing
+          ? 1
+          : 0;
+  _inumaTrace.display_identity_watermark_decode_total_duration_ns +=
+      lookupDurationNs;
+  _inumaTrace.display_identity_watermark_decode_maximum_duration_ns =
+      MAX(_inumaTrace.display_identity_watermark_decode_maximum_duration_ns,
+          lookupDurationNs);
+  _inumaTrace.display_identity_watermark_decode_durations_over_250us +=
+      lookupDurationNs > 250000 ? 1 : 0;
+  _inumaTrace.display_identity_watermark_decode_durations_over_1ms +=
+      lookupDurationNs > 1000000 ? 1 : 0;
+  _inumaTrace.display_identity_unsupported_pixel_format_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupUnsupportedPixelFormat ? 1 : 0;
+  _inumaTrace.display_identity_pixel_buffer_lock_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupPixelBufferLockFailed ? 1 : 0;
+  _inumaTrace.display_identity_geometry_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupGeometryInvalid ? 1 : 0;
+  _inumaTrace.display_identity_contrast_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupInsufficientContrast ? 1 : 0;
+  _inumaTrace.display_identity_sync_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupSyncMismatch ? 1 : 0;
+  _inumaTrace.display_identity_checksum_failures +=
+      lookup == InumaDisplayedFrameIdentityLookupChecksumMismatch ? 1 : 0;
   _inumaTrace.display_identity_context_misses +=
       lookup == InumaDisplayedFrameIdentityLookupContextMissing ? 1 : 0;
   _inumaTrace.display_identity_invalid_lookups +=
@@ -1083,10 +1115,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" :
-        (_inumaStrictReplayPaced
-             ? @"inuma.flutter_webrtc.macos_native_video_surface_trace.v4"
-             : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v3"),
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v5",
     @"status" : @"pass",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1146,9 +1175,9 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"frame_identity_contract" :
-        @"renderer_local_monotonic_generation_not_media_timestamp",
+        @"crc16_product_watermark_frame_identity_joined_to_renderer_local_context",
     @"display_identity_binding_contract" :
-        @"propagated_cvbuffer_generation_attachment_with_exact_generation_keyed_context_no_pointer_identity",
+        @"crc16_product_watermark_decoded_from_renderer_displayed_pixel_buffer_with_source_identity_keyed_context_no_pointer_identity_no_pixel_retention",
     @"sample_capacity" : @(kInumaNativeVideoSurfaceTraceCapacity),
     @"sample_capacity_exhaustions" : @(snapshot->capacity_exhaustions),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
@@ -1206,10 +1235,30 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->display_identity_context_registrations),
     @"display_identity_context_registration_failures" :
         @(snapshot->display_identity_context_registration_failures),
-    @"display_identity_attachment_reads" :
-        @(snapshot->display_identity_attachment_reads),
-    @"display_identity_attachment_misses" :
-        @(snapshot->display_identity_attachment_misses),
+    @"display_identity_watermark_reads" :
+        @(snapshot->display_identity_watermark_reads),
+    @"display_identity_watermark_decode_successes" :
+        @(snapshot->display_identity_watermark_decode_successes),
+    @"display_identity_watermark_decode_total_duration_ns" :
+        @(snapshot->display_identity_watermark_decode_total_duration_ns),
+    @"display_identity_watermark_decode_maximum_duration_ns" :
+        @(snapshot->display_identity_watermark_decode_maximum_duration_ns),
+    @"display_identity_watermark_decode_durations_over_250us" :
+        @(snapshot->display_identity_watermark_decode_durations_over_250us),
+    @"display_identity_watermark_decode_durations_over_1ms" :
+        @(snapshot->display_identity_watermark_decode_durations_over_1ms),
+    @"display_identity_unsupported_pixel_format_failures" :
+        @(snapshot->display_identity_unsupported_pixel_format_failures),
+    @"display_identity_pixel_buffer_lock_failures" :
+        @(snapshot->display_identity_pixel_buffer_lock_failures),
+    @"display_identity_geometry_failures" :
+        @(snapshot->display_identity_geometry_failures),
+    @"display_identity_contrast_failures" :
+        @(snapshot->display_identity_contrast_failures),
+    @"display_identity_sync_failures" :
+        @(snapshot->display_identity_sync_failures),
+    @"display_identity_checksum_failures" :
+        @(snapshot->display_identity_checksum_failures),
     @"display_identity_context_misses" :
         @(snapshot->display_identity_context_misses),
     @"display_identity_invalid_lookups" :

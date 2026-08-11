@@ -39,28 +39,134 @@ typedef struct {
 } InumaPresentationEventRecord;
 
 typedef struct {
-  uint64_t native_generation;
+  uint64_t source_identity;
   InumaPresentationFrameContext context;
 } InumaDisplayedFrameIdentityEntry;
 
-static CFStringRef const kInumaDisplayedFrameGenerationAttachment =
-    CFSTR("com.inuma.flutter-webrtc.native-presentation-generation");
+enum {
+  kInumaProductWatermarkOriginX = 128,
+  kInumaProductWatermarkOriginY = 96,
+  kInumaProductWatermarkColumns = 16,
+  kInumaProductWatermarkRows = 8,
+  kInumaProductWatermarkCellWidth = 6,
+  kInumaProductWatermarkCellHeight = 12,
+  kInumaProductWatermarkBits = 128,
+};
 
-static BOOL InumaCopyDisplayedFrameGeneration(CVPixelBufferRef pixelBuffer,
-                                              uint64_t* generation) {
-  if (pixelBuffer == nil || generation == NULL) return NO;
-  CFTypeRef raw = CVBufferCopyAttachment(
-      pixelBuffer, kInumaDisplayedFrameGenerationAttachment, NULL);
-  if (raw == NULL) return NO;
-  int64_t signedGeneration = 0;
-  const BOOL valid = CFGetTypeID(raw) == CFNumberGetTypeID() &&
-                     CFNumberGetValue((CFNumberRef)raw, kCFNumberSInt64Type,
-                                      &signedGeneration) &&
-                     signedGeneration > 0;
-  CFRelease(raw);
-  if (!valid) return NO;
-  *generation = (uint64_t)signedGeneration;
-  return YES;
+static const uint16_t kInumaProductWatermarkSync = 0xDDAB;
+
+static uint16_t InumaProductWatermarkChecksum(const uint8_t* bytes) {
+  uint16_t checksum = 0xFFFF;
+  for (NSUInteger index = 0; index < 14; index++) {
+    checksum ^= (uint16_t)bytes[index] << 8;
+    for (NSUInteger bit = 0; bit < 8; bit++) {
+      checksum = (checksum & 0x8000) != 0
+                     ? (uint16_t)((checksum << 1) ^ 0x1021)
+                     : (uint16_t)(checksum << 1);
+    }
+  }
+  return checksum;
+}
+
+static uint32_t InumaProductWatermarkUint32(const uint8_t* bytes,
+                                            NSUInteger offset) {
+  return ((uint32_t)bytes[offset] << 24) |
+         ((uint32_t)bytes[offset + 1] << 16) |
+         ((uint32_t)bytes[offset + 2] << 8) |
+         (uint32_t)bytes[offset + 3];
+}
+
+InumaDisplayedFrameIdentityLookupResult InumaDecodeProductWatermark(
+    CVPixelBufferRef pixelBuffer, InumaProductWatermarkIdentity* identity) {
+  if (pixelBuffer == nil || identity == NULL) {
+    return InumaDisplayedFrameIdentityLookupInvalid;
+  }
+  const OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  const BOOL bgra = format == kCVPixelFormatType_32BGRA;
+  const BOOL nv12 = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                    format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+  if (!bgra && !nv12) {
+    return InumaDisplayedFrameIdentityLookupUnsupportedPixelFormat;
+  }
+  const CVPixelBufferLockFlags flags = kCVPixelBufferLock_ReadOnly;
+  if (CVPixelBufferLockBaseAddress(pixelBuffer, flags) != kCVReturnSuccess) {
+    return InumaDisplayedFrameIdentityLookupPixelBufferLockFailed;
+  }
+  const size_t width =
+      nv12 ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetWidth(pixelBuffer);
+  const size_t height =
+      nv12 ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetHeight(pixelBuffer);
+  const uint8_t* base =
+      nv12 ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetBaseAddress(pixelBuffer);
+  const size_t stride =
+      nv12 ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+           : CVPixelBufferGetBytesPerRow(pixelBuffer);
+  const size_t requiredWidth =
+      kInumaProductWatermarkOriginX +
+      kInumaProductWatermarkColumns * kInumaProductWatermarkCellWidth;
+  const size_t requiredHeight =
+      kInumaProductWatermarkOriginY +
+      kInumaProductWatermarkRows * kInumaProductWatermarkCellHeight;
+  const BOOL geometryValid = base != NULL && width >= requiredWidth &&
+                             height >= requiredHeight &&
+                             stride >= width * (bgra ? 4 : 1);
+  if (!geometryValid) {
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, flags);
+    return InumaDisplayedFrameIdentityLookupGeometryInvalid;
+  }
+  uint8_t cells[kInumaProductWatermarkBits] = {0};
+  uint8_t low = UINT8_MAX;
+  uint8_t high = 0;
+  for (NSUInteger bit = 0; bit < kInumaProductWatermarkBits; bit++) {
+    const size_t column = bit % kInumaProductWatermarkColumns;
+    const size_t row = bit / kInumaProductWatermarkColumns;
+    const size_t x = kInumaProductWatermarkOriginX +
+                     column * kInumaProductWatermarkCellWidth +
+                     kInumaProductWatermarkCellWidth / 2;
+    const size_t y = kInumaProductWatermarkOriginY +
+                     row * kInumaProductWatermarkCellHeight +
+                     kInumaProductWatermarkCellHeight / 2;
+    uint8_t value = base[y * stride + x];
+    if (bgra) {
+      const uint8_t* pixel = base + y * stride + x * 4;
+      value = (uint8_t)(((uint32_t)pixel[2] * 54 +
+                         (uint32_t)pixel[1] * 183 +
+                         (uint32_t)pixel[0] * 19) >>
+                        8);
+    }
+    cells[bit] = value;
+    low = MIN(low, value);
+    high = MAX(high, value);
+  }
+  CVPixelBufferUnlockBaseAddress(pixelBuffer, flags);
+  if ((uint16_t)high - (uint16_t)low < 48) {
+    return InumaDisplayedFrameIdentityLookupInsufficientContrast;
+  }
+  const uint16_t threshold = ((uint16_t)low + (uint16_t)high) / 2;
+  uint8_t bytes[16] = {0};
+  for (NSUInteger bit = 0; bit < kInumaProductWatermarkBits; bit++) {
+    if ((uint16_t)cells[bit] >= threshold) {
+      bytes[bit / 8] |= (uint8_t)(0x80 >> (bit % 8));
+    }
+  }
+  const uint16_t sync = (uint16_t)((uint16_t)bytes[0] << 8) | bytes[1];
+  if (sync != kInumaProductWatermarkSync) {
+    return InumaDisplayedFrameIdentityLookupSyncMismatch;
+  }
+  const uint16_t checksum =
+      (uint16_t)((uint16_t)bytes[14] << 8) | bytes[15];
+  if (checksum != InumaProductWatermarkChecksum(bytes)) {
+    return InumaDisplayedFrameIdentityLookupChecksumMismatch;
+  }
+  *identity = (InumaProductWatermarkIdentity){
+      .frameIdentity = InumaProductWatermarkUint32(bytes, 2),
+      .sourceSofUsLow = InumaProductWatermarkUint32(bytes, 6),
+      .sourceEofUsLow = InumaProductWatermarkUint32(bytes, 10),
+  };
+  return InumaDisplayedFrameIdentityLookupFound;
 }
 
 @implementation InumaDisplayedFrameIdentityLedger {
@@ -86,29 +192,16 @@ static BOOL InumaCopyDisplayedFrameGeneration(CVPixelBufferRef pixelBuffer,
   free(_entries);
 }
 
-- (BOOL)registerContext:(InumaPresentationFrameContext)context
-         forPixelBuffer:(CVPixelBufferRef)pixelBuffer {
-  if (pixelBuffer == nil || context.nativeGeneration == 0 ||
-      context.nativeGeneration > INT64_MAX ||
+- (BOOL)registerContext:(InumaPresentationFrameContext)context {
+  if (!context.sourceIdentityValid || context.sourceIdentity > UINT32_MAX ||
+      context.nativeGeneration == 0 ||
       context.renderOrdinal != context.nativeGeneration - 1 ||
       context.timingPolicy == InumaPresentationTimingUnknown) {
     return NO;
   }
-  int64_t signedGeneration = (int64_t)context.nativeGeneration;
-  CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
-                                     &signedGeneration);
-  if (number == NULL) return NO;
-  CVBufferSetAttachment(pixelBuffer, kInumaDisplayedFrameGenerationAttachment,
-                        number, kCVAttachmentMode_ShouldPropagate);
-  CFRelease(number);
-  uint64_t verifiedGeneration = 0;
-  if (!InumaCopyDisplayedFrameGeneration(pixelBuffer, &verifiedGeneration) ||
-      verifiedGeneration != context.nativeGeneration) {
-    return NO;
-  }
   os_unfair_lock_lock(&_lock);
   _entries[_nextIndex] = (InumaDisplayedFrameIdentityEntry){
-      .native_generation = context.nativeGeneration,
+      .source_identity = context.sourceIdentity,
       .context = context,
   };
   _nextIndex = (_nextIndex + 1) % _capacity;
@@ -123,17 +216,17 @@ static BOOL InumaCopyDisplayedFrameGeneration(CVPixelBufferRef pixelBuffer,
   if (pixelBuffer == nil || context == NULL) {
     return InumaDisplayedFrameIdentityLookupInvalid;
   }
-  uint64_t generation = 0;
-  if (!InumaCopyDisplayedFrameGeneration(pixelBuffer, &generation)) {
-    return InumaDisplayedFrameIdentityLookupAttachmentMissing;
-  }
+  InumaProductWatermarkIdentity identity = {0};
+  const InumaDisplayedFrameIdentityLookupResult decoded =
+      InumaDecodeProductWatermark(pixelBuffer, &identity);
+  if (decoded != InumaDisplayedFrameIdentityLookupFound) return decoded;
   BOOL found = NO;
   InumaPresentationFrameContext matched = {0};
   os_unfair_lock_lock(&_lock);
   for (NSUInteger distance = 0; distance < _count; distance++) {
     const NSUInteger index =
         (_nextIndex + _capacity - 1 - distance) % _capacity;
-    if (_entries[index].native_generation == generation) {
+    if (_entries[index].source_identity == identity.frameIdentity) {
       matched = _entries[index].context;
       found = YES;
       break;

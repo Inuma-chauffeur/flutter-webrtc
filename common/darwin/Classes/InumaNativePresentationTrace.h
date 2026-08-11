@@ -85,21 +85,39 @@ typedef struct {
 
 typedef NS_ENUM(uint32_t, InumaDisplayedFrameIdentityLookupResult) {
   InumaDisplayedFrameIdentityLookupFound = 0,
-  InumaDisplayedFrameIdentityLookupAttachmentMissing = 1,
-  InumaDisplayedFrameIdentityLookupContextMissing = 2,
-  InumaDisplayedFrameIdentityLookupInvalid = 3,
+  InumaDisplayedFrameIdentityLookupUnsupportedPixelFormat = 1,
+  InumaDisplayedFrameIdentityLookupPixelBufferLockFailed = 2,
+  InumaDisplayedFrameIdentityLookupGeometryInvalid = 3,
+  InumaDisplayedFrameIdentityLookupInsufficientContrast = 4,
+  InumaDisplayedFrameIdentityLookupSyncMismatch = 5,
+  InumaDisplayedFrameIdentityLookupChecksumMismatch = 6,
+  InumaDisplayedFrameIdentityLookupContextMissing = 7,
+  InumaDisplayedFrameIdentityLookupInvalid = 8,
 };
 
-// Binds a scalar generation to the live CVPixelBuffer and resolves only an
-// exact generation-keyed context. It never stores or compares buffer pointers.
+typedef struct {
+  uint32_t frameIdentity;
+  uint32_t sourceSofUsLow;
+  uint32_t sourceEofUsLow;
+} InumaProductWatermarkIdentity;
+
+// Decodes the existing CRC-checked product watermark directly from a read-only
+// BGRA or NV12 displayed pixel buffer. No pixel, pointer, or attachment escapes
+// this call.
+FOUNDATION_EXPORT InumaDisplayedFrameIdentityLookupResult
+InumaDecodeProductWatermark(CVPixelBufferRef pixelBuffer,
+                            InumaProductWatermarkIdentity* identity);
+
+// Binds a scalar source identity to its live frame context and resolves only a
+// CRC-checked watermark identity decoded from the renderer-displayed buffer.
+// It never stores or compares buffer pointers or retains pixel payloads.
 @interface InumaDisplayedFrameIdentityLedger : NSObject
 
 @property(nonatomic, readonly) NSUInteger capacity;
 
 - (nullable instancetype)initWithCapacity:(NSUInteger)capacity;
 
-- (BOOL)registerContext:(InumaPresentationFrameContext)context
-         forPixelBuffer:(CVPixelBufferRef)pixelBuffer;
+- (BOOL)registerContext:(InumaPresentationFrameContext)context;
 
 - (InumaDisplayedFrameIdentityLookupResult)
     lookupContextForDisplayedPixelBuffer:(CVPixelBufferRef)pixelBuffer
