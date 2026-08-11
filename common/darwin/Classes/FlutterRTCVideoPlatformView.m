@@ -54,6 +54,9 @@ typedef struct {
   uint64_t strict_replay_pacing_overflow_rejections;
   uint64_t strict_replay_pacing_sequence_rejections;
   uint64_t strict_replay_pacing_added_latency_rejections;
+  uint64_t strict_replay_pacing_prearm_discards;
+  uint64_t strict_replay_pacing_late_phase_corrections;
+  uint64_t strict_replay_pacing_early_phase_corrections;
   uint64_t strict_replay_dispatch_submissions;
   uint64_t strict_replay_dispatch_overflow_rejections;
   uint64_t strict_replay_dispatch_depth_high_water;
@@ -104,6 +107,7 @@ static uint64_t InumaStrictReplayReserveNanoseconds(
     case 50000000:
     case 66666667:
     case 83333333:
+    case 95000000:
     case 100000000:
       return value;
     default:
@@ -205,9 +209,11 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       _inumaSampleBuilder = [[InumaVideoSampleBuilder alloc] init];
       if (_inumaStrictReplayPaced && _inumaStrictReplayReserveNs > 0) {
         const NSUInteger capacity =
-            (NSUInteger)(_inumaStrictReplayReserveNs /
-                         kInumaStrictReplayFrameIntervalNs) +
-            1;
+            _inumaStrictReplayReserveNs == 95000000
+                ? 4
+                : (NSUInteger)(_inumaStrictReplayReserveNs /
+                               kInumaStrictReplayFrameIntervalNs) +
+                      1;
         _inumaStrictReplayPacer = [[InumaStrictReplayPacer alloc]
             initWithPresentationReserveNs:_inumaStrictReplayReserveNs
                            frameIntervalNs:kInumaStrictReplayFrameIntervalNs
@@ -411,6 +417,21 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     frameContext.presentationQueueDepth = pacingDecision.queueDepthAfter;
   }
   if (_inumaStrictReplayPaced && !pacingDecision.accepted) {
+    if (pacingDecision.prearmDiscarded) {
+      if (_inumaTrace.enabled) {
+        os_unfair_lock_lock(&_inumaTraceLock);
+        _inumaTrace.strict_replay_pacing_prearm_discards += 1;
+        os_unfair_lock_unlock(&_inumaTraceLock);
+        [_inumaPresentationTrace
+            recordEventKind:InumaPresentationEventPacingPrearmDiscarded
+                        atNs:sampleBuildStarted
+                     context:frameContext
+                   durationNs:0
+                         value:_inumaStrictReplayPacer.prearmDiscardCount];
+      }
+      CFRelease(pixelBuffer);
+      return;
+    }
     const InumaPresentationEventKind rejection =
         !pacingDecision.generationSequenceValid
             ? InumaPresentationEventPacingSequenceRejected
@@ -442,7 +463,27 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   if (_inumaTrace.enabled && _inumaStrictReplayPaced) {
     os_unfair_lock_lock(&_inumaTraceLock);
     _inumaTrace.strict_replay_pacing_accepted += 1;
+    _inumaTrace.strict_replay_pacing_late_phase_corrections +=
+        pacingDecision.latePhaseCorrected ? 1 : 0;
+    _inumaTrace.strict_replay_pacing_early_phase_corrections +=
+        pacingDecision.earlyPhaseCorrected ? 1 : 0;
     os_unfair_lock_unlock(&_inumaTraceLock);
+    if (pacingDecision.latePhaseCorrected) {
+      [_inumaPresentationTrace
+          recordEventKind:InumaPresentationEventPacingLatePhaseCorrected
+                      atNs:sampleBuildStarted
+                   context:frameContext
+                 durationNs:pacingDecision.presentationResidenceNs
+                       value:pacingDecision.queueDepthAfter];
+    }
+    if (pacingDecision.earlyPhaseCorrected) {
+      [_inumaPresentationTrace
+          recordEventKind:InumaPresentationEventPacingEarlyPhaseCorrected
+                      atNs:sampleBuildStarted
+                   context:frameContext
+                 durationNs:pacingDecision.presentationResidenceNs
+                       value:pacingDecision.queueDepthAfter];
+    }
     [_inumaPresentationTrace recordEventKind:InumaPresentationEventPacingAccepted
                                         atNs:sampleBuildStarted
                                      context:frameContext
@@ -1042,7 +1083,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v3",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v4",
     @"status" : @"pass",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1067,6 +1108,14 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(_inumaStrictReplayPacer.queueCapacity),
     @"strict_replay_pacer_accepted_count" :
         @(_inumaStrictReplayPacer.acceptedCount),
+    @"strict_replay_pacer_prearm_discard_count" :
+        @(_inumaStrictReplayPacer.prearmDiscardCount),
+    @"strict_replay_pacer_late_phase_correction_count" :
+        @(_inumaStrictReplayPacer.latePhaseCorrectionCount),
+    @"strict_replay_pacer_early_phase_correction_count" :
+        @(_inumaStrictReplayPacer.earlyPhaseCorrectionCount),
+    @"strict_replay_pacer_armed_generation" :
+        @(_inumaStrictReplayPacer.armedGeneration),
     @"strict_replay_pacer_late_count" : @(_inumaStrictReplayPacer.lateCount),
     @"strict_replay_pacer_overflow_count" :
         @(_inumaStrictReplayPacer.overflowCount),
@@ -1074,6 +1123,18 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(_inumaStrictReplayPacer.generationSequenceFailureCount),
     @"strict_replay_maximum_added_latency_ns" :
         @(_inumaStrictReplayPacer.maximumAddedLatencyNs),
+    @"strict_replay_minimum_presentation_interval_ns" :
+        @(_inumaStrictReplayPacer.minimumPresentationIntervalNs),
+    @"strict_replay_maximum_presentation_interval_ns" :
+        @(_inumaStrictReplayPacer.maximumPresentationIntervalNs),
+    @"strict_replay_minimum_presentation_lead_ns" :
+        @(_inumaStrictReplayPacer.minimumPresentationLeadNs),
+    @"strict_replay_stable_cadence_interval_minimum_ns" :
+        @(_inumaStrictReplayPacer.stableCadenceIntervalMinimumNs),
+    @"strict_replay_stable_cadence_interval_maximum_ns" :
+        @(_inumaStrictReplayPacer.stableCadenceIntervalMaximumNs),
+    @"strict_replay_required_stable_cadence_intervals" :
+        @(_inumaStrictReplayPacer.requiredStableCadenceIntervals),
     @"strict_replay_pacer_added_latency_violation_count" :
         @(_inumaStrictReplayPacer.addedLatencyViolationCount),
     @"strict_replay_pacer_queue_depth_high_water" :
@@ -1124,6 +1185,12 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->strict_replay_pacing_sequence_rejections),
     @"strict_replay_pacing_added_latency_rejections" :
         @(snapshot->strict_replay_pacing_added_latency_rejections),
+    @"strict_replay_pacing_prearm_discards" :
+        @(snapshot->strict_replay_pacing_prearm_discards),
+    @"strict_replay_pacing_late_phase_corrections" :
+        @(snapshot->strict_replay_pacing_late_phase_corrections),
+    @"strict_replay_pacing_early_phase_corrections" :
+        @(snapshot->strict_replay_pacing_early_phase_corrections),
     @"strict_replay_dispatch_submissions" :
         @(snapshot->strict_replay_dispatch_submissions),
     @"strict_replay_dispatch_overflow_rejections" :

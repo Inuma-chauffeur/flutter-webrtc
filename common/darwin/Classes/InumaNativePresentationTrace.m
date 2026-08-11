@@ -188,6 +188,12 @@ static NSString* InumaPresentationEventName(uint32_t kind) {
       return @"pacing_sequence_rejected";
     case InumaPresentationEventPacingAddedLatencyRejected:
       return @"pacing_added_latency_rejected";
+    case InumaPresentationEventPacingPrearmDiscarded:
+      return @"pacing_prearm_discarded";
+    case InumaPresentationEventPacingLatePhaseCorrected:
+      return @"pacing_late_phase_corrected";
+    case InumaPresentationEventPacingEarlyPhaseCorrected:
+      return @"pacing_early_phase_corrected";
     case InumaPresentationEventKindCount: break;
   }
   return @"invalid";

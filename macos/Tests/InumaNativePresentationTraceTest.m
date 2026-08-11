@@ -107,6 +107,37 @@ int main(void) {
     INUMA_REQUIRE([snapshot[@"hot_path_filesystem_writes"] unsignedLongLongValue]
                   == 0);
 
+    InumaNativePresentationTrace* armedPhase =
+        [[InumaNativePresentationTrace alloc] initWithCapacity:8
+                                               sessionSequence:10
+                                                   startedAtNs:1500];
+    [armedPhase recordEventKind:InumaPresentationEventPacingPrearmDiscarded
+                           atNs:1510
+                        context:first
+                      durationNs:0
+                            value:1];
+    [armedPhase recordEventKind:InumaPresentationEventPacingLatePhaseCorrected
+                           atNs:1520
+                        context:second
+                      durationNs:95000000
+                            value:2];
+    [armedPhase recordEventKind:InumaPresentationEventPacingEarlyPhaseCorrected
+                           atNs:1530
+                        context:second
+                      durationNs:90000000
+                            value:2];
+    snapshot = [armedPhase snapshotAtNs:1540];
+    INUMA_REQUIRE(InumaEventCount(snapshot, @"pacing_prearm_discarded") == 1);
+    INUMA_REQUIRE(InumaEventCount(snapshot, @"pacing_late_phase_corrected") == 1);
+    INUMA_REQUIRE(InumaEventCount(snapshot, @"pacing_early_phase_corrected") == 1);
+    events = snapshot[@"events"];
+    INUMA_REQUIRE([events[1][@"event_kind"]
+        isEqualToString:@"pacing_prearm_discarded"]);
+    INUMA_REQUIRE([events[2][@"event_kind"]
+        isEqualToString:@"pacing_late_phase_corrected"]);
+    INUMA_REQUIRE([events[3][@"event_kind"]
+        isEqualToString:@"pacing_early_phase_corrected"]);
+
     InumaNativePresentationTrace* shutdown =
         [[InumaNativePresentationTrace alloc] initWithCapacity:16
                                                sessionSequence:8

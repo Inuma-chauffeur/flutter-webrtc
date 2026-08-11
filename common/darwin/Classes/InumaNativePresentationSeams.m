@@ -104,6 +104,17 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
              : 0;
 }
 
+static const uint64_t kInumaStrictReplayMinimumPresentationIntervalNs =
+    25000000;
+static const uint64_t kInumaStrictReplayMaximumPresentationIntervalNs =
+    49999999;
+static const uint64_t kInumaStrictReplayMinimumPresentationLeadNs = 8333333;
+static const uint64_t kInumaStrictReplayStableCadenceIntervalMinimumNs =
+    25000000;
+static const uint64_t kInumaStrictReplayStableCadenceIntervalMaximumNs =
+    42000000;
+static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
+
 @implementation InumaStrictReplayPacer {
   os_unfair_lock _lock;
   InumaHostTimeClockBlock _hostTimeClock;
@@ -112,10 +123,15 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
   NSUInteger _queueCount;
   BOOL _timelineStarted;
   BOOL _stopped;
-  uint64_t _firstGeneration;
-  uint64_t _lastAcceptedGeneration;
-  uint64_t _anchorPresentationTimeNs;
+  uint64_t _lastObservedGeneration;
+  uint64_t _lastArrivalNs;
+  uint64_t _lastScheduledPresentationTimeNs;
+  NSUInteger _stableCadenceIntervalCount;
+  uint64_t _armedGeneration;
   uint64_t _acceptedCount;
+  uint64_t _prearmDiscardCount;
+  uint64_t _latePhaseCorrectionCount;
+  uint64_t _earlyPhaseCorrectionCount;
   uint64_t _lateCount;
   uint64_t _overflowCount;
   uint64_t _generationSequenceFailureCount;
@@ -182,35 +198,93 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
   [self prunePresentedTimesLockedAtNs:arrivedAtNs];
   decision.queueDepthBefore = _queueCount;
 
+  if (_lastObservedGeneration == 0) {
+    _lastObservedGeneration = generation;
+    _lastArrivalNs = arrivedAtNs;
+    _prearmDiscardCount += 1;
+    decision.prearmDiscarded = YES;
+    decision.generationSequenceValid = YES;
+    os_unfair_lock_unlock(&_lock);
+    return decision;
+  }
+  if (generation != _lastObservedGeneration + 1 ||
+      arrivedAtNs <= _lastArrivalNs) {
+    _generationSequenceFailureCount += 1;
+    decision.generationSequenceValid = NO;
+    _lastObservedGeneration = generation;
+    _lastArrivalNs = arrivedAtNs;
+    _stableCadenceIntervalCount = 0;
+    os_unfair_lock_unlock(&_lock);
+    return decision;
+  }
+  decision.generationSequenceValid = YES;
+  const uint64_t arrivalIntervalNs = arrivedAtNs - _lastArrivalNs;
+  _lastObservedGeneration = generation;
+  _lastArrivalNs = arrivedAtNs;
+
   uint64_t scheduledAtNs = 0;
   if (!_timelineStarted) {
+    if (arrivalIntervalNs >= kInumaStrictReplayStableCadenceIntervalMinimumNs &&
+        arrivalIntervalNs <= kInumaStrictReplayStableCadenceIntervalMaximumNs) {
+      _stableCadenceIntervalCount += 1;
+    } else {
+      _stableCadenceIntervalCount = 0;
+    }
+    if (_stableCadenceIntervalCount <
+        kInumaStrictReplayRequiredStableCadenceIntervals) {
+      _prearmDiscardCount += 1;
+      decision.prearmDiscarded = YES;
+      os_unfair_lock_unlock(&_lock);
+      return decision;
+    }
     if (UINT64_MAX - arrivedAtNs < _presentationReserveNs) {
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
     scheduledAtNs = arrivedAtNs + _presentationReserveNs;
     decision.timelineStarted = YES;
-    decision.generationSequenceValid = YES;
   } else {
-    if (generation != _lastAcceptedGeneration + 1 ||
-        generation < _firstGeneration) {
-      _generationSequenceFailureCount += 1;
-      decision.generationSequenceValid = NO;
+    if (UINT64_MAX - _lastScheduledPresentationTimeNs < _frameIntervalNs ||
+        UINT64_MAX - arrivedAtNs < kInumaStrictReplayMinimumPresentationLeadNs ||
+        UINT64_MAX - arrivedAtNs < _maximumAddedLatencyNs ||
+        UINT64_MAX - _lastScheduledPresentationTimeNs <
+            kInumaStrictReplayMinimumPresentationIntervalNs) {
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
-    decision.generationSequenceValid = YES;
-    const uint64_t index = generation - _firstGeneration;
-    if (index > UINT64_MAX / _frameIntervalNs) {
+    const uint64_t idealAtNs =
+        _lastScheduledPresentationTimeNs + _frameIntervalNs;
+    const uint64_t leadFloorNs =
+        arrivedAtNs + kInumaStrictReplayMinimumPresentationLeadNs;
+    const uint64_t paceFloorNs = _lastScheduledPresentationTimeNs +
+                                 kInumaStrictReplayMinimumPresentationIntervalNs;
+    const uint64_t lowerBoundNs = MAX(leadFloorNs, paceFloorNs);
+    const uint64_t upperBoundNs = arrivedAtNs + _maximumAddedLatencyNs;
+    if (lowerBoundNs > upperBoundNs) {
+      decision.late = YES;
+      decision.latenessNs = lowerBoundNs - upperBoundNs;
+      _lateCount += 1;
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
-    const uint64_t offset = index * _frameIntervalNs;
-    if (UINT64_MAX - _anchorPresentationTimeNs < offset) {
+    scheduledAtNs = MAX(idealAtNs, lowerBoundNs);
+    if (scheduledAtNs > upperBoundNs) {
+      scheduledAtNs = upperBoundNs;
+      decision.earlyPhaseCorrected = YES;
+    } else if (scheduledAtNs > idealAtNs) {
+      decision.latePhaseCorrected = YES;
+    }
+    const uint64_t presentationIntervalNs =
+        scheduledAtNs - _lastScheduledPresentationTimeNs;
+    if (presentationIntervalNs >
+        kInumaStrictReplayMaximumPresentationIntervalNs) {
+      decision.late = YES;
+      decision.latenessNs = presentationIntervalNs -
+                            kInumaStrictReplayMaximumPresentationIntervalNs;
+      _lateCount += 1;
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
-    scheduledAtNs = _anchorPresentationTimeNs + offset;
   }
   decision.scheduledPresentationTimeNs = scheduledAtNs;
   if (scheduledAtNs <= arrivedAtNs) {
@@ -235,14 +309,15 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
   }
   if (!_timelineStarted) {
     _timelineStarted = YES;
-    _firstGeneration = generation;
-    _anchorPresentationTimeNs = scheduledAtNs;
+    _armedGeneration = generation;
   }
   const NSUInteger tail = (_queueHead + _queueCount) % _queueCapacity;
   _scheduledPresentationTimesNs[tail] = scheduledAtNs;
   _queueCount += 1;
-  _lastAcceptedGeneration = generation;
+  _lastScheduledPresentationTimeNs = scheduledAtNs;
   _acceptedCount += 1;
+  _latePhaseCorrectionCount += decision.latePhaseCorrected ? 1 : 0;
+  _earlyPhaseCorrectionCount += decision.earlyPhaseCorrected ? 1 : 0;
   _queueDepthHighWater = MAX(_queueDepthHighWater, _queueCount);
   decision.accepted = YES;
   decision.queueDepthAfter = _queueCount;
@@ -255,6 +330,58 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
   const uint64_t value = _acceptedCount;
   os_unfair_lock_unlock(&_lock);
   return value;
+}
+
+- (uint64_t)prearmDiscardCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _prearmDiscardCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)latePhaseCorrectionCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _latePhaseCorrectionCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)earlyPhaseCorrectionCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _earlyPhaseCorrectionCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)armedGeneration {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _armedGeneration;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)minimumPresentationIntervalNs {
+  return kInumaStrictReplayMinimumPresentationIntervalNs;
+}
+
+- (uint64_t)maximumPresentationIntervalNs {
+  return kInumaStrictReplayMaximumPresentationIntervalNs;
+}
+
+- (uint64_t)minimumPresentationLeadNs {
+  return kInumaStrictReplayMinimumPresentationLeadNs;
+}
+
+- (uint64_t)stableCadenceIntervalMinimumNs {
+  return kInumaStrictReplayStableCadenceIntervalMinimumNs;
+}
+
+- (uint64_t)stableCadenceIntervalMaximumNs {
+  return kInumaStrictReplayStableCadenceIntervalMaximumNs;
+}
+
+- (NSUInteger)requiredStableCadenceIntervals {
+  return kInumaStrictReplayRequiredStableCadenceIntervals;
 }
 
 - (uint64_t)lateCount {
@@ -306,9 +433,11 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
   _queueHead = 0;
   _queueCount = 0;
   _timelineStarted = NO;
-  _firstGeneration = 0;
-  _lastAcceptedGeneration = 0;
-  _anchorPresentationTimeNs = 0;
+  _lastObservedGeneration = 0;
+  _lastArrivalNs = 0;
+  _lastScheduledPresentationTimeNs = 0;
+  _stableCadenceIntervalCount = 0;
+  _armedGeneration = 0;
   os_unfair_lock_unlock(&_lock);
 }
 

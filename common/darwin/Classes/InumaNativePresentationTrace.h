@@ -39,7 +39,10 @@ typedef NS_ENUM(uint32_t, InumaPresentationEventKind) {
   InumaPresentationEventPacingOverflowRejected = 28,
   InumaPresentationEventPacingSequenceRejected = 29,
   InumaPresentationEventPacingAddedLatencyRejected = 30,
-  InumaPresentationEventKindCount = 31,
+  InumaPresentationEventPacingPrearmDiscarded = 31,
+  InumaPresentationEventPacingLatePhaseCorrected = 32,
+  InumaPresentationEventPacingEarlyPhaseCorrected = 33,
+  InumaPresentationEventKindCount = 34,
 };
 
 typedef NS_ENUM(int32_t, InumaRendererErrorDomainClass) {

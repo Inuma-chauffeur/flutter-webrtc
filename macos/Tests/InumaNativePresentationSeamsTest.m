@@ -134,8 +134,121 @@ int main(void) {
                       dictionary, kCMSampleAttachmentKey_DisplayImmediately) ==
                       nil);
     CFRelease(timedSample);
+    const uint64_t capturedIntervalsNs[] = {
+        672750,    7485750,   17602334,  17403666,  17335542,
+        17122458,  16888209,  27349000,  32797000,  32931000,
+        37670000,  33333333,  126450083, 14404667,  17750916,
+        16877417,  18127583,  17315584,  17655083,  33333333,
+        73997875,  15104084,  17542208,  33333333,  94433750,
+        14767375,  17473833,  15954625,  33333333,  89242125,
+        15558500,  15554583,  16553125,  33333333,
+    };
+    NSMutableArray<NSNumber*>* capturedTimes = [NSMutableArray array];
+    uint64_t capturedTimeNs = 1000000000;
+    [capturedTimes addObject:@(capturedTimeNs)];
+    for (NSUInteger index = 0;
+         index < sizeof(capturedIntervalsNs) / sizeof(capturedIntervalsNs[0]);
+         index++) {
+      capturedTimeNs += capturedIntervalsNs[index];
+      [capturedTimes addObject:@(capturedTimeNs)];
+    }
     InumaStrictReplayPacer* paced = [[InumaStrictReplayPacer alloc]
-        initWithPresentationReserveNs:100000000
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:InumaTestHostClock(capturedTimes)];
+    INUMA_REQUIRE(paced != nil);
+    INUMA_REQUIRE(paced.minimumPresentationIntervalNs == 25000000);
+    INUMA_REQUIRE(paced.maximumPresentationIntervalNs == 49999999);
+    INUMA_REQUIRE(paced.minimumPresentationLeadNs == 8333333);
+    INUMA_REQUIRE(paced.stableCadenceIntervalMinimumNs == 25000000);
+    INUMA_REQUIRE(paced.stableCadenceIntervalMaximumNs == 42000000);
+    INUMA_REQUIRE(paced.requiredStableCadenceIntervals == 3);
+    InumaStrictReplayPacingDecision pace = {0};
+    uint64_t previousPresentationTimeNs = 0;
+    uint64_t minimumPresentationIntervalNs = UINT64_MAX;
+    uint64_t maximumPresentationIntervalNs = 0;
+    for (uint64_t generation = 1; generation <= capturedTimes.count;
+         generation++) {
+      pace = [paced decisionForGeneration:generation];
+      INUMA_REQUIRE(pace.generationSequenceValid);
+      if (generation <= 10) {
+        INUMA_REQUIRE(!pace.accepted && pace.prearmDiscarded);
+        INUMA_REQUIRE(!pace.timelineStarted);
+        continue;
+      }
+      INUMA_REQUIRE(pace.accepted && !pace.prearmDiscarded);
+      INUMA_REQUIRE(!pace.late && !pace.overflowed &&
+                    !pace.addedLatencyExceeded);
+      INUMA_REQUIRE(pace.presentationResidenceNs > 0 &&
+                    pace.presentationResidenceNs <= 100000000);
+      if (generation == 11) {
+        INUMA_REQUIRE(pace.timelineStarted);
+        INUMA_REQUIRE(pace.presentationResidenceNs == 95000000);
+      } else {
+        const uint64_t intervalNs =
+            pace.scheduledPresentationTimeNs - previousPresentationTimeNs;
+        minimumPresentationIntervalNs =
+            MIN(minimumPresentationIntervalNs, intervalNs);
+        maximumPresentationIntervalNs =
+            MAX(maximumPresentationIntervalNs, intervalNs);
+        INUMA_REQUIRE(intervalNs >= 25000000 && intervalNs < 50000000);
+      }
+      previousPresentationTimeNs = pace.scheduledPresentationTimeNs;
+    }
+    INUMA_REQUIRE(paced.armedGeneration == 11);
+    INUMA_REQUIRE(paced.prearmDiscardCount == 10);
+    INUMA_REQUIRE(paced.acceptedCount == capturedTimes.count - 10);
+    INUMA_REQUIRE(paced.queueDepthHighWater == 4);
+    INUMA_REQUIRE(paced.latePhaseCorrectionCount == 1);
+    INUMA_REQUIRE(paced.earlyPhaseCorrectionCount == 1);
+    INUMA_REQUIRE(minimumPresentationIntervalNs == 27131252);
+    INUMA_REQUIRE(maximumPresentationIntervalNs == 44120083);
+    INUMA_REQUIRE(paced.lateCount == 0 && paced.overflowCount == 0 &&
+                  paced.generationSequenceFailureCount == 0 &&
+                  paced.addedLatencyViolationCount == 0);
+
+    InumaStrictReplayPacer* late = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:InumaTestHostClock(@[
+                           @1000000000,
+                           @1033333333,
+                           @1066666666,
+                           @1099999999,
+                           @1299999999,
+                         ])];
+    for (uint64_t generation = 1; generation <= 4; generation++) {
+      pace = [late decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted && pace.timelineStarted);
+    pace = [late decisionForGeneration:5];
+    INUMA_REQUIRE(!pace.accepted && pace.late);
+    INUMA_REQUIRE(pace.latenessNs > 0);
+    INUMA_REQUIRE(late.lateCount == 1);
+
+    InumaStrictReplayPacer* overflow = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:1
+                         hostTimeClock:InumaTestHostClock(@[
+                           @1000000000,
+                           @1033333333,
+                           @1066666666,
+                           @1099999999,
+                           @1133333332,
+                         ])];
+    for (uint64_t generation = 1; generation <= 4; generation++) {
+      pace = [overflow decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted);
+    pace = [overflow decisionForGeneration:5];
+    INUMA_REQUIRE(!pace.accepted && pace.overflowed);
+    INUMA_REQUIRE(overflow.overflowCount == 1);
+
+    InumaStrictReplayPacer* sequence = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
                        frameIntervalNs:33333333
                          queueCapacity:4
                          hostTimeClock:InumaTestHostClock(@[
@@ -144,76 +257,31 @@ int main(void) {
                            @1066666666,
                            @1099999999,
                            @1133333332,
+                           @1166666665,
+                           @1199999998,
+                           @1233333331,
+                           @1266666664,
                          ])];
-    INUMA_REQUIRE(paced != nil);
-    InumaStrictReplayPacingDecision pace =
-        [paced decisionForGeneration:1];
-    INUMA_REQUIRE(pace.accepted && pace.timelineStarted);
-    INUMA_REQUIRE(pace.generationSequenceValid && !pace.late &&
-                  !pace.overflowed);
-    INUMA_REQUIRE(pace.scheduledPresentationTimeNs == 1100000000);
-    INUMA_REQUIRE(pace.presentationResidenceNs == 100000000);
-    INUMA_REQUIRE(pace.queueDepthBefore == 0 && pace.queueDepthAfter == 1);
-    for (uint64_t generation = 2; generation <= 4; generation++) {
-      pace = [paced decisionForGeneration:generation];
-      INUMA_REQUIRE(pace.accepted);
-      INUMA_REQUIRE(pace.queueDepthAfter == generation);
+    for (uint64_t generation = 7; generation <= 10; generation++) {
+      pace = [sequence decisionForGeneration:generation];
     }
-    pace = [paced decisionForGeneration:5];
-    INUMA_REQUIRE(pace.accepted);
-    INUMA_REQUIRE(pace.queueDepthBefore == 3 && pace.queueDepthAfter == 4);
-    INUMA_REQUIRE(paced.acceptedCount == 5);
-    INUMA_REQUIRE(paced.queueDepthHighWater == 4);
-    INUMA_REQUIRE(paced.lateCount == 0 && paced.overflowCount == 0 &&
-                  paced.generationSequenceFailureCount == 0);
-
-    InumaStrictReplayPacer* late = [[InumaStrictReplayPacer alloc]
-        initWithPresentationReserveNs:100
-                       frameIntervalNs:10
-                         queueCapacity:4
-                         hostTimeClock:InumaTestHostClock(@[ @1000, @1200 ])];
-    INUMA_REQUIRE([late decisionForGeneration:1].accepted);
-    pace = [late decisionForGeneration:2];
-    INUMA_REQUIRE(!pace.accepted && pace.late && pace.latenessNs == 90);
-    INUMA_REQUIRE(late.lateCount == 1);
-
-    InumaStrictReplayPacer* overflow = [[InumaStrictReplayPacer alloc]
-        initWithPresentationReserveNs:100
-                       frameIntervalNs:10
-                         queueCapacity:2
-                         hostTimeClock:InumaTestHostClock(@[ @1000, @1001, @1002 ])];
-    INUMA_REQUIRE([overflow decisionForGeneration:1].accepted);
-    INUMA_REQUIRE([overflow decisionForGeneration:2].accepted);
-    pace = [overflow decisionForGeneration:3];
-    INUMA_REQUIRE(!pace.accepted && pace.overflowed);
-    INUMA_REQUIRE(overflow.overflowCount == 1);
-
-    InumaStrictReplayPacer* sequence = [[InumaStrictReplayPacer alloc]
-        initWithPresentationReserveNs:100
-                       frameIntervalNs:10
-                         queueCapacity:4
-                         hostTimeClock:InumaTestHostClock(@[ @1000, @1001, @1002 ])];
-    INUMA_REQUIRE([sequence decisionForGeneration:7].accepted);
-    pace = [sequence decisionForGeneration:9];
+    INUMA_REQUIRE(pace.accepted && sequence.armedGeneration == 10);
+    pace = [sequence decisionForGeneration:12];
     INUMA_REQUIRE(!pace.accepted && !pace.generationSequenceValid);
     INUMA_REQUIRE(sequence.generationSequenceFailureCount == 1);
+    pace = [sequence decisionForGeneration:13];
+    INUMA_REQUIRE(pace.accepted && pace.generationSequenceValid);
+    INUMA_REQUIRE(sequence.generationSequenceFailureCount == 1);
     [sequence stop];
-    INUMA_REQUIRE(![sequence decisionForGeneration:8].accepted);
+    INUMA_REQUIRE(![sequence decisionForGeneration:14].accepted);
     [sequence reset];
-    INUMA_REQUIRE([sequence decisionForGeneration:20].accepted);
-
-    InumaStrictReplayPacer* addedLatency = [[InumaStrictReplayPacer alloc]
-        initWithPresentationReserveNs:83000000
-                       frameIntervalNs:33000000
-                         queueCapacity:3
-                         hostTimeClock:InumaTestHostClock(
-                                           @[ @1000000000, @1000000001 ])];
-    INUMA_REQUIRE([addedLatency decisionForGeneration:1].accepted);
-    pace = [addedLatency decisionForGeneration:2];
-    INUMA_REQUIRE(!pace.accepted && pace.addedLatencyExceeded);
-    INUMA_REQUIRE(pace.presentationResidenceNs == 115999999);
-    INUMA_REQUIRE(addedLatency.maximumAddedLatencyNs == 100000000);
-    INUMA_REQUIRE(addedLatency.addedLatencyViolationCount == 1);
+    pace = [sequence decisionForGeneration:20];
+    INUMA_REQUIRE(!pace.accepted && pace.prearmDiscarded);
+    INUMA_REQUIRE([[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:100000001
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:nil] == nil);
 
     InumaBoundedPresentationTraceSink* trace =
         [[InumaBoundedPresentationTraceSink alloc] initWithCapacity:2];
