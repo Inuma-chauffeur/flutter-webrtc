@@ -11,6 +11,7 @@
 #if TARGET_OS_OSX
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaLowLatencyVideoPlayoutConfiguration.h"
+#include "InumaNativePresentationSeams.h"
 #include "InumaPrerendererSmoothingConfiguration.h"
 
 enum { kInumaNativeVideoSurfaceTraceCapacity = 65536 };
@@ -91,6 +92,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   CMSampleBufferRef _inumaPendingSampleBuffer;
   RTCVideoRotation _inumaPendingRotation;
   uint64_t _inumaPendingGeneration;
+  InumaVideoSampleBuilder* _inumaSampleBuilder;
+  InumaSampleRendererAdapter* _inumaRendererAdapter;
 #endif
 }
 
@@ -118,6 +121,18 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         [environment[@"INUMA_FLUTTER_WEBRTC_MACOS_PIXEL_MODE"]
             isEqualToString:@"native_platform_view"];
     if (_inumaNativeSurfaceSelected) {
+      _inumaSampleBuilder = [[InumaVideoSampleBuilder alloc] init];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+      if (@available(macOS 14.0, *)) {
+        InumaAVSampleRendererBackend* backend =
+            [[InumaAVSampleRendererBackend alloc]
+                initWithRenderer:_videoLayer.sampleBufferRenderer];
+        _inumaRendererAdapter = [[InumaSampleRendererAdapter alloc]
+            initWithBackend:backend
+                       clock:[InumaMonotonicClock systemClock]
+                   traceSink:nil];
+      }
+#endif
       os_unfair_lock_lock(&gInumaNativeVideoSurfaceLifecycleLock);
       gInumaNativeVideoSurfaceCreatedCount += 1;
       gInumaNativeVideoSurfaceLiveCount += 1;
@@ -249,7 +264,15 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   }
 
   RTCVideoRotation rotation = frame.rotation;
+#if TARGET_OS_OSX
+  CMSampleBufferRef sampleBuffer = _inumaSampleBuilder == nil
+                                       ? [self sampleBufferFromPixelBuffer:pixelBuffer]
+                                       : [_inumaSampleBuilder
+                                             copyImmediateSampleBufferFromPixelBuffer:
+                                                 pixelBuffer];
+#else
   CMSampleBufferRef sampleBuffer = [self sampleBufferFromPixelBuffer:pixelBuffer];
+#endif
   CFRelease(pixelBuffer);
 
   if (!sampleBuffer) {
@@ -316,6 +339,25 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
 #elif TARGET_OS_OSX
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
   if (@available(macOS 14.0, *)) {
+    if (_inumaNativeSurfaceSelected && _inumaRendererAdapter != nil) {
+      InumaRendererSubmissionResult result =
+          [_inumaRendererAdapter submitSampleBuffer:sampleBuffer
+                                         generation:frameGeneration];
+      if (_inumaTrace.enabled) {
+        os_unfair_lock_lock(&_inumaTraceLock);
+        _inumaTrace.renderer_flushes += result.flushedBeforeEnqueue ? 1 : 0;
+        _inumaTrace.renderer_not_ready_observations +=
+            result.readyBeforeEnqueue ? 0 : 1;
+        _inumaTrace.modern_renderer_enqueues += result.accepted ? 1 : 0;
+        _inumaTrace.renderer_failures += result.failedAfterEnqueue ? 1 : 0;
+        os_unfair_lock_unlock(&_inumaTraceLock);
+        if (result.accepted) {
+          [self inumaRecordEnqueueCompletionForGeneration:frameGeneration
+                                                 startedAt:enqueueStarted];
+        }
+      }
+      return;
+    }
     AVSampleBufferVideoRenderer* renderer = _videoLayer.sampleBufferRenderer;
     if ([renderer requiresFlushToResumeDecoding]) {
       [renderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
@@ -606,6 +648,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     if (pendingSampleBuffer != nil) {
       CFRelease(pendingSampleBuffer);
     }
+    [self->_inumaRendererAdapter stop];
     os_unfair_lock_lock(&gInumaNativeVideoSurfaceLifecycleLock);
     if (self->_inumaSurfaceRegistered) {
       self->_inumaSurfaceRegistered = NO;
