@@ -118,8 +118,8 @@ int main(void) {
     INUMA_REQUIRE(!result.failedAfterEnqueue);
     INUMA_REQUIRE(ready.enqueueCount == 1);
     INUMA_REQUIRE(ready.displayedGeneration == 7);
-    INUMA_REQUIRE([ready.events isEqualToArray:
-        @[ @"requires_flush", @"ready", @"enqueue", @"failed" ]]);
+    INUMA_REQUIRE(([ready.events isEqualToArray:
+        @[ @"requires_flush", @"ready", @"enqueue", @"failed" ]]));
 
     InumaFakeSampleRendererBackend* pressured =
         [[InumaFakeSampleRendererBackend alloc] init];
@@ -142,9 +142,9 @@ int main(void) {
     INUMA_REQUIRE(result.flushedBeforeEnqueue);
     INUMA_REQUIRE(result.failedAfterEnqueue);
     INUMA_REQUIRE(flushed.displayedGeneration == 9);
-    INUMA_REQUIRE([flushed.events isEqualToArray:@[
+    INUMA_REQUIRE(([flushed.events isEqualToArray:@[
       @"requires_flush", @"flush", @"ready", @"enqueue", @"failed"
-    ]]);
+    ]]));
 
     INUMA_REQUIRE(trace.count == 2);
     INUMA_REQUIRE(trace.capacityExhaustions == 1);
