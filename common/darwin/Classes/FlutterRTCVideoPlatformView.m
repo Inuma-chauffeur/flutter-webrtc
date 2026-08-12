@@ -752,10 +752,15 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
           hostNow > frameContext.scheduledPresentationTimeNs
               ? hostNow - frameContext.scheduledPresentationTimeNs
               : 0;
+      const BOOL rearmTriggered =
+          [_inumaStrictReplayPacer invalidateTimelineAfterAcceptedGeneration:
+              frameContext.nativeGeneration];
       if (_inumaTrace.enabled) {
         os_unfair_lock_lock(&_inumaTraceLock);
         _inumaTrace.strict_replay_pacing_late_rejections += 1;
         _inumaTrace.strict_replay_dispatch_late_rejections += 1;
+        _inumaTrace.strict_replay_pacing_rearm_count +=
+            rearmTriggered ? 1 : 0;
         os_unfair_lock_unlock(&_inumaTraceLock);
         [_inumaPresentationTrace
             recordEventKind:InumaPresentationEventPacingLateRejected
@@ -814,12 +819,14 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                                frameContext:
                                    (InumaPresentationFrameContext)frameContext {
   BOOL rejected = NO;
+  BOOL rearmAfterRejection = NO;
   os_unfair_lock_lock(&_inumaTraceLock);
   const NSUInteger capacity = _inumaStrictReplayPacer.queueCapacity;
   if (_inumaShuttingDown || capacity == 0 ||
       _inumaStrictReplayDispatchPending >= capacity) {
     _inumaTrace.strict_replay_dispatch_overflow_rejections += 1;
     rejected = YES;
+    rearmAfterRejection = !_inumaShuttingDown && capacity > 0;
   } else {
     _inumaStrictReplayDispatchPending += 1;
     _inumaTrace.strict_replay_dispatch_submissions += 1;
@@ -829,7 +836,16 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   }
   os_unfair_lock_unlock(&_inumaTraceLock);
   if (rejected) {
+    const BOOL rearmTriggered =
+        rearmAfterRejection &&
+        [_inumaStrictReplayPacer invalidateTimelineAfterAcceptedGeneration:
+            frameContext.nativeGeneration];
     if (_inumaTrace.enabled) {
+      if (rearmTriggered) {
+        os_unfair_lock_lock(&_inumaTraceLock);
+        _inumaTrace.strict_replay_pacing_rearm_count += 1;
+        os_unfair_lock_unlock(&_inumaTraceLock);
+      }
       [_inumaPresentationTrace
           recordEventKind:InumaPresentationEventPacingOverflowRejected
                       atNs:InumaNativeSurfaceMonotonicNanoseconds()

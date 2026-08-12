@@ -103,6 +103,7 @@ typedef struct {
                                           hostTimeClock:
                                               (nullable InumaHostTimeClockBlock)hostTimeClock;
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation;
+- (BOOL)invalidateTimelineAfterAcceptedGeneration:(uint64_t)generation;
 - (InumaStrictReplayPacerSnapshot)snapshot;
 - (void)stop;
 - (void)reset;

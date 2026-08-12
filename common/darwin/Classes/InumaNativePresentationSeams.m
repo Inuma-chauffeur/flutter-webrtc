@@ -365,6 +365,18 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   return decision;
 }
 
+- (BOOL)invalidateTimelineAfterAcceptedGeneration:(uint64_t)generation {
+  if (generation == 0) {
+    return NO;
+  }
+  os_unfair_lock_lock(&_lock);
+  const BOOL invalidated =
+      !_stopped && generation >= _lastArmedGeneration &&
+      [self invalidateStartedTimelineLocked];
+  os_unfair_lock_unlock(&_lock);
+  return invalidated;
+}
+
 - (uint64_t)acceptedCount {
   os_unfair_lock_lock(&_lock);
   const uint64_t value = _acceptedCount;

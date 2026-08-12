@@ -270,6 +270,39 @@ int main(void) {
     INUMA_REQUIRE(late.prearmDiscardCount == 5);
     INUMA_REQUIRE(late.acceptedCount == 3);
 
+    InumaStrictReplayPacer* external = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:InumaTestHostClock(@[
+                           @1000000000,
+                           @1033333333,
+                           @1066666666,
+                           @1099999999,
+                           @1133333332,
+                           @1166666665,
+                           @1199999998,
+                           @1233333331,
+                         ])];
+    for (uint64_t generation = 1; generation <= 4; generation++) {
+      pace = [external decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted && external.armedGeneration == 4);
+    INUMA_REQUIRE([external invalidateTimelineAfterAcceptedGeneration:4]);
+    INUMA_REQUIRE(![external invalidateTimelineAfterAcceptedGeneration:4]);
+    for (uint64_t generation = 5; generation <= 6; generation++) {
+      pace = [external decisionForGeneration:generation];
+      INUMA_REQUIRE(!pace.accepted && pace.rearmPrearmDiscarded);
+    }
+    pace = [external decisionForGeneration:7];
+    INUMA_REQUIRE(pace.accepted && pace.timelineRearmed);
+    INUMA_REQUIRE(![external invalidateTimelineAfterAcceptedGeneration:4]);
+    pace = [external decisionForGeneration:8];
+    INUMA_REQUIRE(pace.accepted);
+    INUMA_REQUIRE(external.armCount == 2 && external.rearmCount == 1 &&
+                  external.rearmPrearmDiscardCount == 2 &&
+                  external.lastArmedGeneration == 7);
+
     InumaStrictReplayPacer* overflow = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000
                        frameIntervalNs:33333333
