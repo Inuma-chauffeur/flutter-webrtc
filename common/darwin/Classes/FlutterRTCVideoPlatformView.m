@@ -54,6 +54,7 @@ typedef struct {
   uint64_t queue_depth_high_water;
   uint64_t strict_replay_pacing_accepted;
   uint64_t strict_replay_pacing_late_rejections;
+  uint64_t strict_replay_pacing_pacer_late_rejections;
   uint64_t strict_replay_pacing_overflow_rejections;
   uint64_t strict_replay_pacing_sequence_rejections;
   uint64_t strict_replay_pacing_added_latency_rejections;
@@ -61,6 +62,7 @@ typedef struct {
   uint64_t strict_replay_pacing_late_phase_corrections;
   uint64_t strict_replay_pacing_early_phase_corrections;
   uint64_t strict_replay_dispatch_submissions;
+  uint64_t strict_replay_dispatch_late_rejections;
   uint64_t strict_replay_dispatch_overflow_rejections;
   uint64_t strict_replay_dispatch_depth_high_water;
   uint64_t shutdown_count;
@@ -465,6 +467,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
           rejection == InumaPresentationEventPacingOverflowRejected ? 1 : 0;
       _inumaTrace.strict_replay_pacing_late_rejections +=
           rejection == InumaPresentationEventPacingLateRejected ? 1 : 0;
+      _inumaTrace.strict_replay_pacing_pacer_late_rejections +=
+          rejection == InumaPresentationEventPacingLateRejected ? 1 : 0;
       _inumaTrace.strict_replay_pacing_added_latency_rejections +=
           rejection == InumaPresentationEventPacingAddedLatencyRejected ? 1 : 0;
       os_unfair_lock_unlock(&_inumaTraceLock);
@@ -742,6 +746,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       if (_inumaTrace.enabled) {
         os_unfair_lock_lock(&_inumaTraceLock);
         _inumaTrace.strict_replay_pacing_late_rejections += 1;
+        _inumaTrace.strict_replay_dispatch_late_rejections += 1;
         os_unfair_lock_unlock(&_inumaTraceLock);
         [_inumaPresentationTrace
             recordEventKind:InumaPresentationEventPacingLateRejected
@@ -1130,6 +1135,14 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   const uint64_t snapshotCount = _inumaTraceSnapshotCount;
   os_unfair_lock_unlock(&_inumaTraceLock);
 
+  const uint64_t pacingDecisionTerminalCount =
+      pacerSnapshot.acceptedCount + pacerSnapshot.prearmDiscardCount +
+      pacerSnapshot.lateCount + pacerSnapshot.overflowCount +
+      pacerSnapshot.generationSequenceFailureCount +
+      pacerSnapshot.addedLatencyViolationCount;
+  const uint64_t pixelBufferSuccessCount =
+      snapshot->direct_pixel_buffer_frames +
+      snapshot->converted_pixel_buffer_frames;
   const BOOL strictReplaySnapshotCoherent =
       !_inumaStrictReplayPaced ||
       (pacerSnapshot.acceptedCount ==
@@ -1141,19 +1154,28 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
        pacerSnapshot.earlyPhaseCorrectionCount ==
            snapshot->strict_replay_pacing_early_phase_corrections &&
        pacerSnapshot.lateCount ==
-           snapshot->strict_replay_pacing_late_rejections &&
+           snapshot->strict_replay_pacing_pacer_late_rejections &&
        pacerSnapshot.overflowCount ==
            snapshot->strict_replay_pacing_overflow_rejections &&
        pacerSnapshot.generationSequenceFailureCount ==
            snapshot->strict_replay_pacing_sequence_rejections &&
        pacerSnapshot.addedLatencyViolationCount ==
            snapshot->strict_replay_pacing_added_latency_rejections &&
-       pacerSnapshot.acceptedCount + pacerSnapshot.prearmDiscardCount ==
+       snapshot->strict_replay_pacing_late_rejections ==
+           snapshot->strict_replay_pacing_pacer_late_rejections +
+               snapshot->strict_replay_dispatch_late_rejections &&
+       pacingDecisionTerminalCount == pixelBufferSuccessCount &&
+       pixelBufferSuccessCount + snapshot->pixel_buffer_failures ==
            snapshot->render_frames &&
+       pacerSnapshot.acceptedCount ==
+           snapshot->sample_buffer_failures +
+               snapshot->strict_replay_dispatch_submissions +
+               snapshot->strict_replay_dispatch_overflow_rejections &&
+       strictReplayDispatchPending == 0 &&
        snapshot->strict_replay_dispatch_submissions ==
-           pacerSnapshot.acceptedCount &&
-       snapshot->enqueue_completions == pacerSnapshot.acceptedCount &&
-       strictReplayDispatchPending == 0);
+           snapshot->enqueue_attempts +
+               snapshot->strict_replay_dispatch_late_rejections &&
+       snapshot->enqueue_completions <= snapshot->enqueue_attempts);
   if (!strictReplaySnapshotCoherent && !shuttingDown &&
       retryAttempt < kInumaTraceMaximumCoherentSnapshotRetries) {
     free(snapshot);
@@ -1192,7 +1214,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v5",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v6",
     @"status" : strictReplaySnapshotCoherent ? @"pass" : @"fail",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1290,6 +1312,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->strict_replay_pacing_accepted),
     @"strict_replay_pacing_late_rejections" :
         @(snapshot->strict_replay_pacing_late_rejections),
+    @"strict_replay_pacing_pacer_late_rejections" :
+        @(snapshot->strict_replay_pacing_pacer_late_rejections),
     @"strict_replay_pacing_overflow_rejections" :
         @(snapshot->strict_replay_pacing_overflow_rejections),
     @"strict_replay_pacing_sequence_rejections" :
@@ -1304,6 +1328,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->strict_replay_pacing_early_phase_corrections),
     @"strict_replay_dispatch_submissions" :
         @(snapshot->strict_replay_dispatch_submissions),
+    @"strict_replay_dispatch_late_rejections" :
+        @(snapshot->strict_replay_dispatch_late_rejections),
     @"strict_replay_dispatch_overflow_rejections" :
         @(snapshot->strict_replay_dispatch_overflow_rejections),
     @"strict_replay_dispatch_depth_high_water" :
