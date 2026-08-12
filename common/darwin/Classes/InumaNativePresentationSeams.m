@@ -128,6 +128,11 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   uint64_t _lastScheduledPresentationTimeNs;
   NSUInteger _stableCadenceIntervalCount;
   uint64_t _armedGeneration;
+  uint64_t _lastArmedGeneration;
+  uint64_t _armCount;
+  uint64_t _rearmCount;
+  uint64_t _rearmPrearmDiscardCount;
+  BOOL _rearmPending;
   uint64_t _acceptedCount;
   uint64_t _prearmDiscardCount;
   uint64_t _latePhaseCorrectionCount;
@@ -182,6 +187,31 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   }
 }
 
+- (BOOL)invalidateStartedTimelineLocked {
+  if (!_timelineStarted) {
+    _stableCadenceIntervalCount = 0;
+    return NO;
+  }
+  _timelineStarted = NO;
+  _queueHead = 0;
+  _queueCount = 0;
+  _lastScheduledPresentationTimeNs = 0;
+  _stableCadenceIntervalCount = 0;
+  _rearmPending = YES;
+  _rearmCount += 1;
+  return YES;
+}
+
+- (void)recordPrearmDiscardLockedForDecision:
+    (InumaStrictReplayPacingDecision*)decision {
+  _prearmDiscardCount += 1;
+  decision->prearmDiscarded = YES;
+  if (_rearmPending) {
+    _rearmPrearmDiscardCount += 1;
+    decision->rearmPrearmDiscarded = YES;
+  }
+}
+
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation {
   InumaStrictReplayPacingDecision decision = {0};
   const uint64_t arrivedAtNs = _hostTimeClock();
@@ -201,8 +231,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   if (_lastObservedGeneration == 0) {
     _lastObservedGeneration = generation;
     _lastArrivalNs = arrivedAtNs;
-    _prearmDiscardCount += 1;
-    decision.prearmDiscarded = YES;
+    [self recordPrearmDiscardLockedForDecision:&decision];
     decision.generationSequenceValid = YES;
     os_unfair_lock_unlock(&_lock);
     return decision;
@@ -213,7 +242,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
     decision.generationSequenceValid = NO;
     _lastObservedGeneration = generation;
     _lastArrivalNs = arrivedAtNs;
-    _stableCadenceIntervalCount = 0;
+    decision.rearmTriggered = [self invalidateStartedTimelineLocked];
     os_unfair_lock_unlock(&_lock);
     return decision;
   }
@@ -232,8 +261,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
     }
     if (_stableCadenceIntervalCount <
         kInumaStrictReplayRequiredStableCadenceIntervals) {
-      _prearmDiscardCount += 1;
-      decision.prearmDiscarded = YES;
+      [self recordPrearmDiscardLockedForDecision:&decision];
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
@@ -264,6 +292,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
       decision.late = YES;
       decision.latenessNs = lowerBoundNs - upperBoundNs;
       _lateCount += 1;
+      decision.rearmTriggered = [self invalidateStartedTimelineLocked];
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
@@ -282,6 +311,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
       decision.latenessNs = presentationIntervalNs -
                             kInumaStrictReplayMaximumPresentationIntervalNs;
       _lateCount += 1;
+      decision.rearmTriggered = [self invalidateStartedTimelineLocked];
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
@@ -291,6 +321,7 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
     decision.late = YES;
     decision.latenessNs = arrivedAtNs - scheduledAtNs;
     _lateCount += 1;
+    decision.rearmTriggered = [self invalidateStartedTimelineLocked];
     os_unfair_lock_unlock(&_lock);
     return decision;
   }
@@ -298,18 +329,27 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   if (decision.presentationResidenceNs > _maximumAddedLatencyNs) {
     decision.addedLatencyExceeded = YES;
     _addedLatencyViolationCount += 1;
+    decision.rearmTriggered = [self invalidateStartedTimelineLocked];
     os_unfair_lock_unlock(&_lock);
     return decision;
   }
   if (_queueCount >= _queueCapacity) {
     decision.overflowed = YES;
     _overflowCount += 1;
+    decision.rearmTriggered = [self invalidateStartedTimelineLocked];
     os_unfair_lock_unlock(&_lock);
     return decision;
   }
   if (!_timelineStarted) {
     _timelineStarted = YES;
-    _armedGeneration = generation;
+    _armCount += 1;
+    _lastArmedGeneration = generation;
+    if (_armedGeneration == 0) {
+      _armedGeneration = generation;
+    } else {
+      decision.timelineRearmed = YES;
+    }
+    _rearmPending = NO;
   }
   const NSUInteger tail = (_queueHead + _queueCount) % _queueCapacity;
   _scheduledPresentationTimesNs[tail] = scheduledAtNs;
@@ -340,6 +380,10 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
       .latePhaseCorrectionCount = _latePhaseCorrectionCount,
       .earlyPhaseCorrectionCount = _earlyPhaseCorrectionCount,
       .armedGeneration = _armedGeneration,
+      .lastArmedGeneration = _lastArmedGeneration,
+      .armCount = _armCount,
+      .rearmCount = _rearmCount,
+      .rearmPrearmDiscardCount = _rearmPrearmDiscardCount,
       .lateCount = _lateCount,
       .overflowCount = _overflowCount,
       .generationSequenceFailureCount = _generationSequenceFailureCount,
@@ -374,6 +418,34 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
 - (uint64_t)armedGeneration {
   os_unfair_lock_lock(&_lock);
   const uint64_t value = _armedGeneration;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)lastArmedGeneration {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _lastArmedGeneration;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)armCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _armCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)rearmCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _rearmCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)rearmPrearmDiscardCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _rearmPrearmDiscardCount;
   os_unfair_lock_unlock(&_lock);
   return value;
 }
@@ -456,6 +528,8 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   _lastScheduledPresentationTimeNs = 0;
   _stableCadenceIntervalCount = 0;
   _armedGeneration = 0;
+  _lastArmedGeneration = 0;
+  _rearmPending = NO;
   os_unfair_lock_unlock(&_lock);
 }
 

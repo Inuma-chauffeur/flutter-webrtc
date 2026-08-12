@@ -15,6 +15,9 @@ typedef struct {
   BOOL accepted;
   BOOL timelineStarted;
   BOOL prearmDiscarded;
+  BOOL rearmTriggered;
+  BOOL rearmPrearmDiscarded;
+  BOOL timelineRearmed;
   BOOL generationSequenceValid;
   BOOL late;
   BOOL overflowed;
@@ -35,6 +38,10 @@ typedef struct {
   uint64_t latePhaseCorrectionCount;
   uint64_t earlyPhaseCorrectionCount;
   uint64_t armedGeneration;
+  uint64_t lastArmedGeneration;
+  uint64_t armCount;
+  uint64_t rearmCount;
+  uint64_t rearmPrearmDiscardCount;
   uint64_t lateCount;
   uint64_t overflowCount;
   uint64_t generationSequenceFailureCount;
@@ -80,6 +87,10 @@ typedef struct {
 @property(nonatomic, readonly) uint64_t latePhaseCorrectionCount;
 @property(nonatomic, readonly) uint64_t earlyPhaseCorrectionCount;
 @property(nonatomic, readonly) uint64_t armedGeneration;
+@property(nonatomic, readonly) uint64_t lastArmedGeneration;
+@property(nonatomic, readonly) uint64_t armCount;
+@property(nonatomic, readonly) uint64_t rearmCount;
+@property(nonatomic, readonly) uint64_t rearmPrearmDiscardCount;
 @property(nonatomic, readonly) uint64_t lateCount;
 @property(nonatomic, readonly) uint64_t overflowCount;
 @property(nonatomic, readonly) uint64_t generationSequenceFailureCount;

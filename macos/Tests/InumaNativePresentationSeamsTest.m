@@ -209,6 +209,10 @@ int main(void) {
                   paced.addedLatencyViolationCount == 0);
     const InumaStrictReplayPacerSnapshot pacedSnapshot = [paced snapshot];
     INUMA_REQUIRE(pacedSnapshot.armedGeneration == 11);
+    INUMA_REQUIRE(pacedSnapshot.lastArmedGeneration == 11);
+    INUMA_REQUIRE(pacedSnapshot.armCount == 1);
+    INUMA_REQUIRE(pacedSnapshot.rearmCount == 0);
+    INUMA_REQUIRE(pacedSnapshot.rearmPrearmDiscardCount == 0);
     INUMA_REQUIRE(pacedSnapshot.prearmDiscardCount == 10);
     INUMA_REQUIRE(pacedSnapshot.acceptedCount == capturedTimes.count - 10);
     INUMA_REQUIRE(pacedSnapshot.queueDepthHighWater == 4);
@@ -229,15 +233,42 @@ int main(void) {
                            @1066666666,
                            @1099999999,
                            @1299999999,
+                           @1333333332,
+                           @1366666665,
+                           @1399999998,
+                           @1433333331,
                          ])];
     for (uint64_t generation = 1; generation <= 4; generation++) {
       pace = [late decisionForGeneration:generation];
     }
     INUMA_REQUIRE(pace.accepted && pace.timelineStarted);
     pace = [late decisionForGeneration:5];
-    INUMA_REQUIRE(!pace.accepted && pace.late);
+    INUMA_REQUIRE(!pace.accepted && pace.late && pace.rearmTriggered);
     INUMA_REQUIRE(pace.latenessNs > 0);
     INUMA_REQUIRE(late.lateCount == 1);
+    for (uint64_t generation = 6; generation <= 7; generation++) {
+      pace = [late decisionForGeneration:generation];
+      INUMA_REQUIRE(!pace.accepted && pace.prearmDiscarded &&
+                    pace.rearmPrearmDiscarded && !pace.rearmTriggered);
+    }
+    pace = [late decisionForGeneration:8];
+    INUMA_REQUIRE(pace.accepted && pace.timelineStarted &&
+                  pace.timelineRearmed && !pace.prearmDiscarded);
+    const uint64_t rearmedPresentationTimeNs =
+        pace.scheduledPresentationTimeNs;
+    pace = [late decisionForGeneration:9];
+    INUMA_REQUIRE(pace.accepted && !pace.timelineStarted &&
+                  !pace.timelineRearmed);
+    INUMA_REQUIRE(pace.scheduledPresentationTimeNs -
+                      rearmedPresentationTimeNs ==
+                  33333333);
+    INUMA_REQUIRE(late.armedGeneration == 4);
+    INUMA_REQUIRE(late.lastArmedGeneration == 8);
+    INUMA_REQUIRE(late.armCount == 2);
+    INUMA_REQUIRE(late.rearmCount == 1);
+    INUMA_REQUIRE(late.rearmPrearmDiscardCount == 2);
+    INUMA_REQUIRE(late.prearmDiscardCount == 5);
+    INUMA_REQUIRE(late.acceptedCount == 3);
 
     InumaStrictReplayPacer* overflow = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000
@@ -255,8 +286,9 @@ int main(void) {
     }
     INUMA_REQUIRE(pace.accepted);
     pace = [overflow decisionForGeneration:5];
-    INUMA_REQUIRE(!pace.accepted && pace.overflowed);
+    INUMA_REQUIRE(!pace.accepted && pace.overflowed && pace.rearmTriggered);
     INUMA_REQUIRE(overflow.overflowCount == 1);
+    INUMA_REQUIRE(overflow.rearmCount == 1);
 
     InumaStrictReplayPacer* sequence = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000
@@ -278,13 +310,24 @@ int main(void) {
     }
     INUMA_REQUIRE(pace.accepted && sequence.armedGeneration == 10);
     pace = [sequence decisionForGeneration:12];
-    INUMA_REQUIRE(!pace.accepted && !pace.generationSequenceValid);
+    INUMA_REQUIRE(!pace.accepted && !pace.generationSequenceValid &&
+                  pace.rearmTriggered);
     INUMA_REQUIRE(sequence.generationSequenceFailureCount == 1);
-    pace = [sequence decisionForGeneration:13];
+    for (uint64_t generation = 13; generation <= 14; generation++) {
+      pace = [sequence decisionForGeneration:generation];
+      INUMA_REQUIRE(!pace.accepted && pace.prearmDiscarded &&
+                    pace.rearmPrearmDiscarded && pace.generationSequenceValid);
+    }
+    pace = [sequence decisionForGeneration:15];
+    INUMA_REQUIRE(pace.accepted && pace.generationSequenceValid &&
+                  pace.timelineRearmed);
+    pace = [sequence decisionForGeneration:16];
     INUMA_REQUIRE(pace.accepted && pace.generationSequenceValid);
     INUMA_REQUIRE(sequence.generationSequenceFailureCount == 1);
+    INUMA_REQUIRE(sequence.rearmCount == 1);
+    INUMA_REQUIRE(sequence.rearmPrearmDiscardCount == 2);
     [sequence stop];
-    INUMA_REQUIRE(![sequence decisionForGeneration:14].accepted);
+    INUMA_REQUIRE(![sequence decisionForGeneration:17].accepted);
     [sequence reset];
     pace = [sequence decisionForGeneration:20];
     INUMA_REQUIRE(!pace.accepted && pace.prearmDiscarded);

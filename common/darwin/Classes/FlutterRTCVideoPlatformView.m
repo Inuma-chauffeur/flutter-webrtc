@@ -59,6 +59,9 @@ typedef struct {
   uint64_t strict_replay_pacing_sequence_rejections;
   uint64_t strict_replay_pacing_added_latency_rejections;
   uint64_t strict_replay_pacing_prearm_discards;
+  uint64_t strict_replay_pacing_rearm_count;
+  uint64_t strict_replay_pacing_rearm_prearm_discards;
+  uint64_t strict_replay_pacing_arm_count;
   uint64_t strict_replay_pacing_late_phase_corrections;
   uint64_t strict_replay_pacing_early_phase_corrections;
   uint64_t strict_replay_dispatch_submissions;
@@ -440,6 +443,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
       if (_inumaTrace.enabled) {
         os_unfair_lock_lock(&_inumaTraceLock);
         _inumaTrace.strict_replay_pacing_prearm_discards += 1;
+        _inumaTrace.strict_replay_pacing_rearm_prearm_discards +=
+            pacingDecision.rearmPrearmDiscarded ? 1 : 0;
         os_unfair_lock_unlock(&_inumaTraceLock);
         [_inumaPresentationTrace
             recordEventKind:InumaPresentationEventPacingPrearmDiscarded
@@ -471,6 +476,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
           rejection == InumaPresentationEventPacingLateRejected ? 1 : 0;
       _inumaTrace.strict_replay_pacing_added_latency_rejections +=
           rejection == InumaPresentationEventPacingAddedLatencyRejected ? 1 : 0;
+      _inumaTrace.strict_replay_pacing_rearm_count +=
+          pacingDecision.rearmTriggered ? 1 : 0;
       os_unfair_lock_unlock(&_inumaTraceLock);
       [_inumaPresentationTrace recordEventKind:rejection
                                           atNs:sampleBuildStarted
@@ -488,6 +495,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         pacingDecision.latePhaseCorrected ? 1 : 0;
     _inumaTrace.strict_replay_pacing_early_phase_corrections +=
         pacingDecision.earlyPhaseCorrected ? 1 : 0;
+    _inumaTrace.strict_replay_pacing_arm_count +=
+        pacingDecision.timelineStarted ? 1 : 0;
     os_unfair_lock_unlock(&_inumaTraceLock);
     if (pacingDecision.latePhaseCorrected) {
       [_inumaPresentationTrace
@@ -1149,6 +1158,12 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
            snapshot->strict_replay_pacing_accepted &&
        pacerSnapshot.prearmDiscardCount ==
            snapshot->strict_replay_pacing_prearm_discards &&
+       pacerSnapshot.rearmCount ==
+           snapshot->strict_replay_pacing_rearm_count &&
+       pacerSnapshot.rearmPrearmDiscardCount ==
+           snapshot->strict_replay_pacing_rearm_prearm_discards &&
+       pacerSnapshot.armCount ==
+           snapshot->strict_replay_pacing_arm_count &&
        pacerSnapshot.latePhaseCorrectionCount ==
            snapshot->strict_replay_pacing_late_phase_corrections &&
        pacerSnapshot.earlyPhaseCorrectionCount ==
@@ -1214,7 +1229,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v6",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v7",
     @"status" : strictReplaySnapshotCoherent ? @"pass" : @"fail",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1247,6 +1262,12 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(pacerSnapshot.earlyPhaseCorrectionCount),
     @"strict_replay_pacer_armed_generation" :
         @(pacerSnapshot.armedGeneration),
+    @"strict_replay_pacer_last_armed_generation" :
+        @(pacerSnapshot.lastArmedGeneration),
+    @"strict_replay_pacer_arm_count" : @(pacerSnapshot.armCount),
+    @"strict_replay_pacer_rearm_count" : @(pacerSnapshot.rearmCount),
+    @"strict_replay_pacer_rearm_prearm_discard_count" :
+        @(pacerSnapshot.rearmPrearmDiscardCount),
     @"strict_replay_pacer_late_count" : @(pacerSnapshot.lateCount),
     @"strict_replay_pacer_overflow_count" :
         @(pacerSnapshot.overflowCount),
@@ -1322,6 +1343,12 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->strict_replay_pacing_added_latency_rejections),
     @"strict_replay_pacing_prearm_discards" :
         @(snapshot->strict_replay_pacing_prearm_discards),
+    @"strict_replay_pacing_rearm_count" :
+        @(snapshot->strict_replay_pacing_rearm_count),
+    @"strict_replay_pacing_rearm_prearm_discards" :
+        @(snapshot->strict_replay_pacing_rearm_prearm_discards),
+    @"strict_replay_pacing_arm_count" :
+        @(snapshot->strict_replay_pacing_arm_count),
     @"strict_replay_pacing_late_phase_corrections" :
         @(snapshot->strict_replay_pacing_late_phase_corrections),
     @"strict_replay_pacing_early_phase_corrections" :
