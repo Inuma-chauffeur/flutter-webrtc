@@ -115,7 +115,7 @@ InumaDecodeProductWatermark(CVPixelBufferRef pixelBuffer,
 FOUNDATION_EXPORT InumaDisplayedFrameIdentityLookupResult
 InumaBindProductWatermarkIdentityToContext(
     CVPixelBufferRef pixelBuffer,
-    InumaPresentationFrameContext* context);
+    InumaPresentationFrameContext* _Nullable context);
 
 // Binds a scalar source identity to its live frame context and resolves only a
 // CRC-checked watermark identity decoded from the renderer-displayed buffer.

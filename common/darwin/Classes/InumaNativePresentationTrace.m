@@ -172,7 +172,7 @@ InumaDisplayedFrameIdentityLookupResult InumaDecodeProductWatermark(
 InumaDisplayedFrameIdentityLookupResult
 InumaBindProductWatermarkIdentityToContext(
     CVPixelBufferRef pixelBuffer,
-    InumaPresentationFrameContext* context) {
+    InumaPresentationFrameContext* _Nullable context) {
   if (context == NULL) return InumaDisplayedFrameIdentityLookupInvalid;
   context->sourceIdentity = 0;
   context->sourceIdentityValid = NO;
