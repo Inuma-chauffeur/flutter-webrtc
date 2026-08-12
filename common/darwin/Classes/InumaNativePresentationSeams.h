@@ -29,6 +29,19 @@ typedef struct {
   NSUInteger queueDepthAfter;
 } InumaStrictReplayPacingDecision;
 
+typedef struct {
+  uint64_t acceptedCount;
+  uint64_t prearmDiscardCount;
+  uint64_t latePhaseCorrectionCount;
+  uint64_t earlyPhaseCorrectionCount;
+  uint64_t armedGeneration;
+  uint64_t lateCount;
+  uint64_t overflowCount;
+  uint64_t generationSequenceFailureCount;
+  uint64_t addedLatencyViolationCount;
+  NSUInteger queueDepthHighWater;
+} InumaStrictReplayPacerSnapshot;
+
 @interface InumaMonotonicClock : NSObject
 
 - (instancetype)initWithNowBlock:(InumaMonotonicClockBlock)nowBlock;
@@ -79,6 +92,7 @@ typedef struct {
                                           hostTimeClock:
                                               (nullable InumaHostTimeClockBlock)hostTimeClock;
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation;
+- (InumaStrictReplayPacerSnapshot)snapshot;
 - (void)stop;
 - (void)reset;
 

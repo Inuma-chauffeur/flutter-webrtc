@@ -332,6 +332,24 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   return value;
 }
 
+- (InumaStrictReplayPacerSnapshot)snapshot {
+  os_unfair_lock_lock(&_lock);
+  const InumaStrictReplayPacerSnapshot value = {
+      .acceptedCount = _acceptedCount,
+      .prearmDiscardCount = _prearmDiscardCount,
+      .latePhaseCorrectionCount = _latePhaseCorrectionCount,
+      .earlyPhaseCorrectionCount = _earlyPhaseCorrectionCount,
+      .armedGeneration = _armedGeneration,
+      .lateCount = _lateCount,
+      .overflowCount = _overflowCount,
+      .generationSequenceFailureCount = _generationSequenceFailureCount,
+      .addedLatencyViolationCount = _addedLatencyViolationCount,
+      .queueDepthHighWater = _queueDepthHighWater,
+  };
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
 - (uint64_t)prearmDiscardCount {
   os_unfair_lock_lock(&_lock);
   const uint64_t value = _prearmDiscardCount;

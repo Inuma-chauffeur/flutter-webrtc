@@ -20,6 +20,7 @@ enum {
   kInumaDisplayedContextCapacity = 256,
 };
 static const uint64_t kInumaStrictReplayFrameIntervalNs = 33333333;
+static const uint64_t kInumaTraceCoherentSnapshotRetryNs = 10000000;
 static const void* kInumaNativeVideoSurfaceQueueKey =
     &kInumaNativeVideoSurfaceQueueKey;
 static os_unfair_lock gInumaNativeVideoSurfaceLifecycleLock =
@@ -157,6 +158,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   uint64_t _inumaTraceStartedMonotonicNs;
   uint64_t _inumaFrameGeneration;
   uint64_t _inumaTraceSnapshotCount;
+  uint64_t _inumaCoherentSnapshotRetryCount;
   dispatch_source_t _inumaTraceTimer;
   dispatch_queue_t _inumaTraceWriterQueue;
   dispatch_source_t _inumaPresentationObserverTimer;
@@ -1104,6 +1106,10 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   if (!_inumaTrace.enabled || _inumaTracePath.length == 0) {
     return;
   }
+  const InumaStrictReplayPacerSnapshot pacerSnapshot =
+      _inumaStrictReplayPacer == nil
+          ? (InumaStrictReplayPacerSnapshot){0}
+          : [_inumaStrictReplayPacer snapshot];
   InumaNativeVideoSurfaceTrace* snapshot =
       malloc(sizeof(InumaNativeVideoSurfaceTrace));
   if (snapshot == NULL) {
@@ -1120,6 +1126,41 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   _inumaTraceSnapshotCount += 1;
   const uint64_t snapshotCount = _inumaTraceSnapshotCount;
   os_unfair_lock_unlock(&_inumaTraceLock);
+
+  const BOOL strictReplaySnapshotCoherent =
+      !_inumaStrictReplayPaced ||
+      (pacerSnapshot.acceptedCount ==
+           snapshot->strict_replay_pacing_accepted &&
+       pacerSnapshot.prearmDiscardCount ==
+           snapshot->strict_replay_pacing_prearm_discards &&
+       pacerSnapshot.latePhaseCorrectionCount ==
+           snapshot->strict_replay_pacing_late_phase_corrections &&
+       pacerSnapshot.earlyPhaseCorrectionCount ==
+           snapshot->strict_replay_pacing_early_phase_corrections &&
+       pacerSnapshot.lateCount ==
+           snapshot->strict_replay_pacing_late_rejections &&
+       pacerSnapshot.overflowCount ==
+           snapshot->strict_replay_pacing_overflow_rejections &&
+       pacerSnapshot.generationSequenceFailureCount ==
+           snapshot->strict_replay_pacing_sequence_rejections &&
+       pacerSnapshot.addedLatencyViolationCount ==
+           snapshot->strict_replay_pacing_added_latency_rejections &&
+       pacerSnapshot.acceptedCount + pacerSnapshot.prearmDiscardCount ==
+           snapshot->render_frames &&
+       snapshot->strict_replay_dispatch_submissions ==
+           pacerSnapshot.acceptedCount &&
+       snapshot->enqueue_completions == pacerSnapshot.acceptedCount &&
+       strictReplayDispatchPending == 0);
+  if (!strictReplaySnapshotCoherent && !shuttingDown) {
+    free(snapshot);
+    _inumaCoherentSnapshotRetryCount += 1;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, kInumaTraceCoherentSnapshotRetryNs),
+        _inumaTraceWriterQueue, ^{
+          [self inumaWriteNativeVideoSurfaceTraceOnWriterQueue];
+        });
+    return;
+  }
 
   const uint64_t prerendererSmoothingDisabledConfigurationCount =
       InumaPrerendererSmoothingDisabledConfigurationCount();
@@ -1170,20 +1211,20 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"strict_replay_queue_capacity" :
         @(_inumaStrictReplayPacer.queueCapacity),
     @"strict_replay_pacer_accepted_count" :
-        @(_inumaStrictReplayPacer.acceptedCount),
+        @(pacerSnapshot.acceptedCount),
     @"strict_replay_pacer_prearm_discard_count" :
-        @(_inumaStrictReplayPacer.prearmDiscardCount),
+        @(pacerSnapshot.prearmDiscardCount),
     @"strict_replay_pacer_late_phase_correction_count" :
-        @(_inumaStrictReplayPacer.latePhaseCorrectionCount),
+        @(pacerSnapshot.latePhaseCorrectionCount),
     @"strict_replay_pacer_early_phase_correction_count" :
-        @(_inumaStrictReplayPacer.earlyPhaseCorrectionCount),
+        @(pacerSnapshot.earlyPhaseCorrectionCount),
     @"strict_replay_pacer_armed_generation" :
-        @(_inumaStrictReplayPacer.armedGeneration),
-    @"strict_replay_pacer_late_count" : @(_inumaStrictReplayPacer.lateCount),
+        @(pacerSnapshot.armedGeneration),
+    @"strict_replay_pacer_late_count" : @(pacerSnapshot.lateCount),
     @"strict_replay_pacer_overflow_count" :
-        @(_inumaStrictReplayPacer.overflowCount),
+        @(pacerSnapshot.overflowCount),
     @"strict_replay_pacer_generation_sequence_failure_count" :
-        @(_inumaStrictReplayPacer.generationSequenceFailureCount),
+        @(pacerSnapshot.generationSequenceFailureCount),
     @"strict_replay_maximum_added_latency_ns" :
         @(_inumaStrictReplayPacer.maximumAddedLatencyNs),
     @"strict_replay_minimum_presentation_interval_ns" :
@@ -1199,9 +1240,9 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"strict_replay_required_stable_cadence_intervals" :
         @(_inumaStrictReplayPacer.requiredStableCadenceIntervals),
     @"strict_replay_pacer_added_latency_violation_count" :
-        @(_inumaStrictReplayPacer.addedLatencyViolationCount),
+        @(pacerSnapshot.addedLatencyViolationCount),
     @"strict_replay_pacer_queue_depth_high_water" :
-        @(_inumaStrictReplayPacer.queueDepthHighWater),
+        @(pacerSnapshot.queueDepthHighWater),
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
@@ -1217,6 +1258,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"trace_snapshot_wall_time_ns" :
         @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0)),
     @"trace_snapshot_count" : @(snapshotCount),
+    @"coherent_snapshot_retry_count" : @(_inumaCoherentSnapshotRetryCount),
     @"render_frames" : @(snapshot->render_frames),
     @"direct_pixel_buffer_frames" : @(snapshot->direct_pixel_buffer_frames),
     @"converted_pixel_buffer_frames" : @(snapshot->converted_pixel_buffer_frames),

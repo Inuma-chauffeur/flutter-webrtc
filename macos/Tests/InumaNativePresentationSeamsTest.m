@@ -207,6 +207,17 @@ int main(void) {
     INUMA_REQUIRE(paced.lateCount == 0 && paced.overflowCount == 0 &&
                   paced.generationSequenceFailureCount == 0 &&
                   paced.addedLatencyViolationCount == 0);
+    const InumaStrictReplayPacerSnapshot pacedSnapshot = [paced snapshot];
+    INUMA_REQUIRE(pacedSnapshot.armedGeneration == 11);
+    INUMA_REQUIRE(pacedSnapshot.prearmDiscardCount == 10);
+    INUMA_REQUIRE(pacedSnapshot.acceptedCount == capturedTimes.count - 10);
+    INUMA_REQUIRE(pacedSnapshot.queueDepthHighWater == 4);
+    INUMA_REQUIRE(pacedSnapshot.latePhaseCorrectionCount == 1);
+    INUMA_REQUIRE(pacedSnapshot.earlyPhaseCorrectionCount == 1);
+    INUMA_REQUIRE(pacedSnapshot.lateCount == 0 &&
+                  pacedSnapshot.overflowCount == 0 &&
+                  pacedSnapshot.generationSequenceFailureCount == 0 &&
+                  pacedSnapshot.addedLatencyViolationCount == 0);
 
     InumaStrictReplayPacer* late = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000
