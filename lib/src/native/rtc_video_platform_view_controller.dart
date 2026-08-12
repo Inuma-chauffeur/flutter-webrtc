@@ -7,6 +7,7 @@ import 'package:webrtc_interface/webrtc_interface.dart';
 
 import '../helper.dart';
 import '../video_renderer_extension.dart' show AudioControl;
+import 'media_stream_track_impl.dart';
 import 'utils.dart';
 
 class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
@@ -17,6 +18,7 @@ class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
   int? _viewId;
   bool _disposed = false;
   MediaStream? _srcObject;
+  MediaStreamTrackNative? _srcTrack;
   StreamSubscription<dynamic>? _eventSubscription;
 
   @override
@@ -53,8 +55,9 @@ class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
       throw 'Can\'t set srcObject: The RTCVideoPlatformController is disposed';
     }
     if (_viewId == null) throw 'Call initialize before setting the stream';
-    if (_srcObject == stream) return;
+    if (_srcObject == stream && _srcTrack == null) return;
     _srcObject = stream;
+    _srcTrack = null;
     onSrcObjectChange?.call();
     WebRTC.invokeMethod(
         'videoPlatformViewRendererSetSrcObject', <String, dynamic>{
@@ -76,8 +79,9 @@ class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
       throw 'Can\'t set srcObject: The RTCVideoPlatformController is disposed';
     }
     if (_viewId == null) throw 'Call initialize before setting the stream';
-    if (_srcObject == stream) return;
+    if (_srcObject == stream && _srcTrack == null) return;
     _srcObject = stream;
+    _srcTrack = null;
     onSrcObjectChange?.call();
     var oldviewId = _viewId;
     try {
@@ -93,6 +97,52 @@ class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
           : value.copyWith(renderVideo: renderVideo);
     } on PlatformException catch (e) {
       throw 'Got exception for RTCVideoPlatformController::setSrcObject: viewId $oldviewId [disposed: $_disposed] with stream ${stream?.id}, error: ${e.message}';
+    }
+  }
+
+  /// Bind the platform view directly to one native receiver track.
+  ///
+  /// Unified Plan permits a remote track event with no associated
+  /// [MediaStream]. Resolving the renderer only through a stream can therefore
+  /// leave a decoded track without a video sink. The peer-connection owner and
+  /// track id form the exact native lookup key and avoid that ambiguity.
+  Future<void> setVideoTrack(MediaStreamTrack? track) async {
+    if (_disposed) {
+      throw 'Can\'t set video track: The RTCVideoPlatformController is disposed';
+    }
+    if (_viewId == null) throw 'Call initialize before setting the video track';
+    if (track != null && track is! MediaStreamTrackNative) {
+      throw ArgumentError.value(
+        track,
+        'track',
+        'must be a native WebRTC track',
+      );
+    }
+    final nativeTrack = track as MediaStreamTrackNative?;
+    if (_srcTrack == nativeTrack && _srcObject == null) return;
+    final previousObject = _srcObject;
+    final previousTrack = _srcTrack;
+    _srcObject = null;
+    _srcTrack = nativeTrack;
+    onSrcObjectChange?.call();
+    final oldViewId = _viewId;
+    try {
+      await WebRTC.invokeMethod(
+        'videoPlatformViewRendererSetVideoTrack',
+        <String, dynamic>{
+          'viewId': _viewId,
+          'trackId': nativeTrack?.id ?? '',
+          'peerConnectionId': nativeTrack?.peerConnectionId ?? '',
+        },
+      );
+      value = nativeTrack == null
+          ? RTCVideoValue.empty
+          : value.copyWith(renderVideo: renderVideo);
+    } on PlatformException catch (error) {
+      _srcObject = previousObject;
+      _srcTrack = previousTrack;
+      throw 'Got exception for RTCVideoPlatformController::setVideoTrack: '
+          'viewId $oldViewId [disposed: $_disposed], error: ${error.message}';
     }
   }
 
@@ -146,7 +196,8 @@ class RTCVideoPlatformViewController extends ValueNotifier<RTCVideoValue>
   }
 
   @override
-  bool get renderVideo => _viewId != null && _srcObject != null;
+  bool get renderVideo =>
+      _viewId != null && (_srcObject != null || _srcTrack != null);
 
   @override
   bool get muted => _srcObject?.getAudioTracks()[0].muted ?? true;

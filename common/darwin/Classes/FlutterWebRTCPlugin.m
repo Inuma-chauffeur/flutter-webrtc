@@ -1408,6 +1408,34 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       }
       render.videoTrack = videoTrack;
       result(nil);
+  } else if ([@"videoPlatformViewRendererSetVideoTrack" isEqualToString:call.method]) {
+      NSDictionary* argsMap = call.arguments;
+      NSNumber* viewId = argsMap[@"viewId"];
+      NSString* trackId = argsMap[@"trackId"];
+      NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+      FlutterRTCVideoPlatformViewController* render = _platformViewFactory.renders[viewId];
+      if (!render) {
+        result([FlutterError errorWithCode:@"videoPlatformViewRendererSetVideoTrack: render is nil"
+                                   message:nil
+                                   details:nil]);
+        return;
+      }
+      if (trackId.length == 0) {
+        render.videoTrack = nil;
+        result(nil);
+        return;
+      }
+      RTCMediaStreamTrack* mediaTrack =
+          [self trackForId:trackId peerConnectionId:peerConnectionId];
+      if (!mediaTrack || ![mediaTrack.kind isEqualToString:@"video"] ||
+          ![mediaTrack isKindOfClass:[RTCVideoTrack class]]) {
+        result([FlutterError errorWithCode:@"videoPlatformViewRendererSetVideoTrack: track not found"
+                                   message:nil
+                                   details:nil]);
+        return;
+      }
+      render.videoTrack = (RTCVideoTrack*)mediaTrack;
+      result(nil);
   } else if ([@"videoPlatformViewRendererDispose" isEqualToString:call.method]) {
       NSDictionary* argsMap = call.arguments;
       NSNumber* viewId = argsMap[@"viewId"];
