@@ -108,6 +108,15 @@ FOUNDATION_EXPORT InumaDisplayedFrameIdentityLookupResult
 InumaDecodeProductWatermark(CVPixelBufferRef pixelBuffer,
                             InumaProductWatermarkIdentity* identity);
 
+// Replaces any local/ordinal identity assumption with the CRC-checked identity
+// decoded from this exact read-only pixel buffer. On every failure the context
+// is left fail-closed with sourceIdentityValid=NO. No pixel or pointer is
+// retained.
+FOUNDATION_EXPORT InumaDisplayedFrameIdentityLookupResult
+InumaBindProductWatermarkIdentityToContext(
+    CVPixelBufferRef pixelBuffer,
+    InumaPresentationFrameContext* context);
+
 // Binds a scalar source identity to its live frame context and resolves only a
 // CRC-checked watermark identity decoded from the renderer-displayed buffer.
 // It never stores or compares buffer pointers or retains pixel payloads.

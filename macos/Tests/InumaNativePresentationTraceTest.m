@@ -307,6 +307,21 @@ int main(void) {
                   InumaDisplayedFrameIdentityLookupChecksumMismatch);
     INUMA_REQUIRE(InumaDecodeProductWatermark(tooSmall, &decoded) ==
                   InumaDisplayedFrameIdentityLookupGeometryInvalid);
+    InumaPresentationFrameContext bound = first;
+    bound.sourceIdentity = UINT32_MAX;
+    bound.sourceIdentityValid = NO;
+    INUMA_REQUIRE(InumaBindProductWatermarkIdentityToContext(reused, &bound) ==
+                  InumaDisplayedFrameIdentityLookupFound);
+    INUMA_REQUIRE(bound.sourceIdentity == first.sourceIdentity);
+    INUMA_REQUIRE(bound.sourceIdentityValid == YES);
+    bound.sourceIdentity = UINT32_MAX;
+    bound.sourceIdentityValid = YES;
+    INUMA_REQUIRE(InumaBindProductWatermarkIdentityToContext(corrupt, &bound) ==
+                  InumaDisplayedFrameIdentityLookupChecksumMismatch);
+    INUMA_REQUIRE(bound.sourceIdentity == 0);
+    INUMA_REQUIRE(bound.sourceIdentityValid == NO);
+    INUMA_REQUIRE(InumaBindProductWatermarkIdentityToContext(reused, NULL) ==
+                  InumaDisplayedFrameIdentityLookupInvalid);
     InumaPresentationFrameContext observed = {0};
     INUMA_REQUIRE([identity registerContext:first]);
     INUMA_REQUIRE(

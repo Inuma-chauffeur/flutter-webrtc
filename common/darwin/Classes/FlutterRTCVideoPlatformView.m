@@ -61,6 +61,13 @@ typedef struct {
   uint64_t strict_replay_dispatch_overflow_rejections;
   uint64_t strict_replay_dispatch_depth_high_water;
   uint64_t shutdown_count;
+  uint64_t display_identity_context_binding_attempts;
+  uint64_t display_identity_context_binding_successes;
+  uint64_t display_identity_context_binding_failures;
+  uint64_t display_identity_context_binding_total_duration_ns;
+  uint64_t display_identity_context_binding_maximum_duration_ns;
+  uint64_t display_identity_context_binding_durations_over_250us;
+  uint64_t display_identity_context_binding_durations_over_1ms;
   uint64_t display_identity_context_registrations;
   uint64_t display_identity_context_registration_failures;
   uint64_t display_identity_watermark_reads;
@@ -348,10 +355,6 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     os_unfair_lock_unlock(&_inumaTraceLock);
     frameContext.renderOrdinal = frameGeneration - 1;
     frameContext.nativeGeneration = frameGeneration;
-    if (_inumaStrictReplayPaced) {
-      frameContext.sourceIdentity = frameContext.renderOrdinal;
-      frameContext.sourceIdentityValid = YES;
-    }
     frameContext.rtpTimestamp = (uint64_t)(uint32_t)frame.timeStamp;
     frameContext.timingPolicy = _inumaStrictReplayPaced
                                     ? InumaPresentationTimingValidHostPTS
@@ -515,6 +518,34 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   }
 #else
   CMSampleBufferRef sampleBuffer = [self sampleBufferFromPixelBuffer:pixelBuffer];
+#endif
+#if TARGET_OS_OSX
+  if (_inumaStrictReplayPaced && sampleBuffer != nil) {
+    const uint64_t bindingStartedAt =
+        InumaNativeSurfaceMonotonicNanoseconds();
+    const InumaDisplayedFrameIdentityLookupResult binding =
+        InumaBindProductWatermarkIdentityToContext(pixelBuffer, &frameContext);
+    const uint64_t bindingDurationNs =
+        InumaNativeSurfaceMonotonicNanoseconds() - bindingStartedAt;
+    if (_inumaTrace.enabled) {
+      os_unfair_lock_lock(&_inumaTraceLock);
+      _inumaTrace.display_identity_context_binding_attempts += 1;
+      _inumaTrace.display_identity_context_binding_successes +=
+          binding == InumaDisplayedFrameIdentityLookupFound ? 1 : 0;
+      _inumaTrace.display_identity_context_binding_failures +=
+          binding == InumaDisplayedFrameIdentityLookupFound ? 0 : 1;
+      _inumaTrace.display_identity_context_binding_total_duration_ns +=
+          bindingDurationNs;
+      _inumaTrace.display_identity_context_binding_maximum_duration_ns =
+          MAX(_inumaTrace.display_identity_context_binding_maximum_duration_ns,
+              bindingDurationNs);
+      _inumaTrace.display_identity_context_binding_durations_over_250us +=
+          bindingDurationNs > 250000 ? 1 : 0;
+      _inumaTrace.display_identity_context_binding_durations_over_1ms +=
+          bindingDurationNs > 1000000 ? 1 : 0;
+      os_unfair_lock_unlock(&_inumaTraceLock);
+    }
+  }
 #endif
   CFRelease(pixelBuffer);
 
@@ -1177,7 +1208,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     @"frame_identity_contract" :
         @"crc16_product_watermark_frame_identity_joined_to_renderer_local_context",
     @"display_identity_binding_contract" :
-        @"crc16_product_watermark_decoded_from_renderer_displayed_pixel_buffer_with_source_identity_keyed_context_no_pointer_identity_no_pixel_retention",
+        @"crc16_product_watermark_decoded_from_each_accepted_input_pixel_buffer_then_resolved_from_renderer_displayed_pixel_buffer_with_source_identity_keyed_context_no_ordinal_assumption_no_pointer_identity_no_pixel_retention",
+    @"display_identity_context_binding_version" : @2,
     @"sample_capacity" : @(kInumaNativeVideoSurfaceTraceCapacity),
     @"sample_capacity_exhaustions" : @(snapshot->capacity_exhaustions),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
@@ -1231,6 +1263,20 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(snapshot->strict_replay_dispatch_depth_high_water),
     @"strict_replay_dispatch_pending" : @(strictReplayDispatchPending),
     @"shutdown_count" : @(snapshot->shutdown_count),
+    @"display_identity_context_binding_attempts" :
+        @(snapshot->display_identity_context_binding_attempts),
+    @"display_identity_context_binding_successes" :
+        @(snapshot->display_identity_context_binding_successes),
+    @"display_identity_context_binding_failures" :
+        @(snapshot->display_identity_context_binding_failures),
+    @"display_identity_context_binding_total_duration_ns" :
+        @(snapshot->display_identity_context_binding_total_duration_ns),
+    @"display_identity_context_binding_maximum_duration_ns" :
+        @(snapshot->display_identity_context_binding_maximum_duration_ns),
+    @"display_identity_context_binding_durations_over_250us" :
+        @(snapshot->display_identity_context_binding_durations_over_250us),
+    @"display_identity_context_binding_durations_over_1ms" :
+        @(snapshot->display_identity_context_binding_durations_over_1ms),
     @"display_identity_context_registrations" :
         @(snapshot->display_identity_context_registrations),
     @"display_identity_context_registration_failures" :

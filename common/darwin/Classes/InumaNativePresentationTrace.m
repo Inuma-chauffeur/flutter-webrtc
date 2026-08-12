@@ -169,6 +169,23 @@ InumaDisplayedFrameIdentityLookupResult InumaDecodeProductWatermark(
   return InumaDisplayedFrameIdentityLookupFound;
 }
 
+InumaDisplayedFrameIdentityLookupResult
+InumaBindProductWatermarkIdentityToContext(
+    CVPixelBufferRef pixelBuffer,
+    InumaPresentationFrameContext* context) {
+  if (context == NULL) return InumaDisplayedFrameIdentityLookupInvalid;
+  context->sourceIdentity = 0;
+  context->sourceIdentityValid = NO;
+  InumaProductWatermarkIdentity identity = {0};
+  const InumaDisplayedFrameIdentityLookupResult result =
+      InumaDecodeProductWatermark(pixelBuffer, &identity);
+  if (result == InumaDisplayedFrameIdentityLookupFound) {
+    context->sourceIdentity = identity.frameIdentity;
+    context->sourceIdentityValid = YES;
+  }
+  return result;
+}
+
 @implementation InumaDisplayedFrameIdentityLedger {
   os_unfair_lock _lock;
   InumaDisplayedFrameIdentityEntry* _entries;
