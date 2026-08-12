@@ -5,6 +5,7 @@
 #import <WebRTC/RTCI420Buffer.h>
 #import <WebRTC/RTCYUVHelper.h>
 #import <os/lock.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -21,6 +22,7 @@ enum {
 };
 static const uint64_t kInumaStrictReplayFrameIntervalNs = 33333333;
 static const uint64_t kInumaTraceCoherentSnapshotRetryNs = 10000000;
+static const NSUInteger kInumaTraceMaximumCoherentSnapshotRetries = 3;
 static const void* kInumaNativeVideoSurfaceQueueKey =
     &kInumaNativeVideoSurfaceQueueKey;
 static os_unfair_lock gInumaNativeVideoSurfaceLifecycleLock =
@@ -284,7 +286,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
           5 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
       __weak FlutterRTCVideoPlatformView* weakSelf = self;
       dispatch_source_set_event_handler(_inumaTraceTimer, ^{
-        [weakSelf inumaWriteNativeVideoSurfaceTraceOnWriterQueue];
+        [weakSelf inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
       });
       dispatch_resume(_inumaTraceTimer);
     }
@@ -1098,11 +1100,12 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
 - (void)inumaWriteNativeVideoSurfaceTrace {
   if (_inumaTraceWriterQueue == nil) return;
   dispatch_async(_inumaTraceWriterQueue, ^{
-    [self inumaWriteNativeVideoSurfaceTraceOnWriterQueue];
+    [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
   });
 }
 
-- (void)inumaWriteNativeVideoSurfaceTraceOnWriterQueue {
+- (void)inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:
+    (NSUInteger)retryAttempt {
   if (!_inumaTrace.enabled || _inumaTracePath.length == 0) {
     return;
   }
@@ -1151,13 +1154,15 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
            pacerSnapshot.acceptedCount &&
        snapshot->enqueue_completions == pacerSnapshot.acceptedCount &&
        strictReplayDispatchPending == 0);
-  if (!strictReplaySnapshotCoherent && !shuttingDown) {
+  if (!strictReplaySnapshotCoherent && !shuttingDown &&
+      retryAttempt < kInumaTraceMaximumCoherentSnapshotRetries) {
     free(snapshot);
     _inumaCoherentSnapshotRetryCount += 1;
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, kInumaTraceCoherentSnapshotRetryNs),
         _inumaTraceWriterQueue, ^{
-          [self inumaWriteNativeVideoSurfaceTraceOnWriterQueue];
+          [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:
+                    retryAttempt + 1];
         });
     return;
   }
@@ -1188,7 +1193,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   }
   NSDictionary* report = @{
     @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v5",
-    @"status" : @"pass",
+    @"status" : strictReplaySnapshotCoherent ? @"pass" : @"fail",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
         (_inumaStrictReplayPaced
@@ -1401,7 +1406,13 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
                                                  options:0
                                                    error:&error];
   if (data != nil && error == nil) {
-    [data writeToFile:_inumaTracePath options:NSDataWritingAtomic error:&error];
+    if (![data writeToFile:_inumaTracePath
+                   options:NSDataWritingAtomic
+                     error:&error]) {
+      fprintf(stderr, "INUMA_NATIVE_SURFACE_TRACE_WRITE_FAILED\n");
+    }
+  } else {
+    fprintf(stderr, "INUMA_NATIVE_SURFACE_TRACE_SERIALIZATION_FAILED\n");
   }
   free(snapshot);
 }
@@ -1485,7 +1496,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   }
   if (_inumaTraceWriterQueue != nil) {
     dispatch_sync(_inumaTraceWriterQueue, ^{
-      [self inumaWriteNativeVideoSurfaceTraceOnWriterQueue];
+      [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
     });
   }
 }
