@@ -1377,23 +1377,22 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   const uint64_t snapshotAt = InumaNativeSurfaceMonotonicNanoseconds();
   const uint64_t snapshotWallTimeNs =
       (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0);
+  BOOL pendingSamplePresent = NO;
+  BOOL drainScheduled = NO;
+  NSUInteger strictReplayDispatchPending = 0;
+  BOOL shuttingDown = NO;
+  BOOL rendererPerformanceMetricRequestPending = NO;
+  BOOL strictReplaySnapshotCoherent = NO;
   os_unfair_lock_lock(&_inumaTraceLock);
   memcpy(snapshot, &_inumaTrace, sizeof(InumaNativeVideoSurfaceTrace));
-  if (_inumaSegmentedEvidenceEnabled) {
-    _inumaTrace.render_event_count = 0;
-    _inumaTrace.enqueue_event_count = 0;
-  }
-  const BOOL pendingSamplePresent = _inumaPendingSampleBuffer != nil;
-  const BOOL drainScheduled = _inumaDrainScheduled;
-  const NSUInteger strictReplayDispatchPending =
-      _inumaStrictReplayDispatchPending;
-  const BOOL shuttingDown = _inumaShuttingDown;
-  const BOOL rendererPerformanceMetricRequestPending =
+  pendingSamplePresent = _inumaPendingSampleBuffer != nil;
+  drainScheduled = _inumaDrainScheduled;
+  strictReplayDispatchPending = _inumaStrictReplayDispatchPending;
+  shuttingDown = _inumaShuttingDown;
+  rendererPerformanceMetricRequestPending =
       _inumaRendererPerformanceMetricRequestPending;
   _inumaTraceSnapshotCount += 1;
   const uint64_t snapshotCount = _inumaTraceSnapshotCount;
-  os_unfair_lock_unlock(&_inumaTraceLock);
-
   const uint64_t pacingDecisionTerminalCount =
       pacerSnapshot.acceptedCount + pacerSnapshot.prearmDiscardCount +
       pacerSnapshot.lateCount + pacerSnapshot.overflowCount +
@@ -1402,7 +1401,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   const uint64_t pixelBufferSuccessCount =
       snapshot->direct_pixel_buffer_frames +
       snapshot->converted_pixel_buffer_frames;
-  const BOOL strictReplaySnapshotCoherent =
+  strictReplaySnapshotCoherent =
       !_inumaStrictReplayPaced ||
       (pacerSnapshot.acceptedCount ==
            snapshot->strict_replay_pacing_accepted &&
@@ -1454,8 +1453,20 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
            snapshot->enqueue_attempts +
                snapshot->strict_replay_dispatch_late_rejections &&
        snapshot->enqueue_completions <= snapshot->enqueue_attempts);
+  const BOOL coherentRetryAvailable =
+      !strictReplaySnapshotCoherent && !shuttingDown &&
+      retryAttempt < kInumaTraceMaximumCoherentSnapshotRetries;
+  if (_inumaSegmentedEvidenceEnabled && !coherentRetryAvailable) {
+    // Drain the scalar arrays only at the same locked linearization point as
+    // the snapshot that will be published.  In-flight pacer-to-dispatch work
+    // is retried first, so an ordinary asynchronous handoff cannot invalidate
+    // a periodic segment or erase events appended after its snapshot.
+    _inumaTrace.render_event_count = 0;
+    _inumaTrace.enqueue_event_count = 0;
+  }
+  os_unfair_lock_unlock(&_inumaTraceLock);
+
   if (!strictReplaySnapshotCoherent && !shuttingDown &&
-      !_inumaSegmentedEvidenceEnabled &&
       retryAttempt < kInumaTraceMaximumCoherentSnapshotRetries) {
     free(snapshot);
     _inumaCoherentSnapshotRetryCount += 1;
