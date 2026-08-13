@@ -114,6 +114,9 @@ static const uint64_t kInumaStrictReplayStableCadenceIntervalMinimumNs =
 static const uint64_t kInumaStrictReplayStableCadenceIntervalMaximumNs =
     42000000;
 static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
+static const uint64_t kInumaDisplayRefreshPeriodMinimumNs = 8000000;
+static const uint64_t kInumaDisplayRefreshPeriodMaximumNs = 25000000;
+static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
 
 @implementation InumaStrictReplayPacer {
   os_unfair_lock _lock;
@@ -141,6 +144,16 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   uint64_t _overflowCount;
   uint64_t _generationSequenceFailureCount;
   uint64_t _addedLatencyViolationCount;
+  uint64_t _displayPhaseTimestampNs;
+  uint64_t _displayPhaseTargetTimeNs;
+  uint64_t _displayRefreshPeriodNs;
+  uint64_t _displayPhaseUpdateCount;
+  uint64_t _displayPhaseAlignmentCount;
+  uint64_t _displayPhaseFallbackCount;
+  uint64_t _lastAlignedDisplayPhaseTimestampNs;
+  uint64_t _lastAlignedDisplayPhaseTargetTimeNs;
+  uint64_t _lastAlignedDisplayRefreshPeriodNs;
+  uint64_t _lastAlignedDisplaySafetyLeadNs;
   NSUInteger _queueDepthHighWater;
 }
 
@@ -212,6 +225,84 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
   }
 }
 
+- (BOOL)updateDisplayPhaseTimestampNs:(uint64_t)timestampNs
+                         targetTimeNs:(uint64_t)targetTimeNs
+                      refreshPeriodNs:(uint64_t)refreshPeriodNs {
+  if (timestampNs == 0 || targetTimeNs <= timestampNs ||
+      refreshPeriodNs < kInumaDisplayRefreshPeriodMinimumNs ||
+      refreshPeriodNs > kInumaDisplayRefreshPeriodMaximumNs ||
+      targetTimeNs - timestampNs > refreshPeriodNs * 2) {
+    return NO;
+  }
+  os_unfair_lock_lock(&_lock);
+  if (_stopped || timestampNs <= _displayPhaseTimestampNs ||
+      targetTimeNs <= _displayPhaseTargetTimeNs) {
+    os_unfair_lock_unlock(&_lock);
+    return NO;
+  }
+  _displayPhaseTimestampNs = timestampNs;
+  _displayPhaseTargetTimeNs = targetTimeNs;
+  _displayRefreshPeriodNs = refreshPeriodNs;
+  _displayPhaseUpdateCount += 1;
+  os_unfair_lock_unlock(&_lock);
+  return YES;
+}
+
+- (BOOL)alignInitialPresentationTimeLockedFromArrivalNs:(uint64_t)arrivedAtNs
+                                            idealTimeNs:(uint64_t)idealTimeNs
+                                               decision:
+                                                   (InumaStrictReplayPacingDecision*)decision
+                                         alignedTimeNs:(uint64_t*)alignedTimeNs {
+  const uint64_t targetTimeNs = _displayPhaseTargetTimeNs;
+  const uint64_t refreshPeriodNs = _displayRefreshPeriodNs;
+  if (_displayPhaseTimestampNs == 0 || targetTimeNs == 0 ||
+      refreshPeriodNs < kInumaDisplayRefreshPeriodMinimumNs ||
+      refreshPeriodNs > kInumaDisplayRefreshPeriodMaximumNs ||
+      arrivedAtNs < _displayPhaseTimestampNs ||
+      arrivedAtNs - _displayPhaseTimestampNs >
+          kInumaDisplayPhaseMaximumAgeNs) {
+    return NO;
+  }
+
+  const uint64_t safetyLeadNs = refreshPeriodNs / 2;
+  if (safetyLeadNs == 0 || targetTimeNs <= safetyLeadNs) {
+    return NO;
+  }
+  uint64_t candidateNs = targetTimeNs - safetyLeadNs;
+  if (candidateNs > idealTimeNs) {
+    const uint64_t distanceNs = candidateNs - idealTimeNs;
+    const uint64_t periods =
+        distanceNs / refreshPeriodNs +
+        (distanceNs % refreshPeriodNs == 0 ? 0 : 1);
+    if (periods > candidateNs / refreshPeriodNs) {
+      return NO;
+    }
+    candidateNs -= periods * refreshPeriodNs;
+  } else {
+    const uint64_t periods = (idealTimeNs - candidateNs) / refreshPeriodNs;
+    if (periods > (UINT64_MAX - candidateNs) / refreshPeriodNs) {
+      return NO;
+    }
+    candidateNs += periods * refreshPeriodNs;
+  }
+
+  if (UINT64_MAX - arrivedAtNs < kInumaStrictReplayMinimumPresentationLeadNs ||
+      candidateNs < arrivedAtNs + kInumaStrictReplayMinimumPresentationLeadNs ||
+      candidateNs > idealTimeNs) {
+    return NO;
+  }
+  if (candidateNs > UINT64_MAX - safetyLeadNs) {
+    return NO;
+  }
+  decision->displayPhaseAligned = YES;
+  decision->displayPhaseTimestampNs = _displayPhaseTimestampNs;
+  decision->displayPhaseTargetTimeNs = candidateNs + safetyLeadNs;
+  decision->displayRefreshPeriodNs = refreshPeriodNs;
+  decision->displaySafetyLeadNs = safetyLeadNs;
+  *alignedTimeNs = candidateNs;
+  return YES;
+}
+
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation {
   InumaStrictReplayPacingDecision decision = {0};
   const uint64_t arrivedAtNs = _hostTimeClock();
@@ -269,7 +360,21 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
       os_unfair_lock_unlock(&_lock);
       return decision;
     }
-    scheduledAtNs = arrivedAtNs + _presentationReserveNs;
+    const uint64_t idealAtNs = arrivedAtNs + _presentationReserveNs;
+    scheduledAtNs = idealAtNs;
+    if ([self alignInitialPresentationTimeLockedFromArrivalNs:arrivedAtNs
+                                                  idealTimeNs:idealAtNs
+                                                     decision:&decision
+                                               alignedTimeNs:&scheduledAtNs]) {
+      _displayPhaseAlignmentCount += 1;
+      _lastAlignedDisplayPhaseTimestampNs = decision.displayPhaseTimestampNs;
+      _lastAlignedDisplayPhaseTargetTimeNs =
+          decision.displayPhaseTargetTimeNs;
+      _lastAlignedDisplayRefreshPeriodNs = decision.displayRefreshPeriodNs;
+      _lastAlignedDisplaySafetyLeadNs = decision.displaySafetyLeadNs;
+    } else {
+      _displayPhaseFallbackCount += 1;
+    }
     decision.timelineStarted = YES;
   } else {
     if (UINT64_MAX - _lastScheduledPresentationTimeNs < _frameIntervalNs ||
@@ -400,6 +505,19 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
       .overflowCount = _overflowCount,
       .generationSequenceFailureCount = _generationSequenceFailureCount,
       .addedLatencyViolationCount = _addedLatencyViolationCount,
+      .displayPhaseUpdateCount = _displayPhaseUpdateCount,
+      .displayPhaseAlignmentCount = _displayPhaseAlignmentCount,
+      .displayPhaseFallbackCount = _displayPhaseFallbackCount,
+      .displayPhaseTimestampNs = _displayPhaseTimestampNs,
+      .displayPhaseTargetTimeNs = _displayPhaseTargetTimeNs,
+      .displayRefreshPeriodNs = _displayRefreshPeriodNs,
+      .lastAlignedDisplayPhaseTimestampNs =
+          _lastAlignedDisplayPhaseTimestampNs,
+      .lastAlignedDisplayPhaseTargetTimeNs =
+          _lastAlignedDisplayPhaseTargetTimeNs,
+      .lastAlignedDisplayRefreshPeriodNs =
+          _lastAlignedDisplayRefreshPeriodNs,
+      .lastAlignedDisplaySafetyLeadNs = _lastAlignedDisplaySafetyLeadNs,
       .queueDepthHighWater = _queueDepthHighWater,
   };
   os_unfair_lock_unlock(&_lock);
@@ -510,6 +628,76 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
 - (uint64_t)addedLatencyViolationCount {
   os_unfair_lock_lock(&_lock);
   const uint64_t value = _addedLatencyViolationCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayPhaseUpdateCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayPhaseUpdateCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayPhaseAlignmentCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayPhaseAlignmentCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayPhaseFallbackCount {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayPhaseFallbackCount;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayPhaseTimestampNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayPhaseTimestampNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayPhaseTargetTimeNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayPhaseTargetTimeNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)displayRefreshPeriodNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _displayRefreshPeriodNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)lastAlignedDisplayPhaseTimestampNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _lastAlignedDisplayPhaseTimestampNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)lastAlignedDisplayPhaseTargetTimeNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _lastAlignedDisplayPhaseTargetTimeNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)lastAlignedDisplayRefreshPeriodNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _lastAlignedDisplayRefreshPeriodNs;
+  os_unfair_lock_unlock(&_lock);
+  return value;
+}
+
+- (uint64_t)lastAlignedDisplaySafetyLeadNs {
+  os_unfair_lock_lock(&_lock);
+  const uint64_t value = _lastAlignedDisplaySafetyLeadNs;
   os_unfair_lock_unlock(&_lock);
   return value;
 }

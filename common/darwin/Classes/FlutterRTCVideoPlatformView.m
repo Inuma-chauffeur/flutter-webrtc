@@ -5,6 +5,7 @@
 #import <WebRTC/RTCI420Buffer.h>
 #import <WebRTC/RTCYUVHelper.h>
 #import <os/lock.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -68,6 +69,23 @@ typedef struct {
   uint64_t strict_replay_dispatch_late_rejections;
   uint64_t strict_replay_dispatch_overflow_rejections;
   uint64_t strict_replay_dispatch_depth_high_water;
+  uint64_t strict_replay_display_link_callbacks;
+  uint64_t strict_replay_display_phase_updates;
+  uint64_t strict_replay_display_phase_rejections;
+  uint64_t strict_replay_last_display_timestamp_ns;
+  uint64_t strict_replay_last_display_target_time_ns;
+  uint64_t strict_replay_last_display_refresh_period_ns;
+  uint64_t renderer_performance_metric_request_count;
+  uint64_t renderer_performance_metric_callback_count;
+  uint64_t renderer_performance_metric_snapshot_count;
+  uint64_t renderer_performance_metric_nil_count;
+  uint64_t renderer_performance_metric_invalid_count;
+  uint64_t renderer_performance_metric_total_frames;
+  uint64_t renderer_performance_metric_dropped_frames;
+  uint64_t renderer_performance_metric_corrupted_frames;
+  uint64_t renderer_performance_metric_optimized_compositing_frames;
+  uint64_t renderer_performance_metric_total_accumulated_delay_ns;
+  uint64_t renderer_performance_metric_last_snapshot_monotonic_ns;
   uint64_t shutdown_count;
   uint64_t display_identity_context_binding_attempts;
   uint64_t display_identity_context_binding_successes;
@@ -116,6 +134,14 @@ static uint64_t InumaNativeSurfaceHostTimeNanoseconds(void) {
              : 0;
 }
 
+static uint64_t InumaFiniteSecondsToNanoseconds(CFTimeInterval value) {
+  if (!isfinite(value) || value <= 0.0 ||
+      value >= ((CFTimeInterval)UINT64_MAX / 1000000000.0)) {
+    return 0;
+  }
+  return (uint64_t)(value * 1000000000.0 + 0.5);
+}
+
 static uint64_t InumaStrictReplayReserveNanoseconds(
     NSDictionary<NSString*, NSString*>* environment) {
   NSString* raw = environment[
@@ -150,6 +176,36 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
 }
 #endif
 
+#if TARGET_OS_OSX
+typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
+
+@interface InumaPresentationDisplayLinkTarget : NSObject
+
+- (instancetype)initWithHandler:(InumaPresentationDisplayLinkHandler)handler;
+- (void)displayLinkDidFire:(id)displayLink;
+
+@end
+
+
+@implementation InumaPresentationDisplayLinkTarget {
+  InumaPresentationDisplayLinkHandler _handler;
+}
+
+- (instancetype)initWithHandler:(InumaPresentationDisplayLinkHandler)handler {
+  self = [super init];
+  if (self) {
+    _handler = [handler copy];
+  }
+  return self;
+}
+
+- (void)displayLinkDidFire:(id)displayLink {
+  _handler(displayLink);
+}
+
+@end
+#endif
+
 @implementation FlutterRTCVideoPlatformView {
   AVSampleBufferDisplayLayer* _videoLayer;
   dispatch_queue_t _sampleBufferQueue;
@@ -170,6 +226,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   dispatch_queue_t _inumaTraceWriterQueue;
   dispatch_source_t _inumaPresentationObserverTimer;
   dispatch_queue_t _inumaPresentationObserverQueue;
+  id _inumaPresentationDisplayLink;
+  InumaPresentationDisplayLinkTarget* _inumaPresentationDisplayLinkTarget;
   InumaDisplayedFrameIdentityLedger* _inumaDisplayedIdentityLedger;
   uint64_t _inumaLastObservedNativeGeneration;
   BOOL _inumaHasLastObservedNativeGeneration;
@@ -178,6 +236,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   BOOL _inumaNativeSurfaceSelected;
   BOOL _inumaStrictReplayPaced;
   uint64_t _inumaStrictReplayReserveNs;
+  BOOL _inumaRendererPerformanceMetricRequestPending;
   BOOL _inumaSurfaceRegistered;
   BOOL _inumaDrainScheduled;
   NSUInteger _inumaStrictReplayDispatchPending;
@@ -291,6 +350,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
           5 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
       __weak FlutterRTCVideoPlatformView* weakSelf = self;
       dispatch_source_set_event_handler(_inumaTraceTimer, ^{
+        [weakSelf inumaRequestRendererPerformanceMetrics];
         [weakSelf inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
       });
       dispatch_resume(_inumaTraceTimer);
@@ -322,6 +382,15 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
 #elif TARGET_OS_OSX
 - (BOOL)isOpaque {
   return NO;
+}
+
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  if (self.window == nil) {
+    [self inumaStopPresentationDisplayLink];
+  } else {
+    [self inumaStartPresentationDisplayLink];
+  }
 }
 
 - (void)layout {
@@ -1012,6 +1081,143 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   os_unfair_lock_unlock(&_inumaTraceLock);
 }
 
+- (void)inumaStartPresentationDisplayLink {
+  if (!_inumaStrictReplayPaced || _inumaStrictReplayPacer == nil ||
+      _inumaPresentationDisplayLink != nil) {
+    return;
+  }
+  if (@available(macOS 14.0, *)) {
+    NSScreen* screen = self.window.screen ?: NSScreen.mainScreen ?:
+        NSScreen.screens.firstObject;
+    if (screen == nil) return;
+    __weak FlutterRTCVideoPlatformView* weakSelf = self;
+    InumaPresentationDisplayLinkTarget* target =
+        [[InumaPresentationDisplayLinkTarget alloc]
+            initWithHandler:^(id displayLink) {
+              [weakSelf inumaPresentationDisplayLinkDidFire:
+                            (CADisplayLink*)displayLink];
+            }];
+    CADisplayLink* displayLink =
+        [screen displayLinkWithTarget:target
+                            selector:@selector(displayLinkDidFire:)];
+    if (displayLink == nil) return;
+    _inumaPresentationDisplayLinkTarget = target;
+    _inumaPresentationDisplayLink = displayLink;
+    [displayLink addToRunLoop:NSRunLoop.mainRunLoop
+                      forMode:NSRunLoopCommonModes];
+  }
+}
+
+- (void)inumaStopPresentationDisplayLink {
+  id displayLink = _inumaPresentationDisplayLink;
+  _inumaPresentationDisplayLink = nil;
+  _inumaPresentationDisplayLinkTarget = nil;
+  [displayLink invalidate];
+}
+
+- (void)inumaPresentationDisplayLinkDidFire:(CADisplayLink*)displayLink
+    API_AVAILABLE(macos(14.0)) {
+  const uint64_t timestampNs =
+      InumaFiniteSecondsToNanoseconds(displayLink.timestamp);
+  const uint64_t targetTimeNs =
+      InumaFiniteSecondsToNanoseconds(displayLink.targetTimestamp);
+  const uint64_t refreshPeriodNs =
+      InumaFiniteSecondsToNanoseconds(displayLink.duration);
+  const BOOL accepted =
+      [_inumaStrictReplayPacer updateDisplayPhaseTimestampNs:timestampNs
+                                                targetTimeNs:targetTimeNs
+                                             refreshPeriodNs:refreshPeriodNs];
+  if (_inumaTrace.enabled) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    _inumaTrace.strict_replay_display_link_callbacks += 1;
+    _inumaTrace.strict_replay_display_phase_updates += accepted ? 1 : 0;
+    _inumaTrace.strict_replay_display_phase_rejections += accepted ? 0 : 1;
+    if (accepted) {
+      _inumaTrace.strict_replay_last_display_timestamp_ns = timestampNs;
+      _inumaTrace.strict_replay_last_display_target_time_ns = targetTimeNs;
+      _inumaTrace.strict_replay_last_display_refresh_period_ns =
+          refreshPeriodNs;
+    }
+    os_unfair_lock_unlock(&_inumaTraceLock);
+  }
+}
+
+- (void)inumaRequestRendererPerformanceMetrics {
+  if (!_inumaTrace.enabled || !_inumaNativeSurfaceSelected ||
+      !_inumaStrictReplayPaced) {
+    return;
+  }
+  if (@available(macOS 14.4, *)) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    if (_inumaShuttingDown || _inumaRendererPerformanceMetricRequestPending) {
+      os_unfair_lock_unlock(&_inumaTraceLock);
+      return;
+    }
+    _inumaRendererPerformanceMetricRequestPending = YES;
+    _inumaTrace.renderer_performance_metric_request_count += 1;
+    os_unfair_lock_unlock(&_inumaTraceLock);
+
+    __weak FlutterRTCVideoPlatformView* weakSelf = self;
+    [_videoLayer.sampleBufferRenderer
+        loadVideoPerformanceMetricsWithCompletionHandler:
+            ^(AVVideoPerformanceMetrics* metrics) {
+              FlutterRTCVideoPlatformView* strongSelf = weakSelf;
+              if (strongSelf == nil) return;
+              const NSInteger totalFrames = metrics.totalNumberOfFrames;
+              const NSInteger droppedFrames = metrics.numberOfDroppedFrames;
+              const NSInteger corruptedFrames = metrics.numberOfCorruptedFrames;
+              const NSInteger optimizedFrames =
+                  metrics.numberOfFramesDisplayedUsingOptimizedCompositing;
+              const NSTimeInterval accumulatedDelay =
+                  metrics.totalAccumulatedFrameDelay;
+              const uint64_t accumulatedDelayNs =
+                  metrics == nil
+                      ? 0
+                      : InumaFiniteSecondsToNanoseconds(accumulatedDelay);
+              const BOOL metricsValid =
+                  metrics != nil && totalFrames >= 0 && droppedFrames >= 0 &&
+                  corruptedFrames >= 0 && optimizedFrames >= 0 &&
+                  droppedFrames <= totalFrames &&
+                  corruptedFrames <= totalFrames &&
+                  optimizedFrames <= totalFrames &&
+                  isfinite(accumulatedDelay) && accumulatedDelay >= 0.0 &&
+                  (accumulatedDelay == 0.0 || accumulatedDelayNs > 0);
+              os_unfair_lock_lock(&strongSelf->_inumaTraceLock);
+              strongSelf->_inumaRendererPerformanceMetricRequestPending = NO;
+              strongSelf->_inumaTrace.renderer_performance_metric_callback_count +=
+                  1;
+              if (metrics == nil) {
+                strongSelf->_inumaTrace.renderer_performance_metric_nil_count +=
+                    1;
+              } else if (!metricsValid) {
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_invalid_count += 1;
+              } else {
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_snapshot_count += 1;
+                strongSelf->_inumaTrace.renderer_performance_metric_total_frames =
+                    (uint64_t)totalFrames;
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_dropped_frames =
+                    (uint64_t)droppedFrames;
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_corrupted_frames =
+                    (uint64_t)corruptedFrames;
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_optimized_compositing_frames =
+                    (uint64_t)optimizedFrames;
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_total_accumulated_delay_ns =
+                    accumulatedDelayNs;
+                strongSelf->_inumaTrace
+                    .renderer_performance_metric_last_snapshot_monotonic_ns =
+                    InumaNativeSurfaceMonotonicNanoseconds();
+              }
+              os_unfair_lock_unlock(&strongSelf->_inumaTraceLock);
+            }];
+  }
+}
+
 - (void)inumaRegisterDisplayedContext:(InumaPresentationFrameContext)context {
   const BOOL registered =
       [_inumaDisplayedIdentityLedger registerContext:context];
@@ -1156,6 +1362,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   const NSUInteger strictReplayDispatchPending =
       _inumaStrictReplayDispatchPending;
   const BOOL shuttingDown = _inumaShuttingDown;
+  const BOOL rendererPerformanceMetricRequestPending =
+      _inumaRendererPerformanceMetricRequestPending;
   _inumaTraceSnapshotCount += 1;
   const uint64_t snapshotCount = _inumaTraceSnapshotCount;
   os_unfair_lock_unlock(&_inumaTraceLock);
@@ -1192,6 +1400,19 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
            snapshot->strict_replay_pacing_sequence_rejections &&
        pacerSnapshot.addedLatencyViolationCount ==
            snapshot->strict_replay_pacing_added_latency_rejections &&
+       pacerSnapshot.displayPhaseUpdateCount ==
+           snapshot->strict_replay_display_phase_updates &&
+       pacerSnapshot.displayPhaseTimestampNs ==
+           snapshot->strict_replay_last_display_timestamp_ns &&
+       pacerSnapshot.displayPhaseTargetTimeNs ==
+           snapshot->strict_replay_last_display_target_time_ns &&
+       pacerSnapshot.displayRefreshPeriodNs ==
+           snapshot->strict_replay_last_display_refresh_period_ns &&
+       snapshot->strict_replay_display_link_callbacks ==
+           snapshot->strict_replay_display_phase_updates +
+               snapshot->strict_replay_display_phase_rejections &&
+       pacerSnapshot.displayPhaseAlignmentCount == pacerSnapshot.armCount &&
+       pacerSnapshot.displayPhaseFallbackCount == 0 &&
        snapshot->strict_replay_pacing_late_rejections ==
            snapshot->strict_replay_pacing_pacer_late_rejections +
                snapshot->strict_replay_dispatch_late_rejections &&
@@ -1245,7 +1466,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v9",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v10",
     @"status" : strictReplaySnapshotCoherent ? @"pass" : @"fail",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1305,6 +1526,59 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(_inumaStrictReplayPacer.requiredStableCadenceIntervals),
     @"strict_replay_pacer_added_latency_violation_count" :
         @(pacerSnapshot.addedLatencyViolationCount),
+    @"strict_replay_display_phase_policy" :
+        (_inumaStrictReplayPaced ? @"display_link_half_refresh_lead"
+                                 : @"disabled"),
+    @"strict_replay_display_link_callbacks" :
+        @(snapshot->strict_replay_display_link_callbacks),
+    @"strict_replay_display_phase_update_count" :
+        @(pacerSnapshot.displayPhaseUpdateCount),
+    @"strict_replay_display_phase_rejection_count" :
+        @(snapshot->strict_replay_display_phase_rejections),
+    @"strict_replay_display_phase_alignment_count" :
+        @(pacerSnapshot.displayPhaseAlignmentCount),
+    @"strict_replay_display_phase_fallback_count" :
+        @(pacerSnapshot.displayPhaseFallbackCount),
+    @"strict_replay_last_display_timestamp_ns" :
+        @(snapshot->strict_replay_last_display_timestamp_ns),
+    @"strict_replay_last_display_target_time_ns" :
+        @(snapshot->strict_replay_last_display_target_time_ns),
+    @"strict_replay_last_display_refresh_period_ns" :
+        @(snapshot->strict_replay_last_display_refresh_period_ns),
+    @"strict_replay_last_aligned_display_timestamp_ns" :
+        @(pacerSnapshot.lastAlignedDisplayPhaseTimestampNs),
+    @"strict_replay_last_aligned_display_target_time_ns" :
+        @(pacerSnapshot.lastAlignedDisplayPhaseTargetTimeNs),
+    @"strict_replay_last_aligned_display_refresh_period_ns" :
+        @(pacerSnapshot.lastAlignedDisplayRefreshPeriodNs),
+    @"strict_replay_last_aligned_display_safety_lead_ns" :
+        @(pacerSnapshot.lastAlignedDisplaySafetyLeadNs),
+    @"renderer_performance_metric_source" :
+        @"avsamplebuffervideorenderer_video_performance_metrics",
+    @"renderer_performance_metric_request_count" :
+        @(snapshot->renderer_performance_metric_request_count),
+    @"renderer_performance_metric_callback_count" :
+        @(snapshot->renderer_performance_metric_callback_count),
+    @"renderer_performance_metric_snapshot_count" :
+        @(snapshot->renderer_performance_metric_snapshot_count),
+    @"renderer_performance_metric_nil_count" :
+        @(snapshot->renderer_performance_metric_nil_count),
+    @"renderer_performance_metric_invalid_count" :
+        @(snapshot->renderer_performance_metric_invalid_count),
+    @"renderer_performance_metric_total_frames" :
+        @(snapshot->renderer_performance_metric_total_frames),
+    @"renderer_performance_metric_dropped_frames" :
+        @(snapshot->renderer_performance_metric_dropped_frames),
+    @"renderer_performance_metric_corrupted_frames" :
+        @(snapshot->renderer_performance_metric_corrupted_frames),
+    @"renderer_performance_metric_optimized_compositing_frames" :
+        @(snapshot->renderer_performance_metric_optimized_compositing_frames),
+    @"renderer_performance_metric_total_accumulated_delay_ns" :
+        @(snapshot->renderer_performance_metric_total_accumulated_delay_ns),
+    @"renderer_performance_metric_last_snapshot_monotonic_ns" :
+        @(snapshot->renderer_performance_metric_last_snapshot_monotonic_ns),
+    @"renderer_performance_metric_request_pending" :
+        @(rendererPerformanceMetricRequestPending),
     @"strict_replay_pacer_queue_depth_high_water" :
         @(pacerSnapshot.queueDepthHighWater),
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
@@ -1496,6 +1770,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
   if (!_inumaNativeSurfaceSelected && !_inumaTrace.enabled) {
     return;
   }
+  [self inumaStopPresentationDisplayLink];
   [self inumaStopNativePresentationObserver];
   void (^stopOnSampleQueue)(void) = ^{
     const uint64_t stopStartedAt = self->_inumaTrace.enabled

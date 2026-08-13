@@ -223,6 +223,74 @@ int main(void) {
                   pacedSnapshot.generationSequenceFailureCount == 0 &&
                   pacedSnapshot.addedLatencyViolationCount == 0);
 
+    InumaStrictReplayPacer* displayAligned = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:InumaTestHostClock(@[
+                           @1000000000,
+                           @1033333333,
+                           @1066666666,
+                           @1099999999,
+                         ])];
+    INUMA_REQUIRE([displayAligned updateDisplayPhaseTimestampNs:1080000000
+                                                       targetTimeNs:1096666667
+                                                    refreshPeriodNs:16666667]);
+    INUMA_REQUIRE(![displayAligned updateDisplayPhaseTimestampNs:1080000000
+                                                        targetTimeNs:1096666667
+                                                     refreshPeriodNs:16666667]);
+    for (uint64_t generation = 1; generation <= 4; generation++) {
+      pace = [displayAligned decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted && pace.timelineStarted &&
+                  pace.displayPhaseAligned);
+    INUMA_REQUIRE(pace.displayRefreshPeriodNs == 16666667);
+    INUMA_REQUIRE(pace.displaySafetyLeadNs == 8333333);
+    INUMA_REQUIRE(pace.displayPhaseTimestampNs == 1080000000);
+    INUMA_REQUIRE(pace.displayPhaseTargetTimeNs ==
+                  pace.scheduledPresentationTimeNs + 8333333);
+    INUMA_REQUIRE(pace.scheduledPresentationTimeNs <= 1194999999);
+    INUMA_REQUIRE(pace.presentationResidenceNs >= 78000000 &&
+                  pace.presentationResidenceNs <= 95000000);
+    INUMA_REQUIRE(displayAligned.displayPhaseUpdateCount == 1);
+    INUMA_REQUIRE(displayAligned.displayPhaseAlignmentCount == 1);
+    INUMA_REQUIRE(displayAligned.displayPhaseFallbackCount == 0);
+    INUMA_REQUIRE(displayAligned.displayPhaseTimestampNs == 1080000000);
+    INUMA_REQUIRE(displayAligned.displayPhaseTargetTimeNs == 1096666667);
+    INUMA_REQUIRE(displayAligned.displayRefreshPeriodNs == 16666667);
+    INUMA_REQUIRE(displayAligned.lastAlignedDisplayPhaseTimestampNs ==
+                  1080000000);
+    INUMA_REQUIRE(displayAligned.lastAlignedDisplayPhaseTargetTimeNs ==
+                  pace.displayPhaseTargetTimeNs);
+    INUMA_REQUIRE(displayAligned.lastAlignedDisplayRefreshPeriodNs ==
+                  16666667);
+    INUMA_REQUIRE(displayAligned.lastAlignedDisplaySafetyLeadNs == 8333333);
+
+    InumaStrictReplayPacer* staleDisplayPhase = [[InumaStrictReplayPacer alloc]
+        initWithPresentationReserveNs:95000000
+                       frameIntervalNs:33333333
+                         queueCapacity:4
+                         hostTimeClock:InumaTestHostClock(@[
+                           @1900000000,
+                           @1933333333,
+                           @1966666666,
+                           @1999999999,
+                         ])];
+    INUMA_REQUIRE([staleDisplayPhase updateDisplayPhaseTimestampNs:1080000000
+                                                          targetTimeNs:1096666667
+                                                       refreshPeriodNs:16666667]);
+    for (uint64_t generation = 1; generation <= 4; generation++) {
+      pace = [staleDisplayPhase decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted && pace.timelineStarted &&
+                  !pace.displayPhaseAligned &&
+                  pace.presentationResidenceNs == 95000000);
+    INUMA_REQUIRE(staleDisplayPhase.displayPhaseAlignmentCount == 0);
+    INUMA_REQUIRE(staleDisplayPhase.displayPhaseFallbackCount == 1);
+    INUMA_REQUIRE(![staleDisplayPhase updateDisplayPhaseTimestampNs:2100000000
+                                                           targetTimeNs:2101000000
+                                                        refreshPeriodNs:1000000]);
+
     InumaStrictReplayPacer* late = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000
                        frameIntervalNs:33333333

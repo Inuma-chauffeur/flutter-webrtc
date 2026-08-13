@@ -24,10 +24,15 @@ typedef struct {
   BOOL addedLatencyExceeded;
   BOOL latePhaseCorrected;
   BOOL earlyPhaseCorrected;
+  BOOL displayPhaseAligned;
   uint64_t arrivedAtHostTimeNs;
   uint64_t scheduledPresentationTimeNs;
   uint64_t presentationResidenceNs;
   uint64_t latenessNs;
+  uint64_t displayPhaseTimestampNs;
+  uint64_t displayPhaseTargetTimeNs;
+  uint64_t displayRefreshPeriodNs;
+  uint64_t displaySafetyLeadNs;
   NSUInteger queueDepthBefore;
   NSUInteger queueDepthAfter;
 } InumaStrictReplayPacingDecision;
@@ -46,6 +51,16 @@ typedef struct {
   uint64_t overflowCount;
   uint64_t generationSequenceFailureCount;
   uint64_t addedLatencyViolationCount;
+  uint64_t displayPhaseUpdateCount;
+  uint64_t displayPhaseAlignmentCount;
+  uint64_t displayPhaseFallbackCount;
+  uint64_t displayPhaseTimestampNs;
+  uint64_t displayPhaseTargetTimeNs;
+  uint64_t displayRefreshPeriodNs;
+  uint64_t lastAlignedDisplayPhaseTimestampNs;
+  uint64_t lastAlignedDisplayPhaseTargetTimeNs;
+  uint64_t lastAlignedDisplayRefreshPeriodNs;
+  uint64_t lastAlignedDisplaySafetyLeadNs;
   NSUInteger queueDepthHighWater;
 } InumaStrictReplayPacerSnapshot;
 
@@ -95,6 +110,16 @@ typedef struct {
 @property(nonatomic, readonly) uint64_t overflowCount;
 @property(nonatomic, readonly) uint64_t generationSequenceFailureCount;
 @property(nonatomic, readonly) uint64_t addedLatencyViolationCount;
+@property(nonatomic, readonly) uint64_t displayPhaseUpdateCount;
+@property(nonatomic, readonly) uint64_t displayPhaseAlignmentCount;
+@property(nonatomic, readonly) uint64_t displayPhaseFallbackCount;
+@property(nonatomic, readonly) uint64_t displayPhaseTimestampNs;
+@property(nonatomic, readonly) uint64_t displayPhaseTargetTimeNs;
+@property(nonatomic, readonly) uint64_t displayRefreshPeriodNs;
+@property(nonatomic, readonly) uint64_t lastAlignedDisplayPhaseTimestampNs;
+@property(nonatomic, readonly) uint64_t lastAlignedDisplayPhaseTargetTimeNs;
+@property(nonatomic, readonly) uint64_t lastAlignedDisplayRefreshPeriodNs;
+@property(nonatomic, readonly) uint64_t lastAlignedDisplaySafetyLeadNs;
 @property(nonatomic, readonly) NSUInteger queueDepthHighWater;
 
 - (nullable instancetype)initWithPresentationReserveNs:(uint64_t)reserveNs
@@ -103,6 +128,9 @@ typedef struct {
                                           hostTimeClock:
                                               (nullable InumaHostTimeClockBlock)hostTimeClock;
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation;
+- (BOOL)updateDisplayPhaseTimestampNs:(uint64_t)timestampNs
+                         targetTimeNs:(uint64_t)targetTimeNs
+                      refreshPeriodNs:(uint64_t)refreshPeriodNs;
 - (BOOL)invalidateTimelineAfterAcceptedGeneration:(uint64_t)generation;
 - (InumaStrictReplayPacerSnapshot)snapshot;
 - (void)stop;
