@@ -241,6 +241,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   BOOL _inumaSurfaceRegistered;
   BOOL _inumaDrainScheduled;
   NSUInteger _inumaStrictReplayDispatchPending;
+  BOOL _inumaStopRequested;
   BOOL _inumaShuttingDown;
   CMSampleBufferRef _inumaPendingSampleBuffer;
   RTCVideoRotation _inumaPendingRotation;
@@ -1830,6 +1831,13 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   if (!_inumaNativeSurfaceSelected && !_inumaTrace.enabled) {
     return;
   }
+  os_unfair_lock_lock(&_inumaTraceLock);
+  if (_inumaStopRequested) {
+    os_unfair_lock_unlock(&_inumaTraceLock);
+    return;
+  }
+  _inumaStopRequested = YES;
+  os_unfair_lock_unlock(&_inumaTraceLock);
   [self inumaStopPresentationDisplayLink];
   [self inumaStopNativePresentationObserver];
   void (^stopOnSampleQueue)(void) = ^{
