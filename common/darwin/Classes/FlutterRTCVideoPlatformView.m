@@ -1375,6 +1375,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     return;
   }
   const uint64_t snapshotAt = InumaNativeSurfaceMonotonicNanoseconds();
+  const uint64_t snapshotWallTimeNs =
+      (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0);
   os_unfair_lock_lock(&_inumaTraceLock);
   memcpy(snapshot, &_inumaTrace, sizeof(InumaNativeVideoSurfaceTrace));
   if (_inumaSegmentedEvidenceEnabled) {
@@ -1621,8 +1623,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     @"sample_capacity_exhaustions" : @(snapshot->capacity_exhaustions),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
     @"trace_snapshot_monotonic_ns" : @(snapshotAt),
-    @"trace_snapshot_wall_time_ns" :
-        @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0)),
+    @"trace_snapshot_wall_time_ns" : @(snapshotWallTimeNs),
     @"trace_snapshot_count" : @(snapshotCount),
     @"coherent_snapshot_retry_count" : @(_inumaCoherentSnapshotRetryCount),
     @"render_frames" : @(snapshot->render_frames),
@@ -1798,12 +1799,10 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
       @"decoder_boundary_trace" : decoder,
       @"receiver_scheduler_trace" : receiver,
     };
-    const uint64_t wallTime =
-        (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0);
     if (![_inumaSegmentedEvidenceWriter writeSegment:segmentPayload
                                          startedAtNs:_inumaSegmentStartedMonotonicNs
                                            endedAtNs:snapshotAt
-                                   snapshotWallTimeNs:wallTime
+                                   snapshotWallTimeNs:snapshotWallTimeNs
                                             terminal:terminal]) {
       fprintf(stderr, "INUMA_SEGMENTED_SCALAR_EVIDENCE_WRITE_FAILED\n");
     } else {
