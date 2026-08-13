@@ -58,7 +58,9 @@
 
 #if TARGET_OS_OSX
 enum {
-  // Covers 30 FPS for 30 minutes plus startup/teardown headroom.
+  // Legacy snapshots retain their original capacity contract. Segmented
+  // evidence drains completed rows every five seconds, so long runs no longer
+  // consume this full allowance.
   kInumaDecoderBoundaryTraceCapacity = 65536,
 };
 
@@ -69,6 +71,10 @@ typedef struct {
   uint64_t callback_set_count;
   uint64_t release_count;
   uint64_t sample_capacity_exhaustions;
+  uint64_t total_decode_count;
+  uint64_t total_output_count;
+  uint64_t next_token;
+  uint64_t stale_completion_count;
   NSUInteger decode_count;
   NSUInteger output_count;
   uint64_t decode_call_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
@@ -79,11 +85,15 @@ typedef struct {
   int64_t decode_status[kInumaDecoderBoundaryTraceCapacity];
   uint8_t decode_missing_frames[kInumaDecoderBoundaryTraceCapacity];
   uint8_t decode_qos_class[kInumaDecoderBoundaryTraceCapacity];
+  uint64_t decode_token[kInumaDecoderBoundaryTraceCapacity];
+  uint8_t decode_complete[kInumaDecoderBoundaryTraceCapacity];
   uint64_t output_callback_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
   uint64_t output_return_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
   uint32_t output_rtp_timestamp[kInumaDecoderBoundaryTraceCapacity];
   int64_t output_timestamp_ns[kInumaDecoderBoundaryTraceCapacity];
   uint8_t output_qos_class[kInumaDecoderBoundaryTraceCapacity];
+  uint64_t output_token[kInumaDecoderBoundaryTraceCapacity];
+  uint8_t output_complete[kInumaDecoderBoundaryTraceCapacity];
 } InumaDecoderBoundaryTrace;
 
 static os_unfair_lock gInumaDecoderBoundaryTraceLock = OS_UNFAIR_LOCK_INIT;
@@ -139,6 +149,10 @@ static NSUInteger InumaDecoderTraceBeginDecode(
     return NSNotFound;
   }
   const NSUInteger index = gInumaDecoderBoundaryTrace.decode_count++;
+  const uint64_t token = ++gInumaDecoderBoundaryTrace.next_token;
+  gInumaDecoderBoundaryTrace.total_decode_count += 1;
+  gInumaDecoderBoundaryTrace.decode_token[index] = token;
+  gInumaDecoderBoundaryTrace.decode_complete[index] = 0;
   gInumaDecoderBoundaryTrace.decode_call_monotonic_ns[index] = calledAt;
   gInumaDecoderBoundaryTrace.decode_rtp_timestamp[index] =
       encodedImage.timeStamp;
@@ -150,20 +164,29 @@ static NSUInteger InumaDecoderTraceBeginDecode(
       missingFrames ? 1 : 0;
   gInumaDecoderBoundaryTrace.decode_qos_class[index] = (uint8_t)qos;
   os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
-  return index;
+  return (NSUInteger)token;
 }
 
-static void InumaDecoderTraceFinishDecode(NSUInteger index,
+static void InumaDecoderTraceFinishDecode(NSUInteger token,
                                           NSInteger status) {
-  if (index == NSNotFound) {
+  if (token == NSNotFound) {
     return;
   }
   const uint64_t returnedAt = InumaDecoderMonotonicNanoseconds();
   os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
-  if (index < gInumaDecoderBoundaryTrace.decode_count) {
-    gInumaDecoderBoundaryTrace.decode_return_monotonic_ns[index] =
-        returnedAt;
-    gInumaDecoderBoundaryTrace.decode_status[index] = status;
+  BOOL found = NO;
+  for (NSUInteger index = 0;
+       index < gInumaDecoderBoundaryTrace.decode_count; index++) {
+    if (gInumaDecoderBoundaryTrace.decode_token[index] == (uint64_t)token) {
+      gInumaDecoderBoundaryTrace.decode_return_monotonic_ns[index] = returnedAt;
+      gInumaDecoderBoundaryTrace.decode_status[index] = status;
+      gInumaDecoderBoundaryTrace.decode_complete[index] = 1;
+      found = YES;
+      break;
+    }
+  }
+  if (!found) {
+    gInumaDecoderBoundaryTrace.stale_completion_count += 1;
   }
   os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
 }
@@ -183,24 +206,37 @@ static NSUInteger InumaDecoderTraceBeginOutput(RTCVideoFrame *frame) {
     return NSNotFound;
   }
   const NSUInteger index = gInumaDecoderBoundaryTrace.output_count++;
+  const uint64_t token = ++gInumaDecoderBoundaryTrace.next_token;
+  gInumaDecoderBoundaryTrace.total_output_count += 1;
+  gInumaDecoderBoundaryTrace.output_token[index] = token;
+  gInumaDecoderBoundaryTrace.output_complete[index] = 0;
   gInumaDecoderBoundaryTrace.output_callback_monotonic_ns[index] = calledAt;
   gInumaDecoderBoundaryTrace.output_rtp_timestamp[index] =
       (uint32_t)frame.timeStamp;
   gInumaDecoderBoundaryTrace.output_timestamp_ns[index] = frame.timeStampNs;
   gInumaDecoderBoundaryTrace.output_qos_class[index] = (uint8_t)qos;
   os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
-  return index;
+  return (NSUInteger)token;
 }
 
-static void InumaDecoderTraceFinishOutput(NSUInteger index) {
-  if (index == NSNotFound) {
+static void InumaDecoderTraceFinishOutput(NSUInteger token) {
+  if (token == NSNotFound) {
     return;
   }
   const uint64_t returnedAt = InumaDecoderMonotonicNanoseconds();
   os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
-  if (index < gInumaDecoderBoundaryTrace.output_count) {
-    gInumaDecoderBoundaryTrace.output_return_monotonic_ns[index] =
-        returnedAt;
+  BOOL found = NO;
+  for (NSUInteger index = 0;
+       index < gInumaDecoderBoundaryTrace.output_count; index++) {
+    if (gInumaDecoderBoundaryTrace.output_token[index] == (uint64_t)token) {
+      gInumaDecoderBoundaryTrace.output_return_monotonic_ns[index] = returnedAt;
+      gInumaDecoderBoundaryTrace.output_complete[index] = 1;
+      found = YES;
+      break;
+    }
+  }
+  if (!found) {
+    gInumaDecoderBoundaryTrace.stale_completion_count += 1;
   }
   os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
 }
@@ -245,7 +281,38 @@ static NSArray<NSNumber *> *InumaDecoderByteArray(const uint8_t *samples,
   return values;
 }
 
-NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
+static void InumaDecoderTraceCompactPrefix(NSUInteger prefix,
+                                           NSUInteger *count,
+                                           uint64_t *call,
+                                           uint64_t *returned,
+                                           uint32_t *rtp,
+                                           int64_t *firstSigned,
+                                           int64_t *secondSigned,
+                                           int64_t *thirdSigned,
+                                           uint8_t *byteValue,
+                                           uint8_t *qos,
+                                           uint64_t *token,
+                                           uint8_t *complete) {
+  if (prefix == 0 || prefix > *count) return;
+  const NSUInteger remaining = *count - prefix;
+#define INUMA_DECODER_MOVE(array) \
+  memmove(array, array + prefix, remaining * sizeof(array[0]))
+  INUMA_DECODER_MOVE(call);
+  INUMA_DECODER_MOVE(returned);
+  INUMA_DECODER_MOVE(rtp);
+  INUMA_DECODER_MOVE(firstSigned);
+  if (secondSigned != NULL) INUMA_DECODER_MOVE(secondSigned);
+  if (thirdSigned != NULL) INUMA_DECODER_MOVE(thirdSigned);
+  if (byteValue != NULL) INUMA_DECODER_MOVE(byteValue);
+  INUMA_DECODER_MOVE(qos);
+  INUMA_DECODER_MOVE(token);
+  INUMA_DECODER_MOVE(complete);
+#undef INUMA_DECODER_MOVE
+  *count = remaining;
+}
+
+static NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshotInternal(
+    BOOL drain) {
   InumaDecoderBoundaryTrace *snapshot =
       calloc(1, sizeof(InumaDecoderBoundaryTrace));
   if (snapshot == NULL) {
@@ -259,9 +326,48 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
   }
   NSString *codecName = @"";
   NSString *implementationName = @"";
+  NSUInteger decodeInflightCount = 0;
+  NSUInteger outputInflightCount = 0;
   os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
   memcpy(snapshot, &gInumaDecoderBoundaryTrace,
          sizeof(InumaDecoderBoundaryTrace));
+  if (drain) {
+    NSUInteger decodePrefix = 0;
+    while (decodePrefix < gInumaDecoderBoundaryTrace.decode_count &&
+           gInumaDecoderBoundaryTrace.decode_complete[decodePrefix] != 0) {
+      decodePrefix += 1;
+    }
+    NSUInteger outputPrefix = 0;
+    while (outputPrefix < gInumaDecoderBoundaryTrace.output_count &&
+           gInumaDecoderBoundaryTrace.output_complete[outputPrefix] != 0) {
+      outputPrefix += 1;
+    }
+    snapshot->decode_count = decodePrefix;
+    snapshot->output_count = outputPrefix;
+    InumaDecoderTraceCompactPrefix(
+        decodePrefix, &gInumaDecoderBoundaryTrace.decode_count,
+        gInumaDecoderBoundaryTrace.decode_call_monotonic_ns,
+        gInumaDecoderBoundaryTrace.decode_return_monotonic_ns,
+        gInumaDecoderBoundaryTrace.decode_rtp_timestamp,
+        gInumaDecoderBoundaryTrace.decode_capture_time_ms,
+        gInumaDecoderBoundaryTrace.decode_render_time_ms,
+        gInumaDecoderBoundaryTrace.decode_status,
+        gInumaDecoderBoundaryTrace.decode_missing_frames,
+        gInumaDecoderBoundaryTrace.decode_qos_class,
+        gInumaDecoderBoundaryTrace.decode_token,
+        gInumaDecoderBoundaryTrace.decode_complete);
+    InumaDecoderTraceCompactPrefix(
+        outputPrefix, &gInumaDecoderBoundaryTrace.output_count,
+        gInumaDecoderBoundaryTrace.output_callback_monotonic_ns,
+        gInumaDecoderBoundaryTrace.output_return_monotonic_ns,
+        gInumaDecoderBoundaryTrace.output_rtp_timestamp,
+        gInumaDecoderBoundaryTrace.output_timestamp_ns, NULL, NULL, NULL,
+        gInumaDecoderBoundaryTrace.output_qos_class,
+        gInumaDecoderBoundaryTrace.output_token,
+        gInumaDecoderBoundaryTrace.output_complete);
+    decodeInflightCount = gInumaDecoderBoundaryTrace.decode_count;
+    outputInflightCount = gInumaDecoderBoundaryTrace.output_count;
+  }
   codecName = [gInumaDecoderBoundaryTraceCodecName copy] ?: @"";
   implementationName =
       [gInumaDecoderBoundaryTraceImplementationName copy] ?: @"";
@@ -270,7 +376,9 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
   if (!snapshot->enabled) {
     free(snapshot);
     return @{
-      @"schema" : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
+      @"schema" : drain
+          ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v2"
+          : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
       @"status" : @"disabled",
       @"finding" : @"decoder_boundary_trace_disabled",
       @"enabled" : @(NO),
@@ -279,7 +387,9 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
   }
 
   NSDictionary<NSString *, id> *report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
+    @"schema" : drain
+        ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v2"
+        : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
     @"status" : @"pass",
     @"finding" : @"decoder_input_and_output_callback_boundaries_retained",
     @"enabled" : @(YES),
@@ -324,8 +434,25 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
     @"output_qos_class" : InumaDecoderByteArray(
         snapshot->output_qos_class, snapshot->output_count),
   };
+  if (drain) {
+    NSMutableDictionary<NSString *, id> *segmented = [report mutableCopy];
+    segmented[@"total_decode_count"] = @(snapshot->total_decode_count);
+    segmented[@"total_output_count"] = @(snapshot->total_output_count);
+    segmented[@"stale_completion_count"] = @(snapshot->stale_completion_count);
+    segmented[@"decode_inflight_count"] = @(decodeInflightCount);
+    segmented[@"output_inflight_count"] = @(outputInflightCount);
+    report = segmented;
+  }
   free(snapshot);
   return report;
+}
+
+NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
+  return InumaDecoderBoundaryTraceSnapshotInternal(NO);
+}
+
+NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceDrainSnapshot(void) {
+  return InumaDecoderBoundaryTraceSnapshotInternal(YES);
 }
 
 @interface InumaTracingVideoDecoder : NSObject <RTCVideoDecoder>

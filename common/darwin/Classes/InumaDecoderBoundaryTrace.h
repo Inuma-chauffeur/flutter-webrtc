@@ -9,4 +9,8 @@ NS_ASSUME_NONNULL_BEGIN
  */
 NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void);
 
+/** Atomically drains only completed decoder/callback rows. Cumulative
+ * counters and in-flight token ownership survive the segment boundary. */
+NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceDrainSnapshot(void);
+
 NS_ASSUME_NONNULL_END

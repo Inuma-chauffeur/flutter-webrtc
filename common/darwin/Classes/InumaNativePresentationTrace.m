@@ -557,7 +557,8 @@ static InumaPresentationEventRecord InumaPresentationRecord(
   os_unfair_lock_unlock(&_lock);
 }
 
-- (NSDictionary<NSString*, id>*)snapshotAtNs:(uint64_t)snapshotAtNs {
+- (NSDictionary<NSString*, id>*)snapshotAtNs:(uint64_t)snapshotAtNs
+                                        drain:(BOOL)drain {
   os_unfair_lock_lock(&_lock);
   const NSUInteger count = _count;
   InumaPresentationEventRecord* copy = calloc(count, sizeof(*copy));
@@ -584,6 +585,10 @@ static InumaPresentationEventRecord InumaPresentationRecord(
   const uint64_t readinessDuration = _readinessTotalDurationNs;
   uint64_t eventCounts[InumaPresentationEventKindCount] = {0};
   memcpy(eventCounts, _eventCounts, sizeof(eventCounts));
+  if (drain) {
+    _count = 0;
+    _nextIndex = 0;
+  }
   os_unfair_lock_unlock(&_lock);
 
   NSMutableArray<NSDictionary<NSString*, id>*>* events =
@@ -654,6 +659,14 @@ static InumaPresentationEventRecord InumaPresentationRecord(
     @"hot_path_filesystem_writes" : @0,
     @"events" : events,
   };
+}
+
+- (NSDictionary<NSString*, id>*)snapshotAtNs:(uint64_t)snapshotAtNs {
+  return [self snapshotAtNs:snapshotAtNs drain:NO];
+}
+
+- (NSDictionary<NSString*, id>*)drainSnapshotAtNs:(uint64_t)snapshotAtNs {
+  return [self snapshotAtNs:snapshotAtNs drain:YES];
 }
 
 - (NSUInteger)count {

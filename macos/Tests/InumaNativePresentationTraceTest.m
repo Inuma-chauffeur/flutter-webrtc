@@ -283,6 +283,32 @@ int main(void) {
         [snapshot[@"last_retained_event_sequence"] unsignedLongLongValue] == 6);
     INUMA_REQUIRE([snapshot[@"capacity_exhaustions"] unsignedLongLongValue] == 0);
 
+    InumaNativePresentationTrace* segmented =
+        [[InumaNativePresentationTrace alloc] initWithCapacity:8
+                                               sessionSequence:4
+                                                   startedAtNs:4000];
+    [segmented recordEventKind:InumaPresentationEventSurfaceResize
+                          atNs:4100
+                       context:(InumaPresentationFrameContext){0}
+                     durationNs:0
+                           value:1];
+    NSDictionary* firstSegment = [segmented drainSnapshotAtNs:4200];
+    INUMA_REQUIRE(
+        [firstSegment[@"retained_event_count"] unsignedIntegerValue] == 2);
+    [segmented recordEventKind:InumaPresentationEventReconnect
+                          atNs:4300
+                       context:(InumaPresentationFrameContext){0}
+                     durationNs:0
+                           value:2];
+    NSDictionary* secondSegment = [segmented drainSnapshotAtNs:4400];
+    INUMA_REQUIRE(
+        [secondSegment[@"retained_event_count"] unsignedIntegerValue] == 1);
+    INUMA_REQUIRE(
+        [secondSegment[@"first_retained_event_sequence"] unsignedLongLongValue] ==
+        3);
+    INUMA_REQUIRE(
+        [secondSegment[@"total_event_count"] unsignedLongLongValue] == 3);
+
     InumaDisplayedFrameIdentityLedger* identity =
         [[InumaDisplayedFrameIdentityLedger alloc] initWithCapacity:2];
     INUMA_REQUIRE(identity != nil && identity.capacity == 2);

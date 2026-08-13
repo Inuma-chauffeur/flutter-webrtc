@@ -15,6 +15,7 @@
 #include "InumaLowLatencyVideoPlayoutConfiguration.h"
 #include "InumaNativePresentationSeams.h"
 #include "InumaPrerendererSmoothingConfiguration.h"
+#include "InumaSegmentedScalarEvidenceWriter.h"
 
 enum {
   kInumaNativeVideoSurfaceTraceCapacity = 65536,
@@ -249,6 +250,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   InumaStrictReplayPacer* _inumaStrictReplayPacer;
   InumaSampleRendererAdapter* _inumaRendererAdapter;
   InumaNativePresentationTrace* _inumaPresentationTrace;
+  InumaSegmentedScalarEvidenceWriter* _inumaSegmentedEvidenceWriter;
+  uint64_t _inumaSegmentStartedMonotonicNs;
+  BOOL _inumaSegmentedEvidenceEnabled;
   uint64_t _inumaSurfaceSessionSequence;
 #endif
 }
@@ -287,6 +291,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
                           ? [environment[@"INUMA_FLUTTER_WEBRTC_TEXTURE_TRACE_PATH"] copy]
                           : nil;
     _inumaTrace.enabled = _inumaTracePath.length > 0;
+    _inumaSegmentedEvidenceEnabled =
+        [environment[@"INUMA_FLUTTER_WEBRTC_SEGMENTED_SCALAR_EVIDENCE"]
+            isEqualToString:@"1"];
     _inumaTraceStartedMonotonicNs = _inumaTrace.enabled
                                         ? InumaNativeSurfaceMonotonicNanoseconds()
                                         : 0;
@@ -322,6 +329,15 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
         _inumaDisplayedIdentityLedger =
             [[InumaDisplayedFrameIdentityLedger alloc]
                 initWithCapacity:kInumaDisplayedContextCapacity];
+        if (_inumaSegmentedEvidenceEnabled) {
+          _inumaSegmentStartedMonotonicNs = _inumaTraceStartedMonotonicNs;
+          _inumaSegmentedEvidenceWriter =
+              [[InumaSegmentedScalarEvidenceWriter alloc]
+                  initWithManifestPath:_inumaTracePath
+                       sessionSequence:_inumaSurfaceSessionSequence
+                     traceStartedAtNs:_inumaTraceStartedMonotonicNs
+                      segmentIntervalNs:5 * NSEC_PER_SEC];
+        }
       }
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
       if (@available(macOS 14.0, *)) {
@@ -351,7 +367,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
       __weak FlutterRTCVideoPlatformView* weakSelf = self;
       dispatch_source_set_event_handler(_inumaTraceTimer, ^{
         [weakSelf inumaRequestRendererPerformanceMetrics];
-        [weakSelf inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
+        [weakSelf inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0
+                                                                      terminal:NO];
       });
       dispatch_resume(_inumaTraceTimer);
     }
@@ -1336,12 +1353,14 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
 - (void)inumaWriteNativeVideoSurfaceTrace {
   if (_inumaTraceWriterQueue == nil) return;
   dispatch_async(_inumaTraceWriterQueue, ^{
-    [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
+    [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0
+                                                                terminal:NO];
   });
 }
 
 - (void)inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:
-    (NSUInteger)retryAttempt {
+    (NSUInteger)retryAttempt
+                                                         terminal:(BOOL)terminal {
   if (!_inumaTrace.enabled || _inumaTracePath.length == 0) {
     return;
   }
@@ -1357,6 +1376,10 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   const uint64_t snapshotAt = InumaNativeSurfaceMonotonicNanoseconds();
   os_unfair_lock_lock(&_inumaTraceLock);
   memcpy(snapshot, &_inumaTrace, sizeof(InumaNativeVideoSurfaceTrace));
+  if (_inumaSegmentedEvidenceEnabled) {
+    _inumaTrace.render_event_count = 0;
+    _inumaTrace.enqueue_event_count = 0;
+  }
   const BOOL pendingSamplePresent = _inumaPendingSampleBuffer != nil;
   const BOOL drainScheduled = _inumaDrainScheduled;
   const NSUInteger strictReplayDispatchPending =
@@ -1429,6 +1452,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
                snapshot->strict_replay_dispatch_late_rejections &&
        snapshot->enqueue_completions <= snapshot->enqueue_attempts);
   if (!strictReplaySnapshotCoherent && !shuttingDown &&
+      !_inumaSegmentedEvidenceEnabled &&
       retryAttempt < kInumaTraceMaximumCoherentSnapshotRetries) {
     free(snapshot);
     _inumaCoherentSnapshotRetryCount += 1;
@@ -1436,7 +1460,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
         dispatch_time(DISPATCH_TIME_NOW, kInumaTraceCoherentSnapshotRetryNs),
         _inumaTraceWriterQueue, ^{
           [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:
-                    retryAttempt + 1];
+                    retryAttempt + 1
+                                                                terminal:NO];
         });
     return;
   }
@@ -1460,7 +1485,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
               @"status" : @"fail",
               @"finding" : @"presentation_trace_not_initialized",
             }
-          : [_inumaPresentationTrace snapshotAtNs:snapshotAt];
+          : (_inumaSegmentedEvidenceEnabled
+                 ? [_inumaPresentationTrace drainSnapshotAtNs:snapshotAt]
+                 : [_inumaPresentationTrace snapshotAtNs:snapshotAt]);
   BOOL layerReadyForDisplay = NO;
   if (@available(macOS 14.4, *)) {
     layerReadyForDisplay = _videoLayer.readyForDisplay;
@@ -1719,8 +1746,14 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     @"enqueue_call_duration_ns" : InumaNativeSurfaceSamples(
         snapshot->enqueue_call_duration_ns, snapshot->enqueue_event_count),
     @"presentation_trace_v2" : presentationTrace,
-    @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
-    @"receiver_scheduler_trace" : RTCInumaReceiverSchedulerTraceSnapshot(),
+    @"decoder_boundary_trace" :
+        (_inumaSegmentedEvidenceEnabled
+             ? InumaDecoderBoundaryTraceDrainSnapshot()
+             : InumaDecoderBoundaryTraceSnapshot()),
+    @"receiver_scheduler_trace" :
+        (_inumaSegmentedEvidenceEnabled
+             ? RTCInumaReceiverSchedulerTraceDrainSnapshot(terminal)
+             : RTCInumaReceiverSchedulerTraceSnapshot()),
     @"prerenderer_smoothing_disabled_configuration_count" :
         @(prerendererSmoothingDisabledConfigurationCount),
     @"prerenderer_smoothing_configuration_contract" :
@@ -1751,6 +1784,33 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     @"raw_pixels_retained" : @NO,
   };
   NSError* error = nil;
+  if (_inumaSegmentedEvidenceEnabled) {
+    NSMutableDictionary<NSString*, id>* surface = [report mutableCopy];
+    NSDictionary* decoder = surface[@"decoder_boundary_trace"];
+    NSDictionary* receiver = surface[@"receiver_scheduler_trace"];
+    [surface removeObjectForKey:@"presentation_trace_v2"];
+    [surface removeObjectForKey:@"decoder_boundary_trace"];
+    [surface removeObjectForKey:@"receiver_scheduler_trace"];
+    NSDictionary* segmentPayload = @{
+      @"surface_trace" : surface,
+      @"presentation_trace_v2" : presentationTrace,
+      @"decoder_boundary_trace" : decoder,
+      @"receiver_scheduler_trace" : receiver,
+    };
+    const uint64_t wallTime =
+        (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000000.0);
+    if (![_inumaSegmentedEvidenceWriter writeSegment:segmentPayload
+                                         startedAtNs:_inumaSegmentStartedMonotonicNs
+                                           endedAtNs:snapshotAt
+                                   snapshotWallTimeNs:wallTime
+                                            terminal:terminal]) {
+      fprintf(stderr, "INUMA_SEGMENTED_SCALAR_EVIDENCE_WRITE_FAILED\n");
+    } else {
+      _inumaSegmentStartedMonotonicNs = snapshotAt;
+    }
+    free(snapshot);
+    return;
+  }
   NSData* data = [NSJSONSerialization dataWithJSONObject:report
                                                  options:0
                                                    error:&error];
@@ -1846,7 +1906,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   }
   if (_inumaTraceWriterQueue != nil) {
     dispatch_sync(_inumaTraceWriterQueue, ^{
-      [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0];
+      [self inumaWriteNativeVideoSurfaceTraceOnWriterQueueWithRetryAttempt:0
+                                                                  terminal:YES];
     });
   }
 }

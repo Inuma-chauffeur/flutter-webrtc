@@ -197,6 +197,9 @@ InumaBindProductWatermarkIdentityToContext(
                        context:(InumaPresentationFrameContext)context;
 
 - (NSDictionary<NSString*, id>*)snapshotAtNs:(uint64_t)snapshotAtNs;
+// Atomically drains only retained rows while preserving global sequences,
+// cumulative counters, and open readiness state for immutable segmentation.
+- (NSDictionary<NSString*, id>*)drainSnapshotAtNs:(uint64_t)snapshotAtNs;
 
 @end
 

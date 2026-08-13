@@ -28,6 +28,7 @@ A new flutter plugin project.
     'Classes/InumaPrerendererSmoothingConfiguration.h',
     'Classes/InumaReceiverSchedulerTraceConfiguration.h',
     'Classes/InumaRepeatBoundaryPolicy.h',
+    'Classes/InumaSegmentedScalarEvidenceWriter.h',
   ]
 
   s.dependency 'FlutterMacOS'
