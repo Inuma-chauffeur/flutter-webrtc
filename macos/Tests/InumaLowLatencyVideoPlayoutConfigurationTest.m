@@ -50,7 +50,8 @@ int main(void) {
                  @"WebRTC-Network-UseNWPathMonitor/Enabled/"
                   "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:10/"
                   "WebRTC-ZeroPlayoutDelay/min_pacing:16ms,"
-                  "max_decode_queue_size:5/"],
+                  "max_decode_queue_size:5/"
+                  "WebRTC-NackInitialRttMs/20/"],
             @"the field-trial policy must remain exact");
     Require(InumaLowLatencyVideoPlayoutForcedMinimumMs() == 0,
             @"forced minimum must remain zero milliseconds");
@@ -60,6 +61,8 @@ int main(void) {
             @"minimum pacing must remain sixteen milliseconds");
     Require(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize() == 5,
             @"decode queue cap must remain five frames");
+    Require(InumaLowLatencyVideoPlayoutInitialNackRttMs() == 20,
+            @"initial NACK RTT must remain twenty milliseconds");
 
     InumaRecordLowLatencyVideoPlayoutConfiguration(NO);
     Require(InumaLowLatencyVideoPlayoutEnabledConfigurationCount() == 0,

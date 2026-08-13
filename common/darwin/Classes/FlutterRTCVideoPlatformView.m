@@ -1467,6 +1467,8 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(InumaLowLatencyVideoPlayoutMinimumPacingMs()),
     @"low_latency_video_playout_maximum_decode_queue_size" :
         @(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize()),
+    @"low_latency_video_playout_initial_nack_rtt_ms" :
+        @(InumaLowLatencyVideoPlayoutInitialNackRttMs()),
     @"credential_value_retained" : @NO,
     @"raw_pixels_retained" : @NO,
   };

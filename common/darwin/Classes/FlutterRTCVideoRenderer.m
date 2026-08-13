@@ -3882,7 +3882,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"sample_capacity" : @(kInumaTextureTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),
-    @"tail_diagnostics_version" : @57,
+    @"tail_diagnostics_version" : @58,
     @"decoder_boundary_trace" : InumaDecoderBoundaryTraceSnapshot(),
     @"receiver_scheduler_trace" :
         RTCInumaReceiverSchedulerTraceSnapshot(),
@@ -3906,6 +3906,8 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
         @(InumaLowLatencyVideoPlayoutMinimumPacingMs()),
     @"low_latency_video_playout_maximum_decode_queue_size" :
         @(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize()),
+    @"low_latency_video_playout_initial_nack_rtt_ms" :
+        @(InumaLowLatencyVideoPlayoutInitialNackRttMs()),
     @"trace_clock_domain" :
         @"macos_clock_monotonic_raw_shared_mach_host_time",
     @"texture_notification_contract" :

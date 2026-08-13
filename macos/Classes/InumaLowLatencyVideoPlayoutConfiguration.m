@@ -30,7 +30,8 @@ InumaParseLowLatencyVideoPlayoutConfiguration(NSDictionary* options,
 NSString* InumaLowLatencyVideoPlayoutFieldTrials(void) {
   return @"WebRTC-Network-UseNWPathMonitor/Enabled/"
           "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:10/"
-          "WebRTC-ZeroPlayoutDelay/min_pacing:16ms,max_decode_queue_size:5/";
+          "WebRTC-ZeroPlayoutDelay/min_pacing:16ms,max_decode_queue_size:5/"
+          "WebRTC-NackInitialRttMs/20/";
 }
 
 NSInteger InumaLowLatencyVideoPlayoutForcedMinimumMs(void) {
@@ -47,6 +48,10 @@ NSInteger InumaLowLatencyVideoPlayoutMinimumPacingMs(void) {
 
 NSInteger InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize(void) {
   return 5;
+}
+
+NSInteger InumaLowLatencyVideoPlayoutInitialNackRttMs(void) {
+  return 20;
 }
 
 void InumaRecordLowLatencyVideoPlayoutConfiguration(BOOL enabled) {
