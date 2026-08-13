@@ -1245,7 +1245,7 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
     layerReadyForDisplay = _videoLayer.readyForDisplay;
   }
   NSDictionary* report = @{
-    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v8",
+    @"schema" : @"inuma.flutter_webrtc.macos_native_video_surface_trace.v9",
     @"status" : strictReplaySnapshotCoherent ? @"pass" : @"fail",
     @"surface_mode" : @"native_platform_view",
     @"surface_contract" :
@@ -1469,6 +1469,10 @@ static NSArray<NSNumber*>* InumaNativeSurfaceSamples(const uint64_t* values,
         @(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize()),
     @"low_latency_video_playout_initial_nack_rtt_ms" :
         @(InumaLowLatencyVideoPlayoutInitialNackRttMs()),
+    @"low_latency_video_playout_nack_periodic_interval_ms" :
+        @(InumaLowLatencyVideoPlayoutNackPeriodicIntervalMs()),
+    @"low_latency_video_playout_nack_timer_high_precision" :
+        @(InumaLowLatencyVideoPlayoutNackTimerHighPrecision()),
     @"credential_value_retained" : @NO,
     @"raw_pixels_retained" : @NO,
   };

@@ -51,7 +51,8 @@ int main(void) {
                   "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:10/"
                   "WebRTC-ZeroPlayoutDelay/min_pacing:16ms,"
                   "max_decode_queue_size:5/"
-                  "WebRTC-NackInitialRttMs/20/"],
+                  "WebRTC-NackInitialRttMs/10/"
+                  "WebRTC-NackPeriodicIntervalMs/4/"],
             @"the field-trial policy must remain exact");
     Require(InumaLowLatencyVideoPlayoutForcedMinimumMs() == 0,
             @"forced minimum must remain zero milliseconds");
@@ -61,8 +62,12 @@ int main(void) {
             @"minimum pacing must remain sixteen milliseconds");
     Require(InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize() == 5,
             @"decode queue cap must remain five frames");
-    Require(InumaLowLatencyVideoPlayoutInitialNackRttMs() == 20,
-            @"initial NACK RTT must remain twenty milliseconds");
+    Require(InumaLowLatencyVideoPlayoutInitialNackRttMs() == 10,
+            @"initial NACK RTT must remain ten milliseconds");
+    Require(InumaLowLatencyVideoPlayoutNackPeriodicIntervalMs() == 4,
+            @"periodic NACK cadence must remain four milliseconds");
+    Require(InumaLowLatencyVideoPlayoutNackTimerHighPrecision() == YES,
+            @"the selected NACK cadence must use high-precision timing");
 
     InumaRecordLowLatencyVideoPlayoutConfiguration(NO);
     Require(InumaLowLatencyVideoPlayoutEnabledConfigurationCount() == 0,

@@ -22,6 +22,10 @@ FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutForcedMaximumMs(void);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutMinimumPacingMs(void);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutMaximumDecodeQueueSize(void);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutInitialNackRttMs(void);
+FOUNDATION_EXPORT NSInteger
+InumaLowLatencyVideoPlayoutNackPeriodicIntervalMs(void);
+FOUNDATION_EXPORT BOOL
+InumaLowLatencyVideoPlayoutNackTimerHighPrecision(void);
 
 /// Records that the opt-in reached the factory before it was constructed.
 FOUNDATION_EXPORT void
