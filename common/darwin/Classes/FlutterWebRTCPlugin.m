@@ -62,6 +62,8 @@ enum {
   // evidence drains completed rows every five seconds, so long runs no longer
   // consume this full allowance.
   kInumaDecoderBoundaryTraceCapacity = 65536,
+  kInumaDecoderTerminalQuiescencePollNs = 1 * NSEC_PER_MSEC,
+  kInumaDecoderTerminalQuiescenceTimeoutNs = 250 * NSEC_PER_MSEC,
 };
 
 typedef struct {
@@ -75,6 +77,11 @@ typedef struct {
   uint64_t total_output_count;
   uint64_t next_token;
   uint64_t stale_completion_count;
+  BOOL terminal_drain_requested;
+  uint64_t terminal_quiescence_wait_ns;
+  uint64_t terminal_quiescence_timeout_count;
+  uint64_t decode_rejections_after_terminal;
+  uint64_t output_rejections_after_terminal;
   NSUInteger decode_count;
   NSUInteger output_count;
   uint64_t decode_call_monotonic_ns[kInumaDecoderBoundaryTraceCapacity];
@@ -142,6 +149,11 @@ static NSUInteger InumaDecoderTraceBeginDecode(
     os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
     return NSNotFound;
   }
+  if (gInumaDecoderBoundaryTrace.terminal_drain_requested) {
+    gInumaDecoderBoundaryTrace.decode_rejections_after_terminal += 1;
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
   if (gInumaDecoderBoundaryTrace.decode_count >=
       kInumaDecoderBoundaryTraceCapacity) {
     gInumaDecoderBoundaryTrace.sample_capacity_exhaustions += 1;
@@ -196,6 +208,11 @@ static NSUInteger InumaDecoderTraceBeginOutput(RTCVideoFrame *frame) {
   const qos_class_t qos = qos_class_self();
   os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
   if (!gInumaDecoderBoundaryTrace.enabled) {
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+    return NSNotFound;
+  }
+  if (gInumaDecoderBoundaryTrace.terminal_drain_requested) {
+    gInumaDecoderBoundaryTrace.output_rejections_after_terminal += 1;
     os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
     return NSNotFound;
   }
@@ -377,7 +394,7 @@ static NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshotInternal(
     free(snapshot);
     return @{
       @"schema" : drain
-          ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v2"
+          ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v3"
           : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
       @"status" : @"disabled",
       @"finding" : @"decoder_boundary_trace_disabled",
@@ -388,7 +405,7 @@ static NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshotInternal(
 
   NSDictionary<NSString *, id> *report = @{
     @"schema" : drain
-        ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v2"
+        ? @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v3"
         : @"inuma.flutter_webrtc.macos_decoder_boundary_trace.v1",
     @"status" : @"pass",
     @"finding" : @"decoder_input_and_output_callback_boundaries_retained",
@@ -441,6 +458,18 @@ static NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshotInternal(
     segmented[@"stale_completion_count"] = @(snapshot->stale_completion_count);
     segmented[@"decode_inflight_count"] = @(decodeInflightCount);
     segmented[@"output_inflight_count"] = @(outputInflightCount);
+    segmented[@"terminal_drain_requested"] =
+        @(snapshot->terminal_drain_requested);
+    segmented[@"terminal_quiescence_timeout_ns"] =
+        @(kInumaDecoderTerminalQuiescenceTimeoutNs);
+    segmented[@"terminal_quiescence_wait_ns"] =
+        @(snapshot->terminal_quiescence_wait_ns);
+    segmented[@"terminal_quiescence_timeout_count"] =
+        @(snapshot->terminal_quiescence_timeout_count);
+    segmented[@"decode_rejections_after_terminal"] =
+        @(snapshot->decode_rejections_after_terminal);
+    segmented[@"output_rejections_after_terminal"] =
+        @(snapshot->output_rejections_after_terminal);
     report = segmented;
   }
   free(snapshot);
@@ -452,6 +481,57 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void) {
 }
 
 NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceDrainSnapshot(void) {
+  return InumaDecoderBoundaryTraceSnapshotInternal(YES);
+}
+
+static BOOL InumaDecoderBoundaryTraceHasIncompleteCallsLocked(void) {
+  for (NSUInteger index = 0;
+       index < gInumaDecoderBoundaryTrace.decode_count; index++) {
+    if (gInumaDecoderBoundaryTrace.decode_complete[index] == 0) return YES;
+  }
+  for (NSUInteger index = 0;
+       index < gInumaDecoderBoundaryTrace.output_count; index++) {
+    if (gInumaDecoderBoundaryTrace.output_complete[index] == 0) return YES;
+  }
+  return NO;
+}
+
+NSDictionary<NSString *, id> *
+InumaDecoderBoundaryTraceTerminalDrainSnapshot(void) {
+  const uint64_t startedAt = InumaDecoderMonotonicNanoseconds();
+  os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+  const BOOL enabled = gInumaDecoderBoundaryTrace.enabled;
+  if (enabled) {
+    gInumaDecoderBoundaryTrace.terminal_drain_requested = YES;
+  }
+  os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+
+  if (enabled) {
+    const struct timespec pollInterval = {
+      .tv_sec = 0,
+      .tv_nsec = kInumaDecoderTerminalQuiescencePollNs,
+    };
+    while (YES) {
+      const uint64_t elapsed =
+          InumaDecoderMonotonicNanoseconds() - startedAt;
+      if (elapsed >= kInumaDecoderTerminalQuiescenceTimeoutNs) {
+        os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+        gInumaDecoderBoundaryTrace.terminal_quiescence_timeout_count += 1;
+        os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+        break;
+      }
+      os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+      const BOOL incomplete =
+          InumaDecoderBoundaryTraceHasIncompleteCallsLocked();
+      os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+      if (!incomplete) break;
+      nanosleep(&pollInterval, NULL);
+    }
+    os_unfair_lock_lock(&gInumaDecoderBoundaryTraceLock);
+    gInumaDecoderBoundaryTrace.terminal_quiescence_wait_ns =
+        InumaDecoderMonotonicNanoseconds() - startedAt;
+    os_unfair_lock_unlock(&gInumaDecoderBoundaryTraceLock);
+  }
   return InumaDecoderBoundaryTraceSnapshotInternal(YES);
 }
 

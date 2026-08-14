@@ -13,4 +13,9 @@ NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshot(void);
  * counters and in-flight token ownership survive the segment boundary. */
 NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceDrainSnapshot(void);
 
+/** Latches the evidence boundary, rejects new trace tokens without changing
+ * decoder behavior, waits boundedly for already-started calls, then drains.
+ * A timeout remains explicit fail-closed evidence in the returned report. */
+NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceTerminalDrainSnapshot(void);
+
 NS_ASSUME_NONNULL_END

@@ -1761,7 +1761,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     @"presentation_trace_v2" : presentationTrace,
     @"decoder_boundary_trace" :
         (_inumaSegmentedEvidenceEnabled
-             ? InumaDecoderBoundaryTraceDrainSnapshot()
+             ? (terminal
+                    ? InumaDecoderBoundaryTraceTerminalDrainSnapshot()
+                    : InumaDecoderBoundaryTraceDrainSnapshot())
              : InumaDecoderBoundaryTraceSnapshot()),
     @"receiver_scheduler_trace" :
         (_inumaSegmentedEvidenceEnabled
