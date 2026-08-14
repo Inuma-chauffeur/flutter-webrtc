@@ -357,9 +357,12 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
 #endif
     }
     if (_inumaTrace.enabled) {
+      dispatch_queue_attr_t writerAttributes =
+          dispatch_queue_attr_make_with_qos_class(
+              DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
       _inumaTraceWriterQueue = dispatch_queue_create(
           "com.cloudwebrtc.flutterwebrtc.video-platform-view.trace-writer",
-          DISPATCH_QUEUE_SERIAL);
+          writerAttributes);
       _inumaTraceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                 _inumaTraceWriterQueue);
       dispatch_source_set_timer(

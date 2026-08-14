@@ -159,7 +159,7 @@ int main(void) {
                          hostTimeClock:InumaTestHostClock(capturedTimes)];
     INUMA_REQUIRE(paced != nil);
     INUMA_REQUIRE(paced.minimumPresentationIntervalNs == 25000000);
-    INUMA_REQUIRE(paced.maximumPresentationIntervalNs == 49999999);
+    INUMA_REQUIRE(paced.maximumPresentationIntervalNs == 66666666);
     INUMA_REQUIRE(paced.minimumPresentationLeadNs == 8333333);
     INUMA_REQUIRE(paced.stableCadenceIntervalMinimumNs == 25000000);
     INUMA_REQUIRE(paced.stableCadenceIntervalMaximumNs == 42000000);
@@ -337,6 +337,45 @@ int main(void) {
     INUMA_REQUIRE(late.rearmPrearmDiscardCount == 2);
     INUMA_REQUIRE(late.prearmDiscardCount == 5);
     INUMA_REQUIRE(late.acceptedCount == 3);
+
+    InumaStrictReplayPacer* boundedLateRecovery =
+        [[InumaStrictReplayPacer alloc]
+            initWithPresentationReserveNs:95000000
+                           frameIntervalNs:33333333
+                             queueCapacity:4
+                             hostTimeClock:InumaTestHostClock(@[
+                               @1000000000,
+                               @1033333333,
+                               @1066666666,
+                               @1099999999,
+                               @1134499999,
+                               @1168999999,
+                               @1203499999,
+                               @1237999999,
+                               @1272499999,
+                               @1306999999,
+                               @1437177124,
+                               @1438000000,
+                             ])];
+    for (uint64_t generation = 1; generation <= 10; generation++) {
+      pace = [boundedLateRecovery decisionForGeneration:generation];
+    }
+    INUMA_REQUIRE(pace.accepted && !pace.latePhaseCorrected);
+    const uint64_t beforeRecoveryPresentationNs =
+        pace.scheduledPresentationTimeNs;
+    pace = [boundedLateRecovery decisionForGeneration:11];
+    INUMA_REQUIRE(pace.accepted && pace.latePhaseCorrected && !pace.late &&
+                  !pace.rearmTriggered && pace.presentationResidenceNs ==
+                      8333333);
+    INUMA_REQUIRE(pace.scheduledPresentationTimeNs -
+                      beforeRecoveryPresentationNs ==
+                  50510460);
+    pace = [boundedLateRecovery decisionForGeneration:12];
+    INUMA_REQUIRE(pace.accepted && !pace.rearmTriggered);
+    INUMA_REQUIRE(boundedLateRecovery.latePhaseCorrectionCount == 1);
+    INUMA_REQUIRE(boundedLateRecovery.lateCount == 0);
+    INUMA_REQUIRE(boundedLateRecovery.rearmCount == 0);
+    INUMA_REQUIRE(boundedLateRecovery.rearmPrearmDiscardCount == 0);
 
     InumaStrictReplayPacer* external = [[InumaStrictReplayPacer alloc]
         initWithPresentationReserveNs:95000000

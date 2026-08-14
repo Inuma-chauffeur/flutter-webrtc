@@ -107,7 +107,7 @@ static uint64_t InumaSystemHostTimeNanoseconds(void) {
 static const uint64_t kInumaStrictReplayMinimumPresentationIntervalNs =
     25000000;
 static const uint64_t kInumaStrictReplayMaximumPresentationIntervalNs =
-    49999999;
+    66666666;
 static const uint64_t kInumaStrictReplayMinimumPresentationLeadNs = 8333333;
 static const uint64_t kInumaStrictReplayStableCadenceIntervalMinimumNs =
     25000000;
