@@ -5,6 +5,7 @@
 #import <WebRTC/RTCI420Buffer.h>
 #import <WebRTC/RTCYUVHelper.h>
 #import <os/lock.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +25,8 @@ enum {
 };
 static const uint64_t kInumaStrictReplayFrameIntervalNs = 33333333;
 static const uint64_t kInumaTraceCoherentSnapshotRetryNs = 10000000;
+static const uint64_t kInumaTerminalPresentationSettlementTimeoutNs = 250000000;
+static const uint64_t kInumaTerminalPresentationSettlementPollNs = 1000000;
 static const NSUInteger kInumaTraceMaximumCoherentSnapshotRetries = 3;
 static const void* kInumaNativeVideoSurfaceQueueKey =
     &kInumaNativeVideoSurfaceQueueKey;
@@ -231,7 +234,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   InumaPresentationDisplayLinkTarget* _inumaPresentationDisplayLinkTarget;
   InumaDisplayedFrameIdentityLedger* _inumaDisplayedIdentityLedger;
   uint64_t _inumaLastObservedNativeGeneration;
+  uint64_t _inumaLastEnqueuedNativeGeneration;
   BOOL _inumaHasLastObservedNativeGeneration;
+  BOOL _inumaHasLastEnqueuedNativeGeneration;
   BOOL _inumaHasObservedPresentationState;
   BOOL _inumaLastObservationResolved;
   BOOL _inumaNativeSurfaceSelected;
@@ -1090,6 +1095,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   const uint64_t completedAt = InumaNativeSurfaceMonotonicNanoseconds();
   os_unfair_lock_lock(&_inumaTraceLock);
   _inumaTrace.enqueue_completions += 1;
+  _inumaLastEnqueuedNativeGeneration = frameGeneration;
+  _inumaHasLastEnqueuedNativeGeneration = YES;
   if (_inumaTrace.enqueue_event_count < kInumaNativeVideoSurfaceTraceCapacity) {
     const NSUInteger index = _inumaTrace.enqueue_event_count++;
     _inumaTrace.enqueue_event_offset_ns[index] =
@@ -1100,6 +1107,37 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     _inumaTrace.capacity_exhaustions += 1;
   }
   os_unfair_lock_unlock(&_inumaTraceLock);
+}
+
+- (BOOL)inumaWaitForTerminalPresentationSettlement {
+  uint64_t targetGeneration = 0;
+  os_unfair_lock_lock(&_inumaTraceLock);
+  const BOOL hasTarget = _inumaHasLastEnqueuedNativeGeneration;
+  targetGeneration = _inumaLastEnqueuedNativeGeneration;
+  os_unfair_lock_unlock(&_inumaTraceLock);
+  if (!hasTarget) return YES;
+
+  const uint64_t startedAt = InumaNativeSurfaceMonotonicNanoseconds();
+  const uint64_t deadline = startedAt + kInumaTerminalPresentationSettlementTimeoutNs;
+  while (true) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    const BOOL settled = _inumaHasLastObservedNativeGeneration &&
+                         _inumaLastObservedNativeGeneration == targetGeneration;
+    os_unfair_lock_unlock(&_inumaTraceLock);
+    if (settled) return YES;
+
+    const uint64_t now = InumaNativeSurfaceMonotonicNanoseconds();
+    if (now >= deadline) return NO;
+    const uint64_t remaining = deadline - now;
+    const uint64_t sleepNs = MIN(
+        kInumaTerminalPresentationSettlementPollNs, remaining);
+    struct timespec delay = {
+        .tv_sec = (time_t)(sleepNs / NSEC_PER_SEC),
+        .tv_nsec = (long)(sleepNs % NSEC_PER_SEC),
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+  }
 }
 
 - (void)inumaStartPresentationDisplayLink {
@@ -1854,6 +1892,16 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   _inumaStopRequested = YES;
   os_unfair_lock_unlock(&_inumaTraceLock);
   [self inumaStopPresentationDisplayLink];
+  // The controller detaches the RTCVideoTrack before invoking this method, so
+  // no new render callback can be admitted. Finish every already accepted
+  // enqueue while the 1 ms displayed-buffer observer remains alive, then give
+  // the renderer one bounded residence window to expose the exact terminal
+  // generation. A timeout deliberately leaves an omission in trace-v2 and is
+  // therefore rejected by the retained gate rather than hidden at shutdown.
+  if (dispatch_get_specific(kInumaNativeVideoSurfaceQueueKey) == NULL) {
+    dispatch_sync(_sampleBufferQueue, ^{});
+  }
+  [self inumaWaitForTerminalPresentationSettlement];
   [self inumaStopNativePresentationObserver];
   void (^stopOnSampleQueue)(void) = ^{
     const uint64_t stopStartedAt = self->_inumaTrace.enabled
