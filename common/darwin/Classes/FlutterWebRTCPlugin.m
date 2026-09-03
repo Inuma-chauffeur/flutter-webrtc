@@ -905,6 +905,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 - (void)initialize:(NSArray*)networkIgnoreMask
     bypassVoiceProcessing:(BOOL)bypassVoiceProcessing
   lowLatencyVideoPlayout:(BOOL)lowLatencyVideoPlayout
+      useNWPathMonitor:(BOOL)useNWPathMonitor
   receiverSchedulerTrace:(BOOL)receiverSchedulerTrace
                  severity:(RTCLoggingSeverity)severity {
     // RTCSetMinDebugLogLevel(severity);
@@ -917,7 +918,10 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
             lowLatencyVideoPlayout);
         if (lowLatencyVideoPlayout) {
             [RTCPeerConnectionFactory configureFieldTrials:
-                InumaLowLatencyVideoPlayoutFieldTrials()];
+                InumaLowLatencyVideoPlayoutFieldTrials(useNWPathMonitor)];
+        } else if (!useNWPathMonitor) {
+            [RTCPeerConnectionFactory configureFieldTrials:
+                @"WebRTC-Network-UseNWPathMonitor/Disabled/"];
         }
 #endif
         VideoDecoderFactory* decoderFactory = [[VideoDecoderFactory alloc] init];
@@ -1017,6 +1021,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     }
 
     BOOL lowLatencyVideoPlayout = NO;
+    BOOL useNWPathMonitor = YES;
     BOOL receiverSchedulerTrace = NO;
 #if TARGET_OS_OSX
     InumaLowLatencyVideoPlayoutParseResult lowLatencyVideoPlayoutResult =
@@ -1028,6 +1033,15 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       result([FlutterError
           errorWithCode:@"invalid-options"
                 message:@"lowLatencyVideoPlayout must be a Boolean"
+                details:nil]);
+      return;
+    }
+    InumaNetworkMonitorParseResult networkMonitorResult =
+        InumaParseNetworkMonitorConfiguration(options, &useNWPathMonitor);
+    if (networkMonitorResult == InumaNetworkMonitorParseResultInvalid) {
+      result([FlutterError
+          errorWithCode:@"invalid-options"
+                message:@"networkUseNWPathMonitor must be a Boolean"
                 details:nil]);
       return;
     }
@@ -1047,6 +1061,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     [self initialize:networkIgnoreMask
         bypassVoiceProcessing:enableBypassVoiceProcessing
        lowLatencyVideoPlayout:lowLatencyVideoPlayout
+           useNWPathMonitor:useNWPathMonitor
        receiverSchedulerTrace:receiverSchedulerTrace
                      severity:severity];
     result(@"");

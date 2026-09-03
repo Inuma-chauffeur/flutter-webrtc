@@ -10,13 +10,25 @@ typedef NS_ENUM(NSUInteger, InumaLowLatencyVideoPlayoutParseResult) {
   InumaLowLatencyVideoPlayoutParseResultInvalid = 2,
 };
 
+typedef NS_ENUM(NSUInteger, InumaNetworkMonitorParseResult) {
+  InumaNetworkMonitorParseResultAbsent = 0,
+  InumaNetworkMonitorParseResultValid = 1,
+  InumaNetworkMonitorParseResultInvalid = 2,
+};
+
 FOUNDATION_EXPORT InumaLowLatencyVideoPlayoutParseResult
 InumaParseLowLatencyVideoPlayoutConfiguration(
     NSDictionary* _Nullable options,
     BOOL* _Nullable enabled);
 
+FOUNDATION_EXPORT InumaNetworkMonitorParseResult
+InumaParseNetworkMonitorConfiguration(
+    NSDictionary* _Nullable options,
+    BOOL* _Nullable enabled);
+
 /// Fixed, audited M144 receiver policy used only when the product opts in.
-FOUNDATION_EXPORT NSString* InumaLowLatencyVideoPlayoutFieldTrials(void);
+FOUNDATION_EXPORT NSString*
+InumaLowLatencyVideoPlayoutFieldTrials(BOOL useNWPathMonitor);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutForcedMinimumMs(void);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutForcedMaximumMs(void);
 FOUNDATION_EXPORT NSInteger InumaLowLatencyVideoPlayoutMinimumPacingMs(void);

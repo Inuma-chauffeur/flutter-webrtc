@@ -27,12 +27,36 @@ InumaParseLowLatencyVideoPlayoutConfiguration(NSDictionary* options,
   return InumaLowLatencyVideoPlayoutParseResultValid;
 }
 
-NSString* InumaLowLatencyVideoPlayoutFieldTrials(void) {
-  return @"WebRTC-Network-UseNWPathMonitor/Enabled/"
-          "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:10/"
+InumaNetworkMonitorParseResult
+InumaParseNetworkMonitorConfiguration(NSDictionary* options,
+                                      BOOL* enabled) {
+  if (enabled == NULL) {
+    return InumaNetworkMonitorParseResultInvalid;
+  }
+
+  id value = options[@"networkUseNWPathMonitor"];
+  if (value == nil) {
+    return InumaNetworkMonitorParseResultAbsent;
+  }
+  if (![value isKindOfClass:[NSNumber class]] ||
+      CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) {
+    return InumaNetworkMonitorParseResultInvalid;
+  }
+
+  *enabled = [value boolValue];
+  return InumaNetworkMonitorParseResultValid;
+}
+
+NSString* InumaLowLatencyVideoPlayoutFieldTrials(BOOL useNWPathMonitor) {
+  NSString* networkMonitor =
+      useNWPathMonitor
+          ? @"WebRTC-Network-UseNWPathMonitor/Enabled/"
+          : @"WebRTC-Network-UseNWPathMonitor/Disabled/";
+  return [networkMonitor stringByAppendingString:
+          @"WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:10/"
           "WebRTC-ZeroPlayoutDelay/min_pacing:16ms,max_decode_queue_size:5/"
           "WebRTC-NackInitialRttMs/10/"
-          "WebRTC-NackPeriodicIntervalMs/4/";
+          "WebRTC-NackPeriodicIntervalMs/4/"];
 }
 
 NSInteger InumaLowLatencyVideoPlayoutForcedMinimumMs(void) {
