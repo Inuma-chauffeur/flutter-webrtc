@@ -24,6 +24,7 @@ A new flutter plugin project.
     'Classes/InumaMainRunLoopNotificationPolicy.h',
     'Classes/InumaNativePresentationSeams.h',
     'Classes/InumaNativePresentationTrace.h',
+    'Classes/InumaNetworkAdapterClassification.h',
     'Classes/InumaLowLatencyVideoPlayoutConfiguration.h',
     'Classes/InumaPrerendererSmoothingConfiguration.h',
     'Classes/InumaReceiverSchedulerTraceConfiguration.h',
@@ -33,6 +34,7 @@ A new flutter plugin project.
 
   s.dependency 'FlutterMacOS'
   s.weak_frameworks = 'ScreenCaptureKit'
+  s.frameworks = 'SystemConfiguration'
   s.dependency 'WebRTC-SDK', '144.7559.09'
   s.osx.deployment_target = '10.15'
 end

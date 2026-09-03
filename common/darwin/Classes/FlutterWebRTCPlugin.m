@@ -21,6 +21,7 @@
 #if TARGET_OS_OSX
 #import "InumaDecoderBoundaryTrace.h"
 #import "InumaLowLatencyVideoPlayoutConfiguration.h"
+#import "InumaNetworkAdapterClassification.h"
 #import "InumaPrerendererSmoothingConfiguration.h"
 #import "InumaReceiverSchedulerTraceConfiguration.h"
 #import <WebRTC/RTCTracing.h>
@@ -1023,6 +1024,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
     BOOL lowLatencyVideoPlayout = NO;
     BOOL useNWPathMonitor = YES;
     BOOL receiverSchedulerTrace = NO;
+    NSString* requiredNetworkInterface = nil;
 #if TARGET_OS_OSX
     InumaLowLatencyVideoPlayoutParseResult lowLatencyVideoPlayoutResult =
         InumaParseLowLatencyVideoPlayoutConfiguration(
@@ -1045,6 +1047,18 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
                 details:nil]);
       return;
     }
+    InumaRequiredNetworkInterfaceParseResult requiredNetworkInterfaceResult =
+        InumaParseRequiredNetworkInterface(options, &requiredNetworkInterface);
+    if (requiredNetworkInterfaceResult ==
+            InumaRequiredNetworkInterfaceParseResultInvalid ||
+        (requiredNetworkInterface.length > 0 && useNWPathMonitor)) {
+      result([FlutterError
+          errorWithCode:@"invalid-options"
+                message:@"networkRequiredInterfaceName requires a bounded name and disabled NWPathMonitor"
+                details:nil]);
+      return;
+    }
+    InumaSetRequiredNetworkInterface(requiredNetworkInterface);
     InumaReceiverSchedulerTraceParseResult receiverSchedulerTraceResult =
         InumaParseReceiverSchedulerTraceConfiguration(
             options, &receiverSchedulerTrace);

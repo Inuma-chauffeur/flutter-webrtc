@@ -3,8 +3,20 @@
 #import "AudioUtils.h"
 #import "FlutterRTCDataChannel.h"
 #import "FlutterWebRTCPlugin.h"
+#if TARGET_OS_OSX
+#import "InumaNetworkAdapterClassification.h"
+#endif
 
 #import <WebRTC/WebRTC.h>
+
+static NSDictionary<NSString*, id>* FlutterRTCStatsValues(
+    RTCStatistics* report) {
+#if TARGET_OS_OSX
+  return InumaAttestLocalCandidateStatsValues(report.type, report.values);
+#else
+  return report.values;
+#endif
+}
 
 @implementation RTCPeerConnection (Flutter)
 
@@ -218,7 +230,7 @@
                             @"id" : report.id,
                             @"type" : report.type,
                             @"timestamp" : @(report.timestamp_us),
-                            @"values" : report.values
+                            @"values" : FlutterRTCStatsValues(report)
                           }];
                         }
                         result(@{@"stats" : stats});
@@ -233,7 +245,7 @@
                               @"id" : report.id,
                               @"type" : report.type,
                               @"timestamp" : @(report.timestamp_us),
-                              @"values" : report.values
+                              @"values" : FlutterRTCStatsValues(report)
                             }];
                           }
                           result(@{@"stats" : stats});
@@ -255,7 +267,7 @@
         @"id" : report.id,
         @"type" : report.type,
         @"timestamp" : @(report.timestamp_us),
-        @"values" : report.values
+        @"values" : FlutterRTCStatsValues(report)
       }];
     }
     result(@{@"stats" : stats});
