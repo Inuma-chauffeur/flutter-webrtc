@@ -44,6 +44,9 @@ int main(void) {
     Require(InumaAttestLocalCandidateStatsValues(@"local-candidate",
                                                   untouched) == untouched,
             @"the default path must not mutate candidate stats");
+    InumaSetRequiredNetworkInterface(@"inuma_missing0");
+    Require(!InumaRefreshNetworkAdapterStatsAttestation(),
+            @"an unavailable exact interface must fail closed");
     InumaSetRequiredNetworkInterface(@"en11");
     Require(InumaAttestLocalCandidateStatsValues(@"remote-candidate",
                                                   untouched) == untouched,
@@ -53,6 +56,47 @@ int main(void) {
         @{@"address" : @"192.0.2.1", @"networkAdapterType" : @"unknown"});
     Require(wrongAddress[@"inumaNetworkInterfaceBindingVerified"] == nil,
             @"an address outside the exact interface must remain unverified");
+
+    NSSet<NSString*>* addresses = [NSSet setWithArray:@[
+      @"10.88.0.2",
+      @"fe80::1234",
+    ]];
+    NSDictionary* attested =
+        InumaAttestLocalCandidateStatsValuesForTesting(
+            @"local-candidate", untouched, addresses, @"ethernet");
+    Require([attested[@"inumaNetworkInterfaceBindingVerified"] boolValue],
+            @"an exact cached address must be attested");
+    Require([attested[@"networkAdapterType"] isEqualToString:@"ethernet"],
+            @"the physical category must replace unknown");
+    Require([attested[@"networkType"] isEqualToString:@"ethernet"],
+            @"an unknown network type must use the physical category");
+    NSDictionary* scopedV6 =
+        InumaAttestLocalCandidateStatsValuesForTesting(
+            @"local-candidate",
+            @{
+              @"address" : @"[fe80::1234%en11]",
+              @"networkAdapterType" : @"unknown",
+            },
+            addresses,
+            @"ethernet");
+    Require([scopedV6[@"inumaNetworkInterfaceBindingVerified"] boolValue],
+            @"a scoped numeric address must normalize before matching");
+    NSDictionary* conflicting =
+        InumaAttestLocalCandidateStatsValuesForTesting(
+            @"local-candidate",
+            @{
+              @"address" : @"10.88.0.2",
+              @"networkAdapterType" : @"wifi",
+            },
+            addresses,
+            @"ethernet");
+    Require(conflicting[@"inumaNetworkInterfaceBindingVerified"] == nil,
+            @"a reported physical-category conflict must fail closed");
+    NSDictionary* missingSnapshot =
+        InumaAttestLocalCandidateStatsValuesForTesting(
+            @"local-candidate", untouched, [NSSet set], nil);
+    Require(missingSnapshot[@"inumaNetworkInterfaceBindingVerified"] == nil,
+            @"a missing cached snapshot must fail closed");
   }
   return 0;
 }

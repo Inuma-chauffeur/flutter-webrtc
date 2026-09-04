@@ -18,6 +18,12 @@ static NSDictionary<NSString*, id>* FlutterRTCStatsValues(
 #endif
 }
 
+static void FlutterRTCRefreshStatsAttestation(void) {
+#if TARGET_OS_OSX
+  InumaRefreshNetworkAdapterStatsAttestation();
+#endif
+}
+
 @implementation RTCPeerConnection (Flutter)
 
 @dynamic eventSink;
@@ -223,6 +229,7 @@ static NSDictionary<NSString*, id>* FlutterRTCStatsValues(
   if (sender != nil) {
     [peerConnection statisticsForSender:sender
                       completionHandler:^(RTCStatisticsReport* statsReport) {
+                        FlutterRTCRefreshStatsAttestation();
                         NSMutableArray* stats = [NSMutableArray array];
                         for (id key in statsReport.statistics) {
                           RTCStatistics* report = [statsReport.statistics objectForKey:key];
@@ -238,6 +245,7 @@ static NSDictionary<NSString*, id>* FlutterRTCStatsValues(
   } else if (receiver != nil) {
     [peerConnection statisticsForReceiver:receiver
                         completionHandler:^(RTCStatisticsReport* statsReport) {
+                          FlutterRTCRefreshStatsAttestation();
                           NSMutableArray* stats = [NSMutableArray array];
                           for (id key in statsReport.statistics) {
                             RTCStatistics* report = [statsReport.statistics objectForKey:key];
@@ -260,6 +268,7 @@ static NSDictionary<NSString*, id>* FlutterRTCStatsValues(
 - (void)peerConnectionGetStats:(nonnull RTCPeerConnection*)peerConnection
                         result:(nonnull FlutterResult)result {
   [peerConnection statisticsWithCompletionHandler:^(RTCStatisticsReport* statsReport) {
+    FlutterRTCRefreshStatsAttestation();
     NSMutableArray* stats = [NSMutableArray array];
     for (id key in statsReport.statistics) {
       RTCStatistics* report = [statsReport.statistics objectForKey:key];

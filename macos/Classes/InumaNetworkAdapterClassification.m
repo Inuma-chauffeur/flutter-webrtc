@@ -9,6 +9,9 @@
 
 static os_unfair_lock gInumaRequiredInterfaceLock = OS_UNFAIR_LOCK_INIT;
 static NSString* gInumaRequiredInterfaceName = nil;
+static NSSet<NSString*>* gInumaRequiredInterfaceAddresses = nil;
+static NSString* gInumaRequiredInterfaceCategory = nil;
+static BOOL gInumaRequiredInterfaceSnapshotValid = NO;
 
 static BOOL InumaInterfaceNameIsValid(NSString* value) {
   if (value.length == 0 || value.length >= IFNAMSIZ ||
@@ -48,6 +51,9 @@ InumaParseRequiredNetworkInterface(NSDictionary* options,
 void InumaSetRequiredNetworkInterface(NSString* interfaceName) {
   os_unfair_lock_lock(&gInumaRequiredInterfaceLock);
   gInumaRequiredInterfaceName = [interfaceName copy];
+  gInumaRequiredInterfaceAddresses = nil;
+  gInumaRequiredInterfaceCategory = nil;
+  gInumaRequiredInterfaceSnapshotValid = NO;
   os_unfair_lock_unlock(&gInumaRequiredInterfaceLock);
 }
 
@@ -73,41 +79,37 @@ static NSString* InumaNormalizedNumericAddress(NSString* value) {
   return normalized;
 }
 
-static BOOL InumaSockaddrMatchesAddress(const struct sockaddr* socketAddress,
-                                        NSString* candidateAddress) {
-  NSString* normalized = InumaNormalizedNumericAddress(candidateAddress);
-  const char* encoded = normalized.UTF8String;
-  if (encoded == NULL || socketAddress == NULL) {
-    return NO;
+static NSString* InumaNumericAddressForSockaddr(
+    const struct sockaddr* socketAddress) {
+  if (socketAddress == NULL) {
+    return nil;
   }
+  char buffer[INET6_ADDRSTRLEN] = {0};
   if (socketAddress->sa_family == AF_INET) {
-    struct in_addr candidate = {0};
-    if (inet_pton(AF_INET, encoded, &candidate) != 1) {
-      return NO;
-    }
     const struct sockaddr_in* current =
         (const struct sockaddr_in*)socketAddress;
-    return memcmp(&candidate, &current->sin_addr, sizeof(candidate)) == 0;
-  }
-  if (socketAddress->sa_family == AF_INET6) {
-    struct in6_addr candidate = {0};
-    if (inet_pton(AF_INET6, encoded, &candidate) != 1) {
-      return NO;
+    if (inet_ntop(AF_INET, &current->sin_addr, buffer, sizeof(buffer)) == NULL) {
+      return nil;
     }
+  } else if (socketAddress->sa_family == AF_INET6) {
     const struct sockaddr_in6* current =
         (const struct sockaddr_in6*)socketAddress;
-    return memcmp(&candidate, &current->sin6_addr, sizeof(candidate)) == 0;
+    if (inet_ntop(AF_INET6, &current->sin6_addr, buffer, sizeof(buffer)) ==
+        NULL) {
+      return nil;
+    }
+  } else {
+    return nil;
   }
-  return NO;
+  return [NSString stringWithUTF8String:buffer];
 }
 
-static BOOL InumaCandidateAddressBelongsToInterface(NSString* address,
-                                                    NSString* interfaceName) {
+static NSSet<NSString*>* InumaAddressesForInterface(NSString* interfaceName) {
   struct ifaddrs* interfaces = NULL;
   if (getifaddrs(&interfaces) != 0 || interfaces == NULL) {
-    return NO;
+    return nil;
   }
-  BOOL matched = NO;
+  NSMutableSet<NSString*>* addresses = [NSMutableSet set];
   const char* requiredName = interfaceName.UTF8String;
   for (const struct ifaddrs* current = interfaces; current != NULL;
        current = current->ifa_next) {
@@ -116,13 +118,13 @@ static BOOL InumaCandidateAddressBelongsToInterface(NSString* address,
         (current->ifa_flags & IFF_UP) == 0) {
       continue;
     }
-    if (InumaSockaddrMatchesAddress(current->ifa_addr, address)) {
-      matched = YES;
-      break;
+    NSString* address = InumaNumericAddressForSockaddr(current->ifa_addr);
+    if (address.length > 0) {
+      [addresses addObject:InumaNormalizedNumericAddress(address)];
     }
   }
   freeifaddrs(interfaces);
-  return matched;
+  return [addresses copy];
 }
 
 static NSString* InumaAdapterCategoryForInterface(NSString* interfaceName) {
@@ -145,23 +147,70 @@ static NSString* InumaAdapterCategoryForInterface(NSString* interfaceName) {
   return nil;
 }
 
+BOOL InumaRefreshNetworkAdapterStatsAttestation(void) {
+  NSString* requiredInterface = InumaRequiredNetworkInterface();
+  if (requiredInterface.length == 0) {
+    return YES;
+  }
+  NSSet<NSString*>* addresses =
+      InumaAddressesForInterface(requiredInterface);
+  NSString* physicalCategory =
+      InumaAdapterCategoryForInterface(requiredInterface);
+  BOOL valid = addresses.count > 0 && physicalCategory.length > 0;
+
+  os_unfair_lock_lock(&gInumaRequiredInterfaceLock);
+  if ([gInumaRequiredInterfaceName isEqualToString:requiredInterface]) {
+    gInumaRequiredInterfaceAddresses = valid ? [addresses copy] : nil;
+    gInumaRequiredInterfaceCategory = valid ? [physicalCategory copy] : nil;
+    gInumaRequiredInterfaceSnapshotValid = valid;
+  } else {
+    valid = NO;
+  }
+  os_unfair_lock_unlock(&gInumaRequiredInterfaceLock);
+  return valid;
+}
+
 NSDictionary<NSString*, id>* InumaAttestLocalCandidateStatsValues(
     NSString* reportType, NSDictionary<NSString*, id>* values) {
   if (![reportType.lowercaseString isEqualToString:@"local-candidate"]) {
     return values;
   }
-  NSString* requiredInterface = InumaRequiredNetworkInterface();
+  os_unfair_lock_lock(&gInumaRequiredInterfaceLock);
+  NSString* requiredInterface = [gInumaRequiredInterfaceName copy];
+  NSSet<NSString*>* addresses =
+      gInumaRequiredInterfaceSnapshotValid
+          ? [gInumaRequiredInterfaceAddresses copy]
+          : nil;
+  NSString* physicalCategory =
+      gInumaRequiredInterfaceSnapshotValid
+          ? [gInumaRequiredInterfaceCategory copy]
+          : nil;
+  os_unfair_lock_unlock(&gInumaRequiredInterfaceLock);
   if (requiredInterface.length == 0) {
     return values;
   }
-  id addressValue = values[@"address"] ?: values[@"ip"];
-  if (![addressValue isKindOfClass:[NSString class]] ||
-      !InumaCandidateAddressBelongsToInterface(
-          (NSString*)addressValue, requiredInterface)) {
+  return InumaAttestLocalCandidateStatsValuesForTesting(
+      reportType, values, addresses ?: [NSSet set], physicalCategory);
+}
+
+NSDictionary<NSString*, id>*
+InumaAttestLocalCandidateStatsValuesForTesting(
+    NSString* reportType,
+    NSDictionary<NSString*, id>* values,
+    NSSet<NSString*>* interfaceAddresses,
+    NSString* physicalCategory) {
+  if (![reportType.lowercaseString isEqualToString:@"local-candidate"]) {
     return values;
   }
-  NSString* physicalCategory =
-      InumaAdapterCategoryForInterface(requiredInterface);
+  id addressValue = values[@"address"] ?: values[@"ip"];
+  NSString* normalizedAddress =
+      [addressValue isKindOfClass:[NSString class]]
+          ? InumaNormalizedNumericAddress((NSString*)addressValue)
+          : nil;
+  if (normalizedAddress.length == 0 ||
+      ![interfaceAddresses containsObject:normalizedAddress]) {
+    return values;
+  }
   NSString* reportedCategory =
       [values[@"networkAdapterType"] isKindOfClass:[NSString class]]
           ? [values[@"networkAdapterType"] lowercaseString]
