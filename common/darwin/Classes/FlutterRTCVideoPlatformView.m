@@ -246,6 +246,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   BOOL _inumaSurfaceRegistered;
   BOOL _inumaDrainScheduled;
   NSUInteger _inumaStrictReplayDispatchPending;
+  dispatch_group_t _inumaRenderCallbackGroup;
+  BOOL _inumaTerminalRenderCallbackDrainSucceeded;
   BOOL _inumaStopRequested;
   BOOL _inumaShuttingDown;
   CMSampleBufferRef _inumaPendingSampleBuffer;
@@ -282,6 +284,8 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     _lastVideoRotation = RTCVideoRotation_0;
 #if TARGET_OS_OSX
     _inumaTraceLock = OS_UNFAIR_LOCK_INIT;
+    _inumaRenderCallbackGroup = dispatch_group_create();
+    _inumaTerminalRenderCallbackDrainSucceeded = YES;
     NSDictionary<NSString*, NSString*>* environment = NSProcessInfo.processInfo.environment;
     _inumaNativeSurfaceSelected =
         [environment[@"INUMA_FLUTTER_WEBRTC_MACOS_PIXEL_MODE"]
@@ -438,6 +442,30 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     return;
   }
 
+#if TARGET_OS_OSX
+  // Stop and callback admission share one lock. Once stop owns the lock and
+  // flips the flag, no later WebRTC callback can enter the terminal drain;
+  // every callback admitted before that point is represented by the group.
+  os_unfair_lock_lock(&_inumaTraceLock);
+  const BOOL renderCallbackAccepted = !_inumaStopRequested;
+  if (renderCallbackAccepted) {
+    dispatch_group_enter(_inumaRenderCallbackGroup);
+  }
+  os_unfair_lock_unlock(&_inumaTraceLock);
+  if (!renderCallbackAccepted) {
+    return;
+  }
+  @try {
+    [self inumaRenderAdmittedFrame:frame];
+  } @finally {
+    dispatch_group_leave(_inumaRenderCallbackGroup);
+  }
+#else
+  [self inumaRenderAdmittedFrame:frame];
+#endif
+}
+
+- (void)inumaRenderAdmittedFrame:(RTC_OBJC_TYPE(RTCVideoFrame) *)frame {
 #if TARGET_OS_OSX
   uint64_t frameGeneration = 0;
   uint64_t frameRtpTimestamp = 0;
@@ -1489,6 +1517,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
            snapshot->sample_buffer_failures +
                snapshot->strict_replay_dispatch_submissions +
                snapshot->strict_replay_dispatch_overflow_rejections &&
+       _inumaTerminalRenderCallbackDrainSucceeded &&
        strictReplayDispatchPending == 0 &&
        snapshot->strict_replay_dispatch_submissions ==
            snapshot->enqueue_attempts +
@@ -1892,12 +1921,22 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   _inumaStopRequested = YES;
   os_unfair_lock_unlock(&_inumaTraceLock);
   [self inumaStopPresentationDisplayLink];
-  // The controller detaches the RTCVideoTrack before invoking this method, so
-  // no new render callback can be admitted. Finish every already accepted
-  // enqueue while the 1 ms displayed-buffer observer remains alive, then give
-  // the renderer one bounded residence window to expose the exact terminal
-  // generation. A timeout deliberately leaves an omission in trace-v2 and is
-  // therefore rejected by the retained gate rather than hidden at shutdown.
+  // Detaching the track prevents future delivery but does not prove a callback
+  // that was already executing has finished scheduling its sample-buffer work.
+  // Close callback admission first, wait for every previously admitted
+  // callback, drain its queued enqueue, and only then capture the terminal
+  // presentation target while the 1 ms displayed-buffer observer remains
+  // alive. Any callback-quiescence timeout permanently fails the terminal
+  // snapshot; it is never converted into an omission-free report.
+  const long renderCallbackDrain = dispatch_group_wait(
+      _inumaRenderCallbackGroup,
+      dispatch_time(DISPATCH_TIME_NOW,
+                    kInumaTerminalPresentationSettlementTimeoutNs));
+  if (renderCallbackDrain != 0) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    _inumaTerminalRenderCallbackDrainSucceeded = NO;
+    os_unfair_lock_unlock(&_inumaTraceLock);
+  }
   if (dispatch_get_specific(kInumaNativeVideoSurfaceQueueKey) == NULL) {
     dispatch_sync(_sampleBufferQueue, ^{});
   }
