@@ -110,7 +110,7 @@ static NSString *gInumaDecoderBoundaryTraceCodecName = nil;
 static NSString *gInumaDecoderBoundaryTraceImplementationName = nil;
 
 static uint64_t InumaDecoderMonotonicNanoseconds(void) {
-  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
 static BOOL InumaDecoderTraceEnvironmentEnabled(void) {
@@ -412,7 +412,7 @@ static NSDictionary<NSString *, id> *InumaDecoderBoundaryTraceSnapshotInternal(
     @"finding" : @"decoder_input_and_output_callback_boundaries_retained",
     @"enabled" : @(YES),
     @"payload_policy" : @"scalar_timing_and_counts_only_no_media_payloads",
-    @"clock_domain" : @"macos_clock_monotonic_raw_shared_mach_host_time",
+    @"clock_domain" : @"macos_clock_uptime_raw_shared_mach_absolute_time",
     @"sample_capacity" : @(kInumaDecoderBoundaryTraceCapacity),
     @"sample_capacity_exhaustions" :
         @(snapshot->sample_capacity_exhaustions),

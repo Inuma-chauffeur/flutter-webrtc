@@ -177,7 +177,7 @@ static BOOL InumaWriteAll(int descriptor, NSData* data) {
     @"status" : @"pass",
     @"finding" : @"immutable_segmented_scalar_evidence_manifest",
     @"session_sequence" : @(_sessionSequence),
-    @"clock_domain" : @"macos_clock_monotonic_raw_shared_mach_host_time",
+    @"clock_domain" : @"macos_clock_uptime_raw_shared_mach_absolute_time",
     @"payload_policy" : kInumaScalarPayloadPolicy,
     @"segment_interval_ns" : @(_segmentIntervalNs),
     @"segment_count" : @(_entries.count),

@@ -97,6 +97,15 @@ static CMSampleBufferRef InumaTestSampleBuffer(void) {
 
 int main(void) {
   @autoreleasepool {
+    const uint64_t uptimeBeforeNs =
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t systemClockNs =
+        [InumaMonotonicClock systemClock].nowNanoseconds;
+    const uint64_t uptimeAfterNs =
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    INUMA_REQUIRE(systemClockNs >= uptimeBeforeNs &&
+                  systemClockNs <= uptimeAfterNs);
+
     CMSampleBufferRef sampleBuffer = InumaTestSampleBuffer();
     INUMA_REQUIRE(sampleBuffer != nil);
     INUMA_REQUIRE(CMTIME_IS_INVALID(CMSampleBufferGetPresentationTimeStamp(

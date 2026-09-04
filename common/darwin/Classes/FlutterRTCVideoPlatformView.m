@@ -126,7 +126,7 @@ typedef struct {
 } InumaNativeVideoSurfaceTrace;
 
 static uint64_t InumaNativeSurfaceMonotonicNanoseconds(void) {
-  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
 static uint64_t InumaNativeSurfaceHostTimeNanoseconds(void) {
@@ -1665,7 +1665,7 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
         @(pacerSnapshot.queueDepthHighWater),
     @"payload_policy" : @"scalar_timing_and_counts_only_no_pixel_payloads",
     @"trace_clock_domain" :
-        @"macos_clock_monotonic_raw_shared_mach_host_time",
+        @"macos_clock_uptime_raw_shared_mach_absolute_time",
     @"frame_identity_contract" :
         @"crc16_product_watermark_frame_identity_joined_to_renderer_local_context",
     @"display_identity_binding_contract" :

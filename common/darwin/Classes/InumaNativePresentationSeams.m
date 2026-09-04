@@ -25,7 +25,7 @@
 
 + (instancetype)systemClock {
   return [[self alloc] initWithNowBlock:^{
-    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   }];
 }
 

@@ -46,6 +46,8 @@ int main(void) {
                                                            options:0
                                                              error:nil];
     INUMA_REQUIRE([report[@"status"] isEqualToString:@"pass"]);
+    INUMA_REQUIRE([report[@"clock_domain"]
+        isEqualToString:@"macos_clock_uptime_raw_shared_mach_absolute_time"]);
     INUMA_REQUIRE([report[@"segment_count"] unsignedIntegerValue] == 2);
     INUMA_REQUIRE([report[@"terminal"] boolValue]);
     INUMA_REQUIRE(writer.writeFailureCount == 0);

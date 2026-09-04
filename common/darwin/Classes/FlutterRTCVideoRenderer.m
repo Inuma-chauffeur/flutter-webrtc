@@ -406,7 +406,7 @@ typedef struct {
 } InumaTextureTrace;
 
 static uint64_t InumaMonotonicNanoseconds(void) {
-  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
 static uint64_t InumaUptimeNanoseconds(void) {
@@ -3913,7 +3913,7 @@ static void InumaMainRunLoopNotificationPerform(void *info) {
     @"low_latency_video_playout_nack_timer_high_precision" :
         @(InumaLowLatencyVideoPlayoutNackTimerHighPrecision()),
     @"trace_clock_domain" :
-        @"macos_clock_monotonic_raw_shared_mach_host_time",
+        @"macos_clock_uptime_raw_shared_mach_absolute_time",
     @"texture_notification_contract" :
         @"frame_state_before_platform_thread_notification",
     @"frame_ownership_contract" :
