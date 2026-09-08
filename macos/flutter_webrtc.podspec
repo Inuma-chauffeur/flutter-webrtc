@@ -22,6 +22,7 @@ A new flutter plugin project.
     'Classes/InumaEmergencyGracePolicy.h',
     'Classes/InumaFrameOwnershipPolicy.h',
     'Classes/InumaMainRunLoopNotificationPolicy.h',
+    'Classes/InumaNativeObserverTiming.h',
     'Classes/InumaNativePresentationSeams.h',
     'Classes/InumaNativePresentationTrace.h',
     'Classes/InumaNetworkAdapterClassification.h',
