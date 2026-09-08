@@ -38,12 +38,18 @@ static void FlutterRTCRefreshStatsAttestation(void) {
 }
 
 - (FlutterEventSink)eventSink {
-  return objc_getAssociatedObject(self, _cmd);
+  @synchronized(self) {
+    // Retain while the same lock still excludes listener cancellation.
+    FlutterEventSink sink = objc_getAssociatedObject(self, _cmd);
+    return sink;
+  }
 }
 
 - (void)setEventSink:(FlutterEventSink)eventSink {
-  objc_setAssociatedObject(self, @selector(eventSink), eventSink,
-                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  @synchronized(self) {
+    objc_setAssociatedObject(self, @selector(eventSink), eventSink,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
+  }
 }
 
 - (FlutterEventChannel*)eventChannel {
@@ -192,6 +198,15 @@ static void FlutterRTCRefreshStatsAttestation(void) {
 }
 
 - (void)peerConnectionClose:(RTCPeerConnection*)peerConnection {
+  // Registry and Flutter handler ownership belong to the platform thread.
+  // Remove admission before native Close can deliver or queue final callbacks.
+  if (self.peerConnections[peerConnection.flutterId] == peerConnection) {
+    [self.peerConnections removeObjectForKey:peerConnection.flutterId];
+  }
+  peerConnection.eventSink = nil;
+  [peerConnection.eventChannel setStreamHandler:nil];
+  peerConnection.eventChannel = nil;
+  peerConnection.delegate = nil;
   [peerConnection close];
 
   // Clean up peerConnection's streams and tracks
@@ -200,8 +215,14 @@ static void FlutterRTCRefreshStatsAttestation(void) {
 
   // Clean up peerConnection's dataChannels.
   NSMutableDictionary<NSString*, RTCDataChannel*>* dataChannels = peerConnection.dataChannels;
-  for (NSString* dataChannelId in dataChannels) {
-    dataChannels[dataChannelId].delegate = nil;
+  for (RTCDataChannel* dataChannel in dataChannels.allValues) {
+    dataChannel.delegate = nil;
+    [dataChannel.eventChannel setStreamHandler:nil];
+    dataChannel.eventChannel = nil;
+    @synchronized(dataChannel) {
+      dataChannel.eventSink = nil;
+      dataChannel.eventQueue = nil;
+    }
     // There is no need to close the RTCDataChannel because it is owned by the
     // RTCPeerConnection and the latter will close the former.
   }
@@ -595,20 +616,26 @@ static void FlutterRTCRefreshStatsAttestation(void) {
   NSString* flutterChannelId = [[NSUUID UUID] UUIDString];
   NSNumber* dataChannelId = [NSNumber numberWithInteger:dataChannel.channelId];
   dataChannel.peerConnectionId = peerConnection.flutterId;
+  dataChannel.flutterChannelId = flutterChannelId;
   dataChannel.eventQueue = nil;
   dataChannel.delegate = self;
-  peerConnection.dataChannels[flutterChannelId] = dataChannel;
-
-  FlutterEventChannel* eventChannel = [FlutterEventChannel
-      eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/dataChannelEvent%1$@%2$@",
-                                                      peerConnection.flutterId, flutterChannelId]
-           binaryMessenger:self.messenger];
-
-  dataChannel.eventChannel = eventChannel;
-  dataChannel.flutterChannelId = flutterChannelId;
 
   dispatch_async(dispatch_get_main_queue(), ^{
-    // setStreamHandler on main thread
+    // A signaling callback may already be queued when close/dispose removes
+    // the peer. Never reinstall its messenger handler or mutate its registry.
+    if (self.peerConnections[peerConnection.flutterId] != peerConnection) {
+      dataChannel.delegate = nil;
+      @synchronized(dataChannel) {
+        dataChannel.eventQueue = nil;
+      }
+      return;
+    }
+    peerConnection.dataChannels[flutterChannelId] = dataChannel;
+    FlutterEventChannel* eventChannel = [FlutterEventChannel
+        eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/dataChannelEvent%1$@%2$@",
+                                                        peerConnection.flutterId, flutterChannelId]
+             binaryMessenger:self.messenger];
+    dataChannel.eventChannel = eventChannel;
     [eventChannel setStreamHandler:dataChannel];
     FlutterEventSink eventSink = peerConnection.eventSink;
     if (eventSink) {

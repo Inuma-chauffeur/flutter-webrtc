@@ -7,11 +7,16 @@
 @property(nonatomic, strong, nonnull)
     NSMutableDictionary<NSString*, RTCMediaStreamTrack*>* remoteTracks;
 @property(nonatomic, strong, nonnull) NSString* flutterId;
-@property(nonatomic, strong, nullable) FlutterEventSink eventSink;
+// Accessors serialize block acquisition and replacement across native callbacks.
+@property(nonatomic, copy, nullable) FlutterEventSink eventSink;
 @property(nonatomic, strong, nullable) FlutterEventChannel* eventChannel;
 @end
 
 @interface FlutterWebRTCPlugin (RTCPeerConnection)
+
+// Platform-thread teardown shared by close, dispose and engine detach.
+// Native WebRTC Close must execute without holding a plugin/peer/channel lock.
+- (void)peerConnectionClose:(nonnull RTCPeerConnection*)peerConnection;
 
 - (void)peerConnectionCreateOffer:(nonnull NSDictionary*)constraints
                    peerConnection:(nonnull RTCPeerConnection*)peerConnection

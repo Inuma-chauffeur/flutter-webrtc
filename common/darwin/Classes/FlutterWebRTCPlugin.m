@@ -835,10 +835,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
 - (void)detachFromEngineForRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
   for (RTCPeerConnection* peerConnection in _peerConnections.allValues) {
-    for (RTCDataChannel* dataChannel in peerConnection.dataChannels) {
-      dataChannel.eventSink = nil;
-    }
-    peerConnection.eventSink = nil;
+    [self peerConnectionClose:peerConnection];
   }
   _eventSink = nil;
 }
@@ -1539,21 +1536,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
     RTCPeerConnection* peerConnection = self.peerConnections[peerConnectionId];
     if (peerConnection) {
-      [peerConnection close];
-      [self.peerConnections removeObjectForKey:peerConnectionId];
-
-      // Clean up peerConnection's streams and tracks
-      [peerConnection.remoteStreams removeAllObjects];
-      [peerConnection.remoteTracks removeAllObjects];
-
-      // Clean up peerConnection's dataChannels.
-      NSMutableDictionary<NSString*, RTCDataChannel*>* dataChannels = peerConnection.dataChannels;
-      for (NSString* dataChannelId in dataChannels) {
-        dataChannels[dataChannelId].delegate = nil;
-        // There is no need to close the RTCDataChannel because it is owned by the
-        // RTCPeerConnection and the latter will close the former.
-      }
-      [dataChannels removeAllObjects];
+      [self peerConnectionClose:peerConnection];
     }
     [self deactiveRtcAudioSession];
     result(nil);

@@ -113,10 +113,16 @@
   RTCDataChannel* dataChannel = dataChannels[dataChannelId];
   if (dataChannel) {
     FlutterEventChannel* eventChannel = dataChannel.eventChannel;
-    [dataChannel close];
     [dataChannels removeObjectForKey:dataChannelId];
+    dataChannel.delegate = nil;
+    // Close can synchronize with WebRTC; do not hold the event-queue lock.
+    [dataChannel close];
     [eventChannel setStreamHandler:nil];
     dataChannel.eventChannel = nil;
+    @synchronized(dataChannel) {
+      dataChannel.eventSink = nil;
+      dataChannel.eventQueue = nil;
+    }
   }
 }
 
