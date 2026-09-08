@@ -15,6 +15,7 @@
 #include "InumaDecoderBoundaryTrace.h"
 #include "InumaLowLatencyVideoPlayoutConfiguration.h"
 #include "InumaNativePresentationSeams.h"
+#include "InumaNativeObserverTiming.h"
 #include "InumaPrerendererSmoothingConfiguration.h"
 #include "InumaSegmentedScalarEvidenceWriter.h"
 
@@ -38,6 +39,7 @@ static uint64_t gInumaNativeVideoSurfaceMaximumLiveCount = 0;
 
 typedef struct {
   bool enabled;
+  InumaNativeObserverTiming observer_timing;
   uint64_t render_frames;
   uint64_t direct_pixel_buffer_frames;
   uint64_t converted_pixel_buffer_frames;
@@ -1338,9 +1340,17 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
 }
 
 - (void)inumaObserveNativePresentedPixelBuffer API_AVAILABLE(macos(14.4)) {
+  const uint64_t copyBeginNs = InumaNativeSurfaceMonotonicNanoseconds();
   CVPixelBufferRef displayed =
       [_videoLayer.sampleBufferRenderer copyDisplayedPixelBuffer];
-  if (displayed == nil) return;
+  const uint64_t copyEndNs = InumaNativeSurfaceMonotonicNanoseconds();
+  if (displayed == nil) {
+    os_unfair_lock_lock(&_inumaTraceLock);
+    InumaNativeObserverRecordPoll(&_inumaTrace.observer_timing,
+                                 copyBeginNs, copyEndNs, false, false, 0);
+    os_unfair_lock_unlock(&_inumaTraceLock);
+    return;
+  }
   InumaPresentationFrameContext context = {0};
   const uint64_t lookupStartedAt = InumaNativeSurfaceMonotonicNanoseconds();
   const InumaDisplayedFrameIdentityLookupResult lookup =
@@ -1352,6 +1362,9 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   const BOOL lookupFound = lookup == InumaDisplayedFrameIdentityLookupFound;
   BOOL newObservation = NO;
   os_unfair_lock_lock(&_inumaTraceLock);
+  const uint64_t previousResolvedCopyBeginNs = InumaNativeObserverRecordPoll(
+      &_inumaTrace.observer_timing, copyBeginNs, copyEndNs, true,
+      lookupFound, context.nativeGeneration);
   _inumaTrace.display_identity_watermark_reads += 1;
   _inumaTrace.display_identity_watermark_decode_successes +=
       lookup == InumaDisplayedFrameIdentityLookupFound ||
@@ -1401,14 +1414,17 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
   }
   os_unfair_lock_unlock(&_inumaTraceLock);
   if (newObservation) {
+    // Preserve the original post-lookup/post-lock event boundary. The two
+    // existing scalars add an API observation window without another event.
+    const uint64_t observedAtNs = InumaNativeSurfaceMonotonicNanoseconds();
     [_inumaPresentationTrace
         recordEventKind:(lookupFound
                              ? InumaPresentationEventDisplayedObserved
                              : InumaPresentationEventDisplayedLookupMiss)
-                    atNs:InumaNativeSurfaceMonotonicNanoseconds()
+                    atNs:observedAtNs
                  context:context
-               durationNs:0
-                     value:0];
+               durationNs:(lookupFound ? observedAtNs - copyBeginNs : 0)
+                     value:(lookupFound ? previousResolvedCopyBeginNs : 0)];
   }
   CFRelease(displayed);
 }
@@ -1700,6 +1716,22 @@ typedef void (^InumaPresentationDisplayLinkHandler)(id displayLink);
     @"display_identity_binding_contract" :
         @"crc16_product_watermark_decoded_from_each_accepted_input_pixel_buffer_then_resolved_from_renderer_displayed_pixel_buffer_with_source_identity_keyed_context_no_ordinal_assumption_no_pointer_identity_no_pixel_retention",
     @"display_identity_context_binding_version" : @2,
+    @"display_observer_timing" : @{
+      @"version" : @1,
+      @"contract" : @"copy_begin_to_original_observed_event_duration_previous_resolved_copy_begin_value_api_witness_not_panel",
+      @"poll_count" : @(snapshot->observer_timing.pollCount),
+      @"nil_count" : @(snapshot->observer_timing.nilCount),
+      @"resolved_count" : @(snapshot->observer_timing.resolvedCount),
+      @"unresolved_count" : @(snapshot->observer_timing.unresolvedCount),
+      @"invalid_timing_count" : @(snapshot->observer_timing.invalidTimingCount),
+      @"first_copy_begin_ns" : @(snapshot->observer_timing.firstCopyBeginNs),
+      @"last_copy_begin_ns" : @(snapshot->observer_timing.lastCopyBeginNs),
+      @"last_copy_end_ns" : @(snapshot->observer_timing.lastCopyEndNs),
+      @"copy_total_duration_ns" : @(snapshot->observer_timing.copyTotalDurationNs),
+      @"copy_maximum_duration_ns" : @(snapshot->observer_timing.copyMaximumDurationNs),
+      @"poll_gap_maximum_ns" : @(snapshot->observer_timing.pollGapMaximumNs),
+      @"poll_gaps_over_20ms" : @(snapshot->observer_timing.pollGapsOver20Ms),
+    },
     @"sample_capacity" : @(kInumaNativeVideoSurfaceTraceCapacity),
     @"sample_capacity_exhaustions" : @(snapshot->capacity_exhaustions),
     @"trace_started_monotonic_ns" : @(_inumaTraceStartedMonotonicNs),
