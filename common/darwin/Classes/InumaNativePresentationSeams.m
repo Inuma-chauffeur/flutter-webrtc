@@ -117,6 +117,8 @@ static const NSUInteger kInumaStrictReplayRequiredStableCadenceIntervals = 3;
 static const uint64_t kInumaDisplayRefreshPeriodMinimumNs = 8000000;
 static const uint64_t kInumaDisplayRefreshPeriodMaximumNs = 25000000;
 static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
+// Follow slow display-clock drift without a refresh-sized PTS discontinuity.
+static const uint64_t kInumaDisplayPhaseMaximumCorrectionNs = 100000;
 
 @implementation InumaStrictReplayPacer {
   os_unfair_lock _lock;
@@ -125,6 +127,7 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
   NSUInteger _queueHead;
   NSUInteger _queueCount;
   BOOL _timelineStarted;
+  BOOL _displayPhaseTrackingArmed;
   BOOL _stopped;
   uint64_t _lastObservedGeneration;
   uint64_t _lastArrivalNs;
@@ -206,6 +209,7 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
     return NO;
   }
   _timelineStarted = NO;
+  _displayPhaseTrackingArmed = NO;
   _queueHead = 0;
   _queueCount = 0;
   _lastScheduledPresentationTimeNs = 0;
@@ -303,6 +307,36 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
   return YES;
 }
 
+// The initial half-refresh alignment otherwise drifts against the display's
+// clock while nominal 30 Hz PTS keep advancing on the host clock. Track only a
+// fresh phase from an aligned epoch. Arrival/cadence bounds always win.
+- (uint64_t)trackDisplayPhaseLockedForTimeNs:(uint64_t)scheduledAtNs
+                                 arrivalNs:(uint64_t)arrivedAtNs
+                              lowerBoundNs:(uint64_t)lowerBoundNs
+                              upperBoundNs:(uint64_t)upperBoundNs {
+  const uint64_t periodNs = _displayRefreshPeriodNs;
+  if (!_displayPhaseTrackingArmed || _displayPhaseTimestampNs == 0 ||
+      arrivedAtNs < _displayPhaseTimestampNs ||
+      arrivedAtNs - _displayPhaseTimestampNs > kInumaDisplayPhaseMaximumAgeNs ||
+      periodNs < kInumaDisplayRefreshPeriodMinimumNs ||
+      periodNs > kInumaDisplayRefreshPeriodMaximumNs ||
+      _displayPhaseTargetTimeNs <= periodNs / 2) {
+    return scheduledAtNs;
+  }
+  const uint64_t phaseNs = _displayPhaseTargetTimeNs - periodNs / 2;
+  const BOOL afterPhase = scheduledAtNs >= phaseNs;
+  const uint64_t remainderNs =
+      (afterPhase ? scheduledAtNs - phaseNs : phaseNs - scheduledAtNs) % periodNs;
+  const BOOL nearestIsEarlier =
+      afterPhase ? remainderNs <= periodNs / 2 : remainderNs > periodNs / 2;
+  const uint64_t distanceNs = MIN(remainderNs, periodNs - remainderNs);
+  const uint64_t correctionNs = MIN(distanceNs, kInumaDisplayPhaseMaximumCorrectionNs);
+  if (nearestIsEarlier) {
+    return scheduledAtNs - MIN(correctionNs, scheduledAtNs - lowerBoundNs);
+  }
+  return scheduledAtNs + MIN(correctionNs, upperBoundNs - scheduledAtNs);
+}
+
 - (InumaStrictReplayPacingDecision)decisionForGeneration:(uint64_t)generation {
   InumaStrictReplayPacingDecision decision = {0};
   const uint64_t arrivedAtNs = _hostTimeClock();
@@ -375,6 +409,7 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
     } else {
       _displayPhaseFallbackCount += 1;
     }
+    _displayPhaseTrackingArmed = decision.displayPhaseAligned;
     decision.timelineStarted = YES;
   } else {
     if (UINT64_MAX - _lastScheduledPresentationTimeNs < _frameIntervalNs ||
@@ -404,10 +439,15 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
     scheduledAtNs = MAX(idealAtNs, lowerBoundNs);
     if (scheduledAtNs > upperBoundNs) {
       scheduledAtNs = upperBoundNs;
-      decision.earlyPhaseCorrected = YES;
-    } else if (scheduledAtNs > idealAtNs) {
-      decision.latePhaseCorrected = YES;
     }
+    scheduledAtNs = [self trackDisplayPhaseLockedForTimeNs:scheduledAtNs
+                                               arrivalNs:arrivedAtNs
+                                            lowerBoundNs:lowerBoundNs
+                                            upperBoundNs:upperBoundNs];
+    // Existing trace events retain the exact signed deviation from nominal
+    // cadence, including either arrival-bound or display-phase correction.
+    decision.earlyPhaseCorrected = scheduledAtNs < idealAtNs;
+    decision.latePhaseCorrected = scheduledAtNs > idealAtNs;
     const uint64_t presentationIntervalNs =
         scheduledAtNs - _lastScheduledPresentationTimeNs;
     if (presentationIntervalNs >
@@ -723,6 +763,7 @@ static const uint64_t kInumaDisplayPhaseMaximumAgeNs = 250000000;
   _queueHead = 0;
   _queueCount = 0;
   _timelineStarted = NO;
+  _displayPhaseTrackingArmed = NO;
   _lastObservedGeneration = 0;
   _lastArrivalNs = 0;
   _lastScheduledPresentationTimeNs = 0;

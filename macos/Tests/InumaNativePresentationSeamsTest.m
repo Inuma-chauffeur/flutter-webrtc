@@ -95,8 +95,96 @@ static CMSampleBufferRef InumaTestSampleBuffer(void) {
   return sampleBuffer;
 }
 
+// Advance virtual clocks without sleeping or creating a display. The measured
+// invariant is phase lock plus existing PTS/residence limits, not panel timing.
+static int InumaCheckDisplayPhaseTracking(uint64_t actualPeriodNs,
+                                         uint64_t frameCount,
+                                         BOOL injectPhaseStep,
+                                         BOOL stopPhaseUpdates,
+                                         BOOL requirePhaseLock) {
+  const uint64_t epoch = 2000000000;
+  const uint64_t nominalPeriodNs = 16666667;
+  __block uint64_t nowNs = epoch;
+  InumaStrictReplayPacer* pacer = [[InumaStrictReplayPacer alloc]
+      initWithPresentationReserveNs:95000000
+                     frameIntervalNs:33333333
+                       queueCapacity:4
+                       hostTimeClock:^uint64_t { return nowNs; }];
+  uint64_t previousPtsNs = 0;
+  uint64_t lastTimestampNs = 0;
+  uint64_t residenceBoundCount = 0;
+  for (uint64_t generation = 1; generation <= frameCount; generation++) {
+    nowNs = epoch + (generation - 1) * 33333333;
+    const uint64_t phaseEpoch = epoch +
+        (injectPhaseStep && generation >= 10 ? 6000000 : 0);
+    const uint64_t timestampNs = phaseEpoch +
+        (nowNs - phaseEpoch) / actualPeriodNs * actualPeriodNs;
+    const uint64_t targetNs = timestampNs + nominalPeriodNs;
+    if (!stopPhaseUpdates || generation <= 10) {
+      INUMA_REQUIRE([pacer updateDisplayPhaseTimestampNs:timestampNs
+                                            targetTimeNs:targetNs
+                                         refreshPeriodNs:nominalPeriodNs]);
+      lastTimestampNs = timestampNs;
+    }
+    const InumaStrictReplayPacingDecision decision =
+        [pacer decisionForGeneration:generation];
+    if (generation <= 3) {
+      INUMA_REQUIRE(decision.prearmDiscarded && !decision.accepted);
+      continue;
+    }
+    INUMA_REQUIRE(decision.accepted && !decision.rearmTriggered &&
+                  decision.presentationResidenceNs >= 8333333 &&
+                  decision.presentationResidenceNs <= 100000000 &&
+                  decision.queueDepthAfter <= 4);
+    const uint64_t ptsNs = decision.scheduledPresentationTimeNs;
+    residenceBoundCount += decision.presentationResidenceNs == 8333333 ||
+                           decision.presentationResidenceNs == 100000000;
+    if (previousPtsNs != 0) {
+      const uint64_t intervalNs = ptsNs - previousPtsNs;
+      INUMA_REQUIRE(intervalNs >= 33233333 && intervalNs <= 33433333);
+      INUMA_REQUIRE(decision.earlyPhaseCorrected == (intervalNs < 33333333));
+      INUMA_REQUIRE(decision.latePhaseCorrected == (intervalNs > 33333333));
+      if (nowNs - lastTimestampNs > 250000000) {
+        INUMA_REQUIRE(intervalNs == 33333333);
+      }
+    }
+    if (requirePhaseLock && !stopPhaseUpdates &&
+        (!injectPhaseStep || generation >= 100)) {
+      const uint64_t phaseNs = targetNs - nominalPeriodNs / 2;
+      const uint64_t deltaNs = ptsNs >= phaseNs ? ptsNs - phaseNs : phaseNs - ptsNs;
+      const uint64_t remainderNs = deltaNs % nominalPeriodNs;
+      INUMA_REQUIRE(MIN(remainderNs, nominalPeriodNs - remainderNs) <= 1);
+    }
+    previousPtsNs = ptsNs;
+  }
+  INUMA_REQUIRE(pacer.acceptedCount == frameCount - 3 && pacer.rearmCount == 0);
+  INUMA_REQUIRE(requirePhaseLock || residenceBoundCount > 0);
+  // Old phase state must not re-enable tracking after reset with stale input.
+  [pacer stop];
+  INUMA_REQUIRE(![pacer decisionForGeneration:frameCount + 1].accepted);
+  [pacer reset];
+  nowNs += 2000000000;
+  for (uint64_t generation = 1; generation <= 5; generation++) {
+    const InumaStrictReplayPacingDecision decision =
+        [pacer decisionForGeneration:generation];
+    if (generation >= 4) {
+      INUMA_REQUIRE(decision.accepted && !decision.displayPhaseAligned &&
+                    decision.presentationResidenceNs == 95000000 &&
+                    !decision.earlyPhaseCorrected && !decision.latePhaseCorrected);
+    }
+    nowNs += 33333333;
+  }
+  return 0;
+}
+
 int main(void) {
   @autoreleasepool {
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16666500, 54004, NO, NO, YES) == 0);
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16666834, 6004, NO, NO, YES) == 0);
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16666667, 800, YES, NO, YES) == 0);
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16666667, 800, YES, YES, YES) == 0);
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16666834, 54004, NO, NO, NO) == 0);
+    INUMA_REQUIRE(InumaCheckDisplayPhaseTracking(16650000, 54004, NO, NO, NO) == 0);
     const uint64_t uptimeBeforeNs =
         clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     const uint64_t systemClockNs =
