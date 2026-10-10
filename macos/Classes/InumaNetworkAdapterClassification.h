@@ -16,6 +16,12 @@ InumaParseRequiredNetworkInterface(NSDictionary* _Nullable options,
 /// Stores the process-scoped exact interface selected before factory creation.
 void InumaSetRequiredNetworkInterface(NSString* _Nullable interfaceName);
 
+/// The field trial that makes libwebrtc enumerate only the stored interface
+/// (SDK patch 0010), or an empty string when none is stored. It joins the
+/// factory's field trials, so no ICE candidate is gathered on another adapter:
+/// without it the Wi-Fi pair won selection (drive 2, 2026-10-10).
+NSString* InumaRequiredNetworkInterfaceFieldTrial(void);
+
 /// Refreshes one fail-closed interface snapshot before a stats report is read.
 /// System interface discovery is intentionally performed once per native
 /// callback, rather than once for every historical local-candidate row.

@@ -914,12 +914,12 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
         RTCResetInumaReceiverSchedulerTrace(receiverSchedulerTrace);
         InumaRecordLowLatencyVideoPlayoutConfiguration(
             lowLatencyVideoPlayout);
-        if (lowLatencyVideoPlayout) {
-            [RTCPeerConnectionFactory configureFieldTrials:
-                InumaLowLatencyVideoPlayoutFieldTrials(useNWPathMonitor)];
-        } else if (!useNWPathMonitor) {
-            [RTCPeerConnectionFactory configureFieldTrials:
-                @"WebRTC-Network-UseNWPathMonitor/Disabled/"];
+        NSString* trials = lowLatencyVideoPlayout
+            ? InumaLowLatencyVideoPlayoutFieldTrials(useNWPathMonitor)
+            : (useNWPathMonitor ? @"" : @"WebRTC-Network-UseNWPathMonitor/Disabled/");
+        trials = [trials stringByAppendingString:InumaRequiredNetworkInterfaceFieldTrial()];
+        if (trials.length > 0) {
+            [RTCPeerConnectionFactory configureFieldTrials:trials];
         }
 #endif
         VideoDecoderFactory* decoderFactory = [[VideoDecoderFactory alloc] init];

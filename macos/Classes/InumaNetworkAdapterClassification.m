@@ -64,6 +64,13 @@ static NSString* InumaRequiredNetworkInterface(void) {
   return value;
 }
 
+NSString* InumaRequiredNetworkInterfaceFieldTrial(void) {
+  NSString* name = InumaRequiredNetworkInterface();
+  return name.length > 0
+             ? [NSString stringWithFormat:@"WebRTC-InumaRequiredNetworkInterface/%@/", name]
+             : @"";
+}
+
 static NSString* InumaNormalizedNumericAddress(NSString* value) {
   NSString* normalized = [value stringByTrimmingCharactersInSet:
       [NSCharacterSet whitespaceAndNewlineCharacterSet]];

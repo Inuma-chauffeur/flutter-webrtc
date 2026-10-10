@@ -37,6 +37,14 @@ int main(void) {
                 @{@"networkRequiredInterfaceName" : @"en11"}, NULL) ==
                 InumaRequiredNetworkInterfaceParseResultInvalid,
             @"a missing parser output must fail closed");
+    InumaSetRequiredNetworkInterface(nil);
+    Require([InumaRequiredNetworkInterfaceFieldTrial() isEqualToString:@""],
+            @"no stored interface must add no field trial");
+    InumaSetRequiredNetworkInterface(@"en11");
+    Require([InumaRequiredNetworkInterfaceFieldTrial()
+                isEqualToString:@"WebRTC-InumaRequiredNetworkInterface/en11/"],
+            @"the stored interface must restrict libwebrtc's enumeration to it");
+    InumaSetRequiredNetworkInterface(nil);
 
     NSDictionary* untouched = @{@"address" : @"10.88.0.2",
                                 @"networkAdapterType" : @"unknown"};
